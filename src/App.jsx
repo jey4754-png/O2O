@@ -1,11 +1,13 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import {
   ArrowLeft,
   BarChart3,
   Bell,
   Calendar,
+  Calculator,
   Check,
+  ChevronRight,
   Clock,
   Copy,
   Download,
@@ -15,29 +17,57 @@ import {
   MapPin,
   MessageCircle,
   Minus,
+  Pencil,
   Plus,
   QrCode,
   Search,
   Send,
   Share2,
+  ShieldCheck,
   ShoppingBag,
   Store,
+  Trash2,
   Upload,
   User,
   Users,
   X,
 } from 'lucide-react';
 import { eventDefinitions, sampleCommunityGroups, sampleDeals } from './data';
+import { REGIONS } from './regions';
+import SplitCalculator from './Calculator';
+import GroupRoom from './GroupRoom';
+import { RELEASE_FEATURES } from './releasePhase';
+import {
+  claimGroupHost,
+  createMutationId,
+  createGroupRoom as initializeGroupRoom,
+  fetchUnreadCounts,
+  getGroupCredential,
+  joinGroupRoom,
+  reserveGroupQuantity,
+} from './groupApi';
+import {
+  calculateProductAllocation,
+  calculateSplit,
+  formatGroupQuantityAllocation,
+  GROUP_STATUS_LABELS,
+  normalizeCategory,
+  PRODUCT_CATEGORIES,
+} from './trade';
 import {
   clearProfile,
   clearEvents,
   exportEventsCsv,
+  exportOrdersCsv,
+  flushPendingEvents,
   getEvents,
+  getCustomerNumber,
   getProfile,
   getVisitorId,
   initAnalytics,
   saveProfile,
   track,
+  trackPageview,
   useScreenAnalytics,
 } from './analytics';
 import { clamp, discountedPrice, formatWon } from './utils';
@@ -49,6 +79,74 @@ const CUSTOMER_GROUPS_KEY = 'o2o_mvp_customer_groups';
 const CUSTOMER_ORDERS_KEY = 'o2o_mvp_customer_orders';
 const FAVORITES_KEY = 'o2o_mvp_favorite_deal_ids';
 const HOST_DEALS_KEY = 'o2o_mvp_host_deal_ids';
+const OWNER_NEIGHBORHOOD_KEY = 'o2o_mvp_owner_neighborhood';
+const OWNER_LOCATION_KEY = 'o2o_mvp_owner_location';
+const PUBLIC_DEAL_SYNCED_KEY = 'o2o_mvp_public_deal_sync_fingerprints';
+const CUSTOMER_ORDER_SYNCED_KEY = 'o2o_mvp_customer_order_sync_fingerprints';
+const PUBLIC_DEAL_CAPABILITIES_KEY = 'o2o_mvp_public_deal_capabilities_v1';
+const CUSTOMER_ORDER_CAPABILITY_KEY = 'o2o_mvp_customer_order_capability_v1';
+const GROUP_STATUS_SEEN_KEY = 'o2o_mvp_group_status_seen_v1';
+const COUNTED_PARTICIPATIONS_KEY = 'o2o_mvp_counted_participations';
+const PUBLIC_DEAL_SYNC_INTERVAL_MS = 10000;
+const EVENT_MIN_RELEASE_PHASE = Object.freeze({
+  chat_message_sent: 8,
+  chat_lock_changed: 8,
+  unread_badge_viewed: 8,
+  group_status_notice_viewed: 8,
+  share_clicked: 9,
+  group_shared: 9,
+  group_deep_link_opened: 9,
+});
+const isEventVisibleInRelease = (eventName) => (
+  Number(EVENT_MIN_RELEASE_PHASE[eventName] || 1) <= RELEASE_FEATURES.phase
+);
+const visibleEventDefinitions = eventDefinitions.filter((event) => isEventVisibleInRelease(event.name));
+const DEFAULT_LOCATION = {
+  region: '경기도',
+  district: '성남시 분당구',
+  neighborhood: '판교동',
+};
+const NEW_CUSTOMER_GROUP_DEAL = {
+  id: 'new-customer-group',
+  source: 'customer',
+  saleType: 'community',
+  category: '음식·간편식',
+  store: '',
+  title: '',
+  description: '',
+  address: '',
+  deadline: '',
+  methods: ['그룹배달'],
+  originalPrice: 0,
+  discountRate: 0,
+  current: 0,
+  target: 5,
+  currentPeople: 0,
+  targetPeople: 5,
+  totalQuantity: 5,
+  orderedQuantity: 0,
+  unitPrice: 0,
+  unitRemainder: 0,
+  hostMode: 'self',
+  hostMatched: true,
+  image: fallbackImage,
+  menu: [],
+  isNewGroup: true,
+};
+const LEGACY_LOCATIONS = {
+  '판교': DEFAULT_LOCATION,
+  '판교동': DEFAULT_LOCATION,
+  '운중동': { region: '경기도', district: '성남시 분당구', neighborhood: '운중동' },
+  '화곡': { region: '서울특별시', district: '강서구', neighborhood: '화곡동' },
+  '화곡동': { region: '서울특별시', district: '강서구', neighborhood: '화곡동' },
+  '목동': { region: '서울특별시', district: '양천구', neighborhood: '목동' },
+};
+const ORDER_STAGES = [
+  { id: 'new', label: '신규 주문', action: '주문 확인' },
+  { id: 'preparing', label: '준비 중', action: '준비 완료' },
+  { id: 'pickup_waiting', label: '픽업 대기', action: '픽업 완료' },
+  { id: 'completed', label: '주문 완료', action: null },
+];
 
 function loadJson(key, fallback) {
   try {
@@ -59,80 +157,931 @@ function loadJson(key, fallback) {
 }
 
 function saveJson(key, value) {
-  localStorage.setItem(key, JSON.stringify(value));
+  const serialize = (input, stripImages = false) => JSON.stringify(input, (property, item) => (
+    stripImages && property === 'image' && typeof item === 'string' && item.startsWith('data:image/')
+      ? fallbackImage
+      : item
+  ));
+
+  try {
+    localStorage.setItem(key, serialize(value));
+    return true;
+  } catch (error) {
+    const isQuotaError = error?.name === 'QuotaExceededError' || error?.code === 22 || error?.code === 1014;
+    if (!isQuotaError) {
+      console.warn('브라우저 저장소를 사용할 수 없어 이번 변경은 현재 화면에만 유지됩니다.');
+      return false;
+    }
+
+    [CREATED_DEALS_KEY, CUSTOMER_GROUPS_KEY].forEach((storageKey) => {
+      try {
+        const stored = JSON.parse(localStorage.getItem(storageKey) || '[]');
+        localStorage.setItem(storageKey, serialize(stored, true));
+      } catch {
+        // Keep the current in-memory state if an old malformed value cannot be compacted.
+      }
+    });
+
+    try {
+      localStorage.setItem(key, serialize(value, true));
+      return true;
+    } catch {
+      console.warn('브라우저 저장공간이 부족해 이번 변경은 현재 화면에만 유지됩니다.');
+      return false;
+    }
+  }
+}
+
+function createClientCapability(prefix) {
+  const random = () => globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2);
+  return `${prefix}-${random()}-${random()}-${random()}`;
+}
+
+function getDealCapability(dealId, { create = false } = {}) {
+  const capabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
+  if (!capabilities[dealId] && create) {
+    capabilities[dealId] = createClientCapability('deal');
+    saveJson(PUBLIC_DEAL_CAPABILITIES_KEY, capabilities);
+  }
+  return capabilities[dealId] || '';
+}
+
+function getCustomerOrderCapability() {
+  let capability = '';
+  try {
+    capability = localStorage.getItem(CUSTOMER_ORDER_CAPABILITY_KEY) || '';
+    if (!capability) {
+      capability = createClientCapability('customer');
+      localStorage.setItem(CUSTOMER_ORDER_CAPABILITY_KEY, capability);
+    }
+  } catch {
+    capability = createClientCapability('customer');
+  }
+  return capability;
+}
+
+function compressImage(file, maxSize = 420, quality = 0.72, maxDataUrlLength = 32000) {
+  return new Promise((resolve, reject) => {
+    if (!file.type?.startsWith('image/')) {
+      reject(new Error('JPG, PNG 형식의 이미지를 사용해 주세요.'));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('이미지를 읽을 수 없습니다.'));
+    reader.onload = () => {
+      const image = new Image();
+      image.onerror = () => reject(new Error('JPG, PNG 형식의 이미지를 사용해 주세요.'));
+      image.onload = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          let scale = Math.min(1, maxSize / Math.max(image.width, image.height));
+          let nextQuality = quality;
+
+          for (let attempt = 0; attempt < 7; attempt += 1) {
+            canvas.width = Math.max(1, Math.round(image.width * scale));
+            canvas.height = Math.max(1, Math.round(image.height * scale));
+            const context = canvas.getContext('2d');
+            if (!context) throw new Error('canvas_unavailable');
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            context.drawImage(image, 0, 0, canvas.width, canvas.height);
+            const output = canvas.toDataURL('image/jpeg', nextQuality);
+            if (output.length <= maxDataUrlLength) {
+              resolve(output);
+              return;
+            }
+            scale *= 0.76;
+            nextQuality = Math.max(0.46, nextQuality - 0.07);
+          }
+
+          reject(new Error('이미지 용량이 너무 큽니다. 다른 이미지를 선택해 주세요.'));
+        } catch {
+          reject(new Error('이 이미지는 처리할 수 없습니다. JPG 또는 PNG 이미지를 선택해 주세요.'));
+        }
+      };
+      image.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function compactImageForSync(source, maxSize = 360, quality = 0.68, maxDataUrlLength = 32000) {
+  if (!source?.startsWith('data:image/')) return Promise.resolve(source || fallbackImage);
+  if (source.startsWith('data:image/jpeg;base64,') && source.length <= maxDataUrlLength) {
+    return Promise.resolve(source);
+  }
+  return new Promise((resolve) => {
+    const image = new Image();
+    image.onerror = () => resolve(fallbackImage);
+    image.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        let scale = Math.min(1, maxSize / Math.max(image.width, image.height));
+        let nextQuality = quality;
+        for (let attempt = 0; attempt < 7; attempt += 1) {
+          canvas.width = Math.max(1, Math.round(image.width * scale));
+          canvas.height = Math.max(1, Math.round(image.height * scale));
+          const context = canvas.getContext('2d');
+          if (!context) break;
+          context.drawImage(image, 0, 0, canvas.width, canvas.height);
+          const output = canvas.toDataURL('image/jpeg', nextQuality);
+          if (output.length <= maxDataUrlLength) {
+            resolve(output);
+            return;
+          }
+          scale *= 0.76;
+          nextQuality = Math.max(0.44, nextQuality - 0.07);
+        }
+      } catch {
+        // Use a stable fallback image when a browser cannot resize the local upload.
+      }
+      resolve(fallbackImage);
+    };
+    image.src = source;
+  });
+}
+
+async function fetchPublicDeals() {
+  try {
+    const response = await fetch('/api/public-deals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'list' }),
+    });
+    const result = await response.json();
+    return response.ok && result.ok && Array.isArray(result.deals)
+      ? result.deals.map((deal) => ({ ...migrateLocationFields(deal), category: normalizeCategory(deal.category) }))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function publishPublicDeal(deal) {
+  try {
+    const capabilityToken = getDealCapability(deal.id, { create: true });
+    const syncedDeal = {
+      ...deal,
+      visibility: 'public',
+      image: await compactImageForSync(deal.image),
+    };
+    const response = await fetch('/api/public-deals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'publish', deal: syncedDeal, capabilityToken }),
+    });
+    const result = await response.json();
+    return response.ok && result.ok ? result.deal : null;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchCustomerOrders(phone) {
+  const normalizedPhone = normalizePhone(phone);
+  if (!normalizedPhone) return [];
+  try {
+    const response = await fetch('/api/customer-orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'list',
+        phone: normalizedPhone,
+        visitorId: getVisitorId(),
+        customerCapabilityToken: getCustomerOrderCapability(),
+      }),
+    });
+    const result = await response.json();
+    return response.ok && result.ok && Array.isArray(result.orders)
+      ? result.orders.map((order) => migrateLocationFields(order))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function publishCustomerOrder(order) {
+  try {
+    const response = await fetch('/api/customer-orders', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'publish',
+        order,
+        visitorId: order.visitorId || getVisitorId(),
+        customerCapabilityToken: getCustomerOrderCapability(),
+      }),
+    });
+    const result = await response.json();
+    return response.ok && result.ok ? result.order : null;
+  } catch {
+    return null;
+  }
+}
+
+async function deletePublicDeal(dealId) {
+  try {
+    const capabilityToken = getDealCapability(dealId);
+    if (!capabilityToken) return false;
+    const response = await fetch('/api/public-deals', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', dealId, capabilityToken }),
+    });
+    const result = await response.json();
+    return response.ok && result.ok;
+  } catch {
+    return false;
+  }
+}
+
+function dealTimestamp(deal) {
+  if (deal?.updatedAt || deal?.syncedAt) return new Date(deal.updatedAt || deal.syncedAt).getTime() || 0;
+  if (deal?.createdAt) return new Date(deal.createdAt).getTime() || 0;
+  const match = String(deal?.id || '').match(/^(?:owner|customer)-(\d+)/);
+  return match ? Number(match[1]) : 0;
+}
+
+function dealSyncFingerprint(deal) {
+  const { syncedAt, ...content } = deal || {};
+  return JSON.stringify({ imageSyncVersion: 2, ...content });
+}
+
+function mergeDeals(...collections) {
+  const merged = new Map();
+  collections.flat().forEach((deal) => {
+    if (!deal?.id) return;
+    if (!merged.has(deal.id)) {
+      merged.set(deal.id, deal);
+      return;
+    }
+    const preferred = merged.get(deal.id);
+    const preferredTime = dealTimestamp(preferred);
+    const candidateTime = dealTimestamp(deal);
+    const hasVersionedUpdate = Boolean(
+      preferred?.updatedAt || preferred?.syncedAt || deal?.updatedAt || deal?.syncedAt,
+    );
+    if (hasVersionedUpdate && candidateTime > preferredTime) {
+      merged.set(deal.id, { ...preferred, ...deal });
+      return;
+    }
+    merged.set(deal.id, {
+      ...deal,
+      ...preferred,
+      current: hasVersionedUpdate
+        ? Number(preferred.current || 0)
+        : Math.max(Number(preferred.current || 0), Number(deal.current || 0)),
+      participantCount: hasVersionedUpdate
+        ? Number(preferred.participantCount || 0)
+        : Math.max(Number(preferred.participantCount || 0), Number(deal.participantCount || 0)),
+    });
+  });
+  return [...merged.values()].sort((left, right) => dealTimestamp(right) - dealTimestamp(left));
+}
+
+function getRegion(regionName) {
+  return REGIONS.find((region) => region.name === regionName) || REGIONS.find((region) => region.name === DEFAULT_LOCATION.region) || REGIONS[0];
+}
+
+function getDistrict(region, districtName) {
+  return region.districts.find((district) => district.name === districtName) || region.districts[0];
+}
+
+function normalizeLocation(value = {}) {
+  const input = value || {};
+  const legacy = LEGACY_LOCATIONS[input.neighborhood];
+  const source = input.district ? input : (legacy || input);
+  const region = getRegion(source.region);
+  const district = getDistrict(region, source.district);
+  const neighborhood = district.neighborhoods.includes(source.neighborhood)
+    ? source.neighborhood
+    : district.neighborhoods[0];
+  return { region: region.name, district: district.name, neighborhood };
+}
+
+function migrateLocationFields(value = {}) {
+  return { ...value, ...normalizeLocation(value) };
+}
+
+function locationKey(value = {}) {
+  const location = normalizeLocation(value);
+  return `${location.region}/${location.district}/${location.neighborhood}`;
+}
+
+function sameLocation(left = {}, right = {}) {
+  return locationKey(left) === locationKey(right);
+}
+
+function formatLocation(value = {}, separator = ' · ') {
+  const location = normalizeLocation(value);
+  return [location.region, location.district, location.neighborhood].join(separator);
 }
 
 function loadCreatedDeals() {
-  return loadJson(CREATED_DEALS_KEY, []);
+  const deals = loadJson(CREATED_DEALS_KEY, []);
+  const migrated = deals.map((deal) => ({
+    ...migrateLocationFields(deal),
+    category: normalizeCategory(deal.category),
+    visibility: deal.visibility || 'public',
+  }));
+  if (JSON.stringify(migrated) !== JSON.stringify(deals)) {
+    saveJson(CREATED_DEALS_KEY, migrated);
+  }
+  return migrated;
 }
 
 function saveCreatedDeals(deals) {
   saveJson(CREATED_DEALS_KEY, deals);
 }
 
+function loadCustomerGroups() {
+  const groups = loadJson(CUSTOMER_GROUPS_KEY, []);
+  const fallbackLocation = normalizeLocation(getProfile() || DEFAULT_LOCATION);
+  const migrated = groups.map((group) => {
+    const targetPeople = Math.min(20, Math.max(1, Number(group.targetPeople || group.target || 1)));
+    const currentPeople = Math.max(0, Number(group.currentPeople ?? group.currentCount ?? group.current ?? 1));
+    const totalQuantity = Math.min(999, Math.max(1, Number(group.totalQuantity || group.productQuantity || group.target || 1)));
+    const creatorQuantity = Math.min(totalQuantity, Math.max(0, Number(group.creatorQuantity ?? group.creatorProductQuantity ?? 1)));
+    const orderedQuantity = Math.min(totalQuantity, Math.max(0, Number(group.orderedQuantity ?? group.allocatedProductQuantity ?? creatorQuantity)));
+    const allocation = calculateProductAllocation(Math.max(0, Math.floor(Number(group.originalPrice || 0))), totalQuantity, Math.min(1, totalQuantity));
+    return migrateLocationFields({
+      ...(group.neighborhood ? group : { ...group, ...fallbackLocation }),
+      category: normalizeCategory(group.category),
+      visibility: group.visibility || 'public',
+      target: targetPeople,
+      targetPeople,
+      targetCount: targetPeople,
+      current: currentPeople,
+      currentPeople,
+      currentCount: currentPeople,
+      participantCount: Number(group.participantCount ?? currentPeople),
+      quantityTracking: true,
+      totalQuantity,
+      productQuantity: totalQuantity,
+      creatorQuantity,
+      creatorProductQuantity: creatorQuantity,
+      orderedQuantity,
+      allocatedProductQuantity: orderedQuantity,
+      unitPrice: Number(group.unitPrice ?? allocation.unitPrice),
+      unitRemainder: Number(group.unitRemainder ?? group.splitRemainder ?? allocation.remainder),
+      hostMode: group.hostMode === 'recruiting' ? 'recruiting' : 'self',
+      hostMatched: group.hostMode === 'recruiting'
+        ? Boolean(group.hostMatched || group.hostActorId)
+        : true,
+    });
+  });
+  if (JSON.stringify(migrated) !== JSON.stringify(groups)) {
+    saveJson(CUSTOMER_GROUPS_KEY, migrated);
+  }
+  return migrated;
+}
+
+function loadOrders() {
+  const orders = loadJson(CUSTOMER_ORDERS_KEY, []);
+  const profile = getProfile();
+  const visitorId = getVisitorId();
+  const migrated = orders.map((order) => migrateLocationFields({
+    ...order,
+    visitorId: order.visitorId || visitorId,
+    customerNumber: order.customerNumber || getCustomerNumber(order.visitorId || visitorId),
+    customerName: order.customerName || profile?.name || '테스트 사용자',
+    customerPhone: order.customerPhone || profile?.phone || '미설정',
+    status: order.status || 'new',
+    statusHistory: order.statusHistory?.length
+      ? order.statusHistory
+      : [{ status: order.status || 'new', actor: 'legacy', timestamp: order.createdAt || new Date().toISOString() }],
+    ...(order.region ? {} : order.deal || {}),
+  }));
+  if (JSON.stringify(migrated) !== JSON.stringify(orders)) saveJson(CUSTOMER_ORDERS_KEY, migrated);
+  return migrated;
+}
+
+function normalizePhone(value) {
+  return String(value || '').replace(/\D/g, '');
+}
+
+function isOrderForProfile(order, profile, visitorId) {
+  if (!profile) return false;
+  const profilePhone = normalizePhone(profile.phone);
+  const orderPhone = normalizePhone(order.customerPhone);
+  if (profilePhone && orderPhone) return profilePhone === orderPhone;
+  return Boolean(visitorId && order.visitorId === visitorId);
+}
+
+function orderSyncFingerprint(order) {
+  const { syncedAt, ...content } = order || {};
+  return JSON.stringify(content);
+}
+
+function mergeOrders(...collections) {
+  const merged = new Map();
+  collections.flat().forEach((order) => {
+    if (!order?.id) return;
+    const current = merged.get(order.id);
+    if (!current) {
+      merged.set(order.id, order);
+      return;
+    }
+    const currentTime = new Date(current.statusUpdatedAt || current.syncedAt || current.createdAt || 0).getTime();
+    const nextTime = new Date(order.statusUpdatedAt || order.syncedAt || order.createdAt || 0).getTime();
+    merged.set(order.id, nextTime >= currentTime ? { ...current, ...order } : { ...order, ...current });
+  });
+  return [...merged.values()].sort((left, right) => (
+    new Date(right.createdAt || 0).getTime() - new Date(left.createdAt || 0).getTime()
+  ));
+}
+
+function participationKey(order) {
+  return `${order?.visitorId || getVisitorId()}:${order?.dealId || order?.deal?.id || ''}`;
+}
+
+function loadOwnerLocation() {
+  const stored = loadJson(OWNER_LOCATION_KEY, null);
+  let legacyNeighborhood = null;
+  try {
+    legacyNeighborhood = localStorage.getItem(OWNER_NEIGHBORHOOD_KEY);
+  } catch {
+    // Use the default owner location when browser storage is unavailable.
+  }
+  return normalizeLocation(stored || LEGACY_LOCATIONS[legacyNeighborhood] || DEFAULT_LOCATION);
+}
+
+function loadProfile() {
+  const profile = getProfile();
+  if (!profile) return null;
+  const migrated = migrateLocationFields(profile);
+  if (JSON.stringify(migrated) !== JSON.stringify(profile)) saveProfile(migrated);
+  return migrated;
+}
+
 function getDealPrice(deal) {
-  if (deal.source === 'customer' && deal.menu?.[0]?.price) return deal.menu[0].price;
+  if (deal.source === 'customer' && deal.menu?.[0]?.price !== undefined) return Number(deal.menu[0].price || 0);
   return discountedPrice(deal.originalPrice, deal.discountRate);
 }
 
+function getDealQuantity(deal = {}) {
+  const tracksQuantity = Boolean(deal.quantityTracking);
+  const target = Math.max(1, Number(
+    tracksQuantity
+      ? deal.totalQuantity ?? deal.productQuantity ?? deal.target ?? 1
+      : deal.target ?? 1,
+  ));
+  const fallbackOrdered = deal.source === 'customer'
+    ? deal.creatorQuantity ?? deal.creatorProductQuantity ?? deal.current ?? 0
+    : deal.current ?? 0;
+  const ordered = clamp(Number(
+    tracksQuantity
+      ? deal.orderedQuantity ?? deal.allocatedProductQuantity ?? fallbackOrdered
+      : deal.current ?? 0,
+  ), 0, target);
+  const targetPeople = Math.max(1, Number(deal.targetPeople ?? deal.targetCount ?? deal.target ?? 1));
+  const currentPeople = Math.max(0, Number(
+    deal.currentPeople ?? deal.currentCount ?? deal.participantCount ?? deal.current ?? 0,
+  ));
+  return {
+    target,
+    ordered,
+    remaining: Math.max(0, target - ordered),
+    participants: currentPeople,
+    targetPeople,
+    currentPeople,
+  };
+}
+
+function isDealHostMatched(deal = {}, hostDealIds = []) {
+  if (deal.source === 'customer') {
+    if (deal.hostMode === 'recruiting') return Boolean(deal.hostMatched || deal.hostActorId);
+    return deal.hostMode === 'self' || Boolean(deal.hostMatched || deal.hostActorId);
+  }
+  return Boolean(deal.hostMatched || hostDealIds.includes(deal.id));
+}
+
+function getOrderStage(order) {
+  return ORDER_STAGES.find((stage) => stage.id === order.status) || ORDER_STAGES[0];
+}
+
 function normalizeRoute(pathname) {
-  if (['/customer', '/owner', '/dashboard'].includes(pathname)) return pathname;
+  if (pathname === '/admin' && !RELEASE_FEATURES.admin) return '/';
+  if (['/customer', '/owner', '/admin', '/dashboard'].includes(pathname)) return pathname;
   return '/';
 }
 
 function App() {
-  const [analyticsReady] = useState(() => initAnalytics());
+  const [analyticsReady, setAnalyticsReady] = useState(() => initAnalytics());
   const [route, setRoute] = useState(() => normalizeRoute(window.location.pathname));
-  const [profile, setProfile] = useState(() => getProfile());
+  const [profile, setProfile] = useState(() => loadProfile());
+  const [ownerLocation, setOwnerLocation] = useState(() => loadOwnerLocation());
+  const [ownerPreviewMode, setOwnerPreviewMode] = useState(false);
+  const [previewLocation, setPreviewLocation] = useState(DEFAULT_LOCATION);
   const [customerScreen, setCustomerScreen] = useState(profile ? 'list' : 'onboarding');
   const [ownerScreen, setOwnerScreen] = useState('form');
   const [createdDeals, setCreatedDeals] = useState(() => loadCreatedDeals());
-  const [customerGroups, setCustomerGroups] = useState(() => loadJson(CUSTOMER_GROUPS_KEY, []));
-  const [orders, setOrders] = useState(() => loadJson(CUSTOMER_ORDERS_KEY, []));
+  const [customerGroups, setCustomerGroups] = useState(() => loadCustomerGroups());
+  const [remoteDeals, setRemoteDeals] = useState([]);
+  const [orders, setOrders] = useState(() => loadOrders());
   const [favoriteIds, setFavoriteIds] = useState(() => loadJson(FAVORITES_KEY, []));
   const [hostDealIds, setHostDealIds] = useState(() => loadJson(HOST_DEALS_KEY, []));
   const [selectedDeal, setSelectedDeal] = useState(() => loadCreatedDeals()[0] || sampleDeals[0]);
+  const [unreadCounts, setUnreadCounts] = useState({});
+  const [statusNotices, setStatusNotices] = useState({});
+  const [handledDeepLink, setHandledDeepLink] = useState('');
 
   const deals = useMemo(
-    () => [...createdDeals, ...customerGroups, ...sampleDeals, ...sampleCommunityGroups],
-    [createdDeals, customerGroups],
+    () => mergeDeals(
+      createdDeals,
+      customerGroups,
+      remoteDeals,
+      sampleDeals.map((deal) => ({ ...deal, category: normalizeCategory(deal.category) })),
+      sampleCommunityGroups.map((deal) => ({ ...deal, category: normalizeCategory(deal.category) })),
+    ),
+    [createdDeals, customerGroups, remoteDeals],
   );
 
   useEffect(() => {
-    const handlePopState = () => setRoute(normalizeRoute(window.location.pathname));
-    window.addEventListener('popstate', handlePopState);
-    return () => window.removeEventListener('popstate', handlePopState);
+    if (!profile || !RELEASE_FEATURES.unreadBadges) {
+      setUnreadCounts({});
+      return undefined;
+    }
+    let cancelled = false;
+    const refreshUnread = async () => {
+      const next = await fetchUnreadCounts({ adminMode: route === '/admin' });
+      if (!cancelled) setUnreadCounts(next);
+    };
+    refreshUnread();
+    const timer = window.setInterval(refreshUnread, 5000);
+    const handleFocus = () => refreshUnread();
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('o2o-group-fallback-updated', handleFocus);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('o2o-group-fallback-updated', handleFocus);
+    };
+  }, [profile, route]);
+
+  useEffect(() => {
+    if (!RELEASE_FEATURES.unreadBadges || !profile || !['/customer', '/admin'].includes(route)) {
+      setStatusNotices({});
+      return;
+    }
+    const actorId = route === '/admin' ? `${getVisitorId()}_admin` : getVisitorId();
+    const seen = loadJson(GROUP_STATUS_SEEN_KEY, {});
+    const next = {};
+    deals.forEach((deal) => {
+      if (deal.source !== 'customer' || !getGroupCredential(deal.id, actorId)) return;
+      const status = deal.groupStatus || 'recruiting';
+      if (status !== 'recruiting' && seen[`${deal.id}::${actorId}`] !== status) {
+        next[deal.id] = status;
+      }
+    });
+    setStatusNotices(next);
+  }, [deals, profile, route]);
+
+  const acknowledgeGroupStatus = (deal) => {
+    if (!RELEASE_FEATURES.unreadBadges) return;
+    const status = deal?.groupStatus || 'recruiting';
+    if (!deal?.id || status === 'recruiting') return;
+    const actorId = route === '/admin' ? `${getVisitorId()}_admin` : getVisitorId();
+    const seen = loadJson(GROUP_STATUS_SEEN_KEY, {});
+    seen[`${deal.id}::${actorId}`] = status;
+    saveJson(GROUP_STATUS_SEEN_KEY, seen);
+    setStatusNotices((current) => {
+      const next = { ...current };
+      delete next[deal.id];
+      return next;
+    });
+    track('group_status_notice_viewed', { group_id: deal.id, group_status: status });
+  };
+
+  useEffect(() => {
+    if (!RELEASE_FEATURES.deepLinks || !profile || !['/customer', '/admin'].includes(route)) return;
+    const groupId = new URLSearchParams(window.location.search).get('group');
+    if (!groupId) return;
+    const requestedView = new URLSearchParams(window.location.search).get('view');
+    const deepLinkKey = `${route}:${groupId}:${requestedView || 'detail'}:${profile.phone || profile.name}`;
+    if (handledDeepLink === deepLinkKey) return;
+    const linkedDeal = deals.find((deal) => deal.id === groupId);
+    if (!linkedDeal) return;
+    acknowledgeGroupStatus(linkedDeal);
+    setSelectedDeal(linkedDeal);
+    setCustomerScreen(requestedView === 'room' ? 'room' : 'detail');
+    setHandledDeepLink(deepLinkKey);
+    track('group_deep_link_opened', {
+      group_id: groupId,
+      destination: requestedView === 'room' ? 'room' : 'detail',
+      signed_in: true,
+    });
+  }, [deals, handledDeepLink, profile, route]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      const next = await fetchPublicDeals();
+      if (!cancelled) setRemoteDeals(next);
+    };
+    refresh();
+    const timer = window.setInterval(refresh, PUBLIC_DEAL_SYNC_INTERVAL_MS);
+    const handleFocus = () => refresh();
+    const handlePageShow = () => refresh();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') refresh();
+    };
+    window.addEventListener('focus', handleFocus);
+    window.addEventListener('pageshow', handlePageShow);
+    window.addEventListener('online', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('pageshow', handlePageShow);
+      window.removeEventListener('online', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    let syncing = false;
+    const syncPendingDeals = async () => {
+      if (syncing) return;
+      const localPublicDeals = [...createdDeals, ...customerGroups]
+        .filter((deal) => deal.visibility === 'public');
+      if (!localPublicDeals.length) return;
+      const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
+      const pending = localPublicDeals.filter(
+        (deal) => fingerprints[deal.id] !== dealSyncFingerprint(deal),
+      );
+      if (!pending.length) return;
+      syncing = true;
+      try {
+        const published = await Promise.all(pending.map(publishPublicDeal));
+        if (cancelled) return;
+        const valid = published.filter(Boolean);
+        if (!valid.length) return;
+        const nextFingerprints = { ...loadJson(PUBLIC_DEAL_SYNCED_KEY, {}) };
+        valid.forEach((deal) => {
+          const local = localPublicDeals.find((item) => item.id === deal.id);
+          if (local) nextFingerprints[deal.id] = dealSyncFingerprint(local);
+        });
+        saveJson(PUBLIC_DEAL_SYNCED_KEY, nextFingerprints);
+        setRemoteDeals((current) => mergeDeals(valid, current));
+      } finally {
+        syncing = false;
+      }
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') syncPendingDeals();
+    };
+    syncPendingDeals();
+    const timer = window.setInterval(syncPendingDeals, 15000);
+    window.addEventListener('online', syncPendingDeals);
+    window.addEventListener('pageshow', syncPendingDeals);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('online', syncPendingDeals);
+      window.removeEventListener('pageshow', syncPendingDeals);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [createdDeals, customerGroups]);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setRoute(normalizeRoute(window.location.pathname));
+      setHandledDeepLink('');
+    };
+    const handleStorage = (event) => {
+      if (event.key === CREATED_DEALS_KEY) setCreatedDeals(loadCreatedDeals());
+      if (event.key === CUSTOMER_GROUPS_KEY) setCustomerGroups(loadCustomerGroups());
+      if (event.key === CUSTOMER_ORDERS_KEY) setOrders(loadOrders());
+      if ([OWNER_LOCATION_KEY, OWNER_NEIGHBORHOOD_KEY].includes(event.key)) {
+        setOwnerLocation(loadOwnerLocation());
+      }
+    };
+    window.addEventListener('popstate', handlePopState);
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener('popstate', handlePopState);
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!profile) return undefined;
+    const retry = () => flushPendingEvents(profile);
+    retry();
+    window.addEventListener('online', retry);
+    const timer = window.setInterval(retry, 15000);
+    return () => {
+      window.removeEventListener('online', retry);
+      window.clearInterval(timer);
+    };
+  }, [profile]);
+
+  useEffect(() => {
+    const profilePhone = normalizePhone(profile?.phone);
+    if (!profilePhone) return undefined;
+    let cancelled = false;
+    let syncing = false;
+
+    const syncOrders = async () => {
+      if (syncing) return;
+      syncing = true;
+      try {
+        const visitorId = getVisitorId();
+        const matchingLocalOrders = loadOrders()
+          .filter((order) => isOrderForProfile(order, profile, visitorId))
+          .map((order) => ({ ...order, customerPhone: profilePhone }));
+        const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+        const pending = matchingLocalOrders.filter(
+          (order) => fingerprints[order.id] !== orderSyncFingerprint(order),
+        );
+        const published = await Promise.all(pending.map(publishCustomerOrder));
+        const nextFingerprints = { ...fingerprints };
+        pending.forEach((order, index) => {
+          if (published[index]) nextFingerprints[order.id] = orderSyncFingerprint(order);
+        });
+
+        const centralOrders = await fetchCustomerOrders(profilePhone);
+        if (cancelled) return;
+        centralOrders.forEach((order) => {
+          nextFingerprints[order.id] = orderSyncFingerprint(order);
+        });
+        saveJson(CUSTOMER_ORDER_SYNCED_KEY, nextFingerprints);
+        setOrders((current) => {
+          const merged = mergeOrders(current, centralOrders);
+          saveJson(CUSTOMER_ORDERS_KEY, merged);
+          return JSON.stringify(merged) === JSON.stringify(current) ? current : merged;
+        });
+      } finally {
+        syncing = false;
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') syncOrders();
+    };
+    syncOrders();
+    const timer = window.setInterval(syncOrders, 15000);
+    window.addEventListener('online', syncOrders);
+    window.addEventListener('pageshow', syncOrders);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('online', syncOrders);
+      window.removeEventListener('pageshow', syncOrders);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [profile, orders]);
+
+  useEffect(() => {
+    if (analyticsReady) trackPageview();
+  }, [route, analyticsReady]);
+
   const navigateTo = (nextRoute) => {
-    window.history.pushState({}, '', nextRoute);
-    setRoute(nextRoute);
-    track('app_opened', { app: nextRoute.replace('/', '') || 'launcher' });
+    const normalizedRoute = normalizeRoute(nextRoute);
+    window.history.pushState({}, '', normalizedRoute);
+    setHandledDeepLink('');
+    if (normalizedRoute !== '/customer') setOwnerPreviewMode(false);
+    setRoute(normalizedRoute);
+    track('app_opened', { app: normalizedRoute.replace('/', '') || 'launcher' });
   };
 
   const handleProfileSubmit = (nextProfile) => {
     saveProfile(nextProfile);
+    setAnalyticsReady(initAnalytics(nextProfile));
     setProfile(nextProfile);
-    setCustomerScreen('list');
+    const nextVisitorId = getVisitorId();
+    const nextCustomerNumber = getCustomerNumber(nextVisitorId);
+    const nextPhone = normalizePhone(nextProfile.phone);
+    if (nextPhone) {
+      setOrders((current) => {
+        const migrated = current.map((order) => (
+          normalizePhone(order.customerPhone) === nextPhone
+            ? {
+                ...order,
+                visitorId: nextVisitorId,
+                customerNumber: nextCustomerNumber,
+                customerName: nextProfile.name,
+                customerPhone: nextProfile.phone,
+              }
+            : order
+        ));
+        saveJson(CUSTOMER_ORDERS_KEY, migrated);
+        return migrated;
+      });
+    }
+    flushPendingEvents(nextProfile);
+    if (nextProfile.testerType === '사장님') {
+      const nextLocation = normalizeLocation(nextProfile);
+      setOwnerLocation(nextLocation);
+      saveJson(OWNER_LOCATION_KEY, nextLocation);
+    }
+    const linkedGroupId = new URLSearchParams(window.location.search).get('group');
+    setCustomerScreen(linkedGroupId ? 'detail' : 'list');
     track('profile_submitted', {
+      region: nextProfile.region,
+      district: nextProfile.district,
       neighborhood: nextProfile.neighborhood,
       tester_type: nextProfile.testerType,
     });
   };
 
   const handleLogout = () => {
+    track('profile_logged_out', { neighborhood: profile?.neighborhood || '미설정' });
     clearProfile();
+    setAnalyticsReady(false);
     setProfile(null);
     setCustomerScreen('onboarding');
-    track('profile_logged_out', {});
   };
 
-  const addOwnerDeal = (ownerProduct) => {
+  const handleNeighborhoodChange = (location) => {
+    if (!location) return;
+    const nextLocation = normalizeLocation(location);
+    if (!profile && ownerPreviewMode) {
+      if (sameLocation(nextLocation, previewLocation)) return;
+      const previousLocation = previewLocation;
+      setPreviewLocation(nextLocation);
+      track('neighborhood_changed', {
+        from_region: previousLocation.region,
+        from_district: previousLocation.district,
+        from_neighborhood: previousLocation.neighborhood,
+        ...nextLocation,
+        source: 'owner_preview',
+      });
+      return;
+    }
+    if (!profile || sameLocation(nextLocation, profile)) return;
+    const previousLocation = normalizeLocation(profile);
+    const nextProfile = {
+      ...profile,
+      ...nextLocation,
+    };
+    saveProfile(nextProfile);
+    setProfile(nextProfile);
+    track('neighborhood_changed', {
+      from_region: previousLocation.region,
+      from_district: previousLocation.district,
+      from_neighborhood: previousLocation.neighborhood,
+      ...nextLocation,
+    });
+  };
+
+  const openOwnerCustomerPreview = (screen = 'list', location = DEFAULT_LOCATION) => {
+    const nextLocation = normalizeLocation(location);
+    setPreviewLocation(nextLocation);
+    setOwnerPreviewMode(true);
+    window.history.pushState({}, '', '/customer');
+    setRoute('/customer');
+    setCustomerScreen(screen);
+    track('owner_customer_preview_opened', { screen, ...nextLocation });
+  };
+
+  const handleOwnerNeighborhoodChange = (location) => {
+    if (!location) return;
+    const nextLocation = normalizeLocation(location);
+    if (sameLocation(nextLocation, ownerLocation)) return;
+    const previousLocation = ownerLocation;
+    setOwnerLocation(nextLocation);
+    saveJson(OWNER_LOCATION_KEY, nextLocation);
+    try {
+      localStorage.setItem(OWNER_NEIGHBORHOOD_KEY, nextLocation.neighborhood);
+    } catch {
+      // The selected location remains available in React state for this session.
+    }
+    if (profile?.testerType === '사장님') {
+      const nextProfile = { ...profile, ...nextLocation };
+      saveProfile(nextProfile);
+      setProfile(nextProfile);
+    }
+    track('owner_neighborhood_changed', {
+      from_region: previousLocation.region,
+      from_district: previousLocation.district,
+      from_neighborhood: previousLocation.neighborhood,
+      ...nextLocation,
+    });
+  };
+
+  const addOwnerDeal = (ownerProduct, editingId = null) => {
+    const previous = editingId
+      ? createdDeals.find((deal) => deal.id === editingId)
+      : null;
+    const centralVersion = editingId
+      ? remoteDeals.find((deal) => deal.id === editingId)
+      : null;
     const deal = {
-      id: `owner-${Date.now()}`,
+      id: editingId || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`,
+      createdAt: previous?.createdAt || new Date().toISOString(),
+      visibility: 'public',
       source: 'merchant',
       saleType: ownerProduct.saleType,
-      category: ownerProduct.category,
+      category: normalizeCategory(ownerProduct.category),
+      region: ownerProduct.region,
+      district: ownerProduct.district,
+      neighborhood: ownerProduct.neighborhood,
       store: ownerProduct.storeName,
       title: ownerProduct.productName,
       description: ownerProduct.description,
@@ -145,7 +1094,13 @@ function App() {
       eventEnd: ownerProduct.eventEnd,
       originalPrice: Number(ownerProduct.originalPrice),
       discountRate: Number(ownerProduct.discountRate),
-      current: 0,
+      current: editingId
+        ? Math.max(Number(previous?.current || 0), Number(centralVersion?.current || 0))
+        : 0,
+      participantCount: editingId
+        ? Math.max(Number(previous?.participantCount || 0), Number(centralVersion?.participantCount || 0))
+        : 0,
+      quantityTracking: true,
       target: Number(ownerProduct.saleType === 'instant' ? ownerProduct.stock : ownerProduct.maxQuantity),
       likes: 0,
       image: ownerProduct.image || fallbackImage,
@@ -157,9 +1112,12 @@ function App() {
           option: ownerProduct.methods.join(', '),
         },
       ],
+      updatedAt: new Date().toISOString(),
     };
     setCreatedDeals((current) => {
-      const next = [deal, ...current];
+      const next = editingId
+        ? [deal, ...current.filter((item) => item.id !== editingId)]
+        : [deal, ...current];
       saveCreatedDeals(next);
       return next;
     });
@@ -167,36 +1125,148 @@ function App() {
     setOwnerScreen('done');
   };
 
-  const createCustomerGroup = (draft) => {
+  const updateCustomerDeal = (deal, options = {}) => {
+    const updated = {
+      ...deal,
+      category: normalizeCategory(deal.category),
+      visibility: 'public',
+      updatedAt: deal.updatedAt || new Date().toISOString(),
+    };
+    const isLocallyOwned = customerGroups.some((item) => item.id === updated.id);
+    if (!options.observed || isLocallyOwned) {
+      setCustomerGroups((current) => {
+        const next = [updated, ...current.filter((item) => item.id !== updated.id)];
+        saveJson(CUSTOMER_GROUPS_KEY, next);
+        return next;
+      });
+    } else {
+      setRemoteDeals((current) => mergeDeals([updated], current.filter((item) => item.id !== updated.id)));
+    }
+    setSelectedDeal(updated);
+    if (!options.observed) track('customer_deal_updated', { deal_id: updated.id });
+    if (options.sync !== false) {
+      publishPublicDeal(updated).then((published) => {
+        if (published) setRemoteDeals((current) => mergeDeals([published], current));
+      });
+    }
+  };
+
+  const removeDeal = async (deal) => {
+    if (!deal?.id) return false;
+    const deleted = await deletePublicDeal(deal.id);
+    if (!deleted) {
+      track('deal_delete_failed', { deal_id: deal.id, source: deal.source });
+      return false;
+    }
+    if (deal.source === 'customer') {
+      setCustomerGroups((current) => {
+        const next = current.filter((item) => item.id !== deal.id);
+        saveJson(CUSTOMER_GROUPS_KEY, next);
+        return next;
+      });
+    } else {
+      setCreatedDeals((current) => {
+        const next = current.filter((item) => item.id !== deal.id);
+        saveCreatedDeals(next);
+        return next;
+      });
+    }
+    setRemoteDeals((current) => current.filter((item) => item.id !== deal.id));
+    const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
+    delete fingerprints[deal.id];
+    saveJson(PUBLIC_DEAL_SYNCED_KEY, fingerprints);
+    track('deal_deleted', { deal_id: deal.id, source: deal.source, central_deleted: deleted });
+    return deleted;
+  };
+
+  const createCustomerGroup = async (draft) => {
+    const targetPeople = Math.min(20, Math.max(1, Number(draft.quantity || draft.targetPeople || 1)));
+    const totalQuantity = Math.min(999, Math.max(1, Number(
+      draft.totalQuantity
+      || draft.productQuantity
+      || draft.baseDeal?.totalQuantity
+      || targetPeople,
+    )));
+    const creatorQuantity = Math.min(totalQuantity, Math.max(1, Number(
+      draft.creatorQuantity || draft.creatorProductQuantity || 1,
+    )));
+    const totalPrice = Math.max(0, Math.floor(Number(
+      draft.totalPrice
+      || draft.salePrice
+      || draft.baseDeal?.originalPrice
+      || draft.expectedPrice
+      || 0
+    )));
+    const split = calculateSplit(totalPrice, targetPeople, 1);
+    const productAllocation = calculateProductAllocation(totalPrice, totalQuantity, creatorQuantity);
+    const hostMode = draft.hostMode === 'recruiting' ? 'recruiting' : 'self';
+    const creatorActorId = getVisitorId();
+    const now = new Date().toISOString();
+    const groupId = draft.groupId || `customer-${globalThis.crypto?.randomUUID?.() || Date.now()}`;
     const group = {
-      id: `customer-${Date.now()}`,
+      id: groupId,
+      groupId,
+      createdAt: now,
+      updatedAt: now,
+      visibility: 'public',
       source: 'customer',
       saleType: 'community',
-      category: draft.category,
-      store: `${profile?.neighborhood || '동네'} 호스트`,
+      category: normalizeCategory(draft.category),
+      region: profile?.region || DEFAULT_LOCATION.region,
+      district: profile?.district || DEFAULT_LOCATION.district,
+      neighborhood: profile?.neighborhood || '미설정',
+      store: `${profile?.neighborhood || '동네'} 공동구매`,
       title: draft.title,
       description: draft.description || draft.memo,
       address: draft.pickupPlace,
       distance: '내 주변',
       deadline: `${draft.deadlineDate} ${draft.deadlineTime}`,
       methods: [draft.method],
-      originalPrice: Number(draft.expectedPrice || discountedPrice(draft.baseDeal.originalPrice, draft.baseDeal.discountRate)),
+      originalPrice: totalPrice,
+      expectedPerPerson: productAllocation.unitPrice,
+      equalSplitAmount: split.perPerson,
+      splitRemainder: productAllocation.remainder,
+      approximatePrice: productAllocation.approximate,
+      unitPrice: productAllocation.unitPrice,
+      unitRemainder: productAllocation.remainder,
       discountRate: 0,
       current: 1,
-      target: Number(draft.maxPeople),
+      currentPeople: 1,
+      participantCount: 1,
+      quantityTracking: true,
+      target: targetPeople,
+      targetPeople,
+      targetCount: targetPeople,
+      currentCount: 1,
+      totalQuantity,
+      productQuantity: totalQuantity,
+      creatorQuantity,
+      creatorProductQuantity: creatorQuantity,
+      orderedQuantity: creatorQuantity,
+      allocatedProductQuantity: creatorQuantity,
+      minPeople: Number(draft.minPeople || 1),
+      maxPeople: Math.min(20, Number(draft.maxPeople || targetPeople)),
+      groupStatus: 'recruiting',
+      chatLocked: false,
+      creatorActorId,
+      hostMode,
+      hostMatched: hostMode === 'self',
+      hostActorId: hostMode === 'self' ? creatorActorId : '',
+      version: 1,
+      stateHistory: [],
       likes: 0,
       image: draft.image || draft.baseDeal.image || fallbackImage,
       menu: [
         {
           id: `customer-menu-${Date.now()}`,
           name: draft.title,
-          price: Number(draft.expectedPrice || discountedPrice(draft.baseDeal.originalPrice, draft.baseDeal.discountRate)),
-          option: draft.category,
+          price: productAllocation.unitPrice,
+          option: `${draft.category} · 1개 기준`,
         },
       ],
     };
     setCustomerGroups((current) => {
-      const next = [group, ...current];
+      const next = [group, ...current.filter((item) => item.id !== group.id)];
       saveJson(CUSTOMER_GROUPS_KEY, next);
       return next;
     });
@@ -207,22 +1277,260 @@ function App() {
       category: group.category,
       method: draft.method,
       title: group.title,
+      target_people: targetPeople,
+      total_quantity: totalQuantity,
+      creator_quantity: creatorQuantity,
+      host_mode: hostMode,
     });
+    await initializeGroupRoom({
+      deal: group,
+      actorId: creatorActorId,
+      nickname: profile?.name || '테스트 호스트',
+    });
+    const published = await publishPublicDeal(group);
+    if (published) setRemoteDeals((current) => mergeDeals([published], current));
     return group;
   };
 
-  const saveCustomerOrder = (order) => {
+  const saveCustomerOrder = async (order) => {
+    const isPurchase = order.type === 'purchase';
+    const isCustomerGroupPurchase = isPurchase && order.deal?.source === 'customer';
+    const actorId = getVisitorId();
+    let groupSnapshot = null;
+    if (isCustomerGroupPurchase) {
+      const selectedQuantity = Math.max(1, Number(order.selectedCount || order.quantity || 1));
+      const existingCredential = getGroupCredential(order.deal.id, actorId);
+      if (existingCredential) {
+        const reserved = await reserveGroupQuantity(
+          order.deal.id,
+          selectedQuantity,
+          actorId,
+          order.clientMutationId,
+        );
+        groupSnapshot = reserved?.snapshot || null;
+      } else {
+        const joined = await joinGroupRoom({
+          deal: order.deal,
+          actorId,
+          nickname: profile?.name || '테스트 참여자',
+          role: 'member',
+          selectedQuantity,
+        });
+        groupSnapshot = joined?.snapshot || null;
+      }
+    }
+    const createdAt = new Date().toISOString();
+    const randomValue = new Uint32Array(1);
+    globalThis.crypto?.getRandomValues?.(randomValue);
+    const orderNonce = String(randomValue[0] || Math.floor(Math.random() * 1_000_000))
+      .slice(-6)
+      .padStart(6, '0');
+    const orderId = `order-${Date.now()}${orderNonce}`;
+    const participantKey = participationKey({
+      visitorId: getVisitorId(),
+      dealId: order.dealId,
+    });
+    const countedParticipations = loadJson(COUNTED_PARTICIPATIONS_KEY, {});
+    const isNewDealParticipant = isPurchase && !countedParticipations[participantKey];
+    const newOrder = {
+      id: orderId,
+      createdAt,
+      status: 'new',
+      paymentStatus: 'pending',
+      visitorId: actorId,
+      customerNumber: getCustomerNumber(),
+      customerName: profile?.name || '테스트 사용자',
+      customerPhone: profile?.phone || '미설정',
+      region: order.deal?.region || profile?.region || DEFAULT_LOCATION.region,
+      district: order.deal?.district || profile?.district || DEFAULT_LOCATION.district,
+      neighborhood: order.deal?.neighborhood || profile?.neighborhood || '미설정',
+      statusHistory: [{ status: 'new', actor: 'customer', timestamp: createdAt }],
+      ...order,
+    };
     setOrders((current) => {
-      const next = [
-        {
-          id: `order-${Date.now()}`,
-          createdAt: new Date().toISOString(),
-          ...order,
-        },
-        ...current,
-      ];
+      const next = [newOrder, ...current];
       saveJson(CUSTOMER_ORDERS_KEY, next);
       return next;
+    });
+    publishCustomerOrder(newOrder).then((published) => {
+      if (!published) return;
+      const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+      fingerprints[newOrder.id] = orderSyncFingerprint(newOrder);
+      saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+    });
+
+    if (isPurchase && order.deal?.id) {
+      const target = Math.max(1, Number(order.deal.target || 1));
+      const orderedQuantityIncrement = Math.max(1, Number(order.selectedCount || order.quantity || 1));
+      const alreadyJoinedRoom = Boolean(getGroupCredential(order.deal.id, getVisitorId()));
+      if (order.deal.source === 'customer') {
+        const currentCount = Number(groupSnapshot?.group?.currentCount ?? order.deal.current ?? 0);
+        const nextOrderedQuantity = Number(
+          groupSnapshot?.group?.orderedQuantity
+          ?? Number(order.deal.orderedQuantity || 0) + orderedQuantityIncrement,
+        );
+        const updatedDeal = {
+          ...order.deal,
+          current: currentCount,
+          currentPeople: currentCount,
+          currentCount,
+          participantCount: currentCount,
+          orderedQuantity: nextOrderedQuantity,
+          allocatedProductQuantity: nextOrderedQuantity,
+          updatedAt: groupSnapshot?.group?.updatedAt || order.deal.updatedAt,
+        };
+        countedParticipations[participantKey] = true;
+        saveJson(COUNTED_PARTICIPATIONS_KEY, countedParticipations);
+        setSelectedDeal((current) => (current?.id === updatedDeal.id ? updatedDeal : current));
+        setRemoteDeals((current) => mergeDeals(
+          [updatedDeal],
+          current.filter((item) => item.id !== updatedDeal.id),
+        ));
+        if (isNewDealParticipant) {
+          track('group_participant_joined', {
+            group_id: order.deal.id,
+            role: 'participant',
+            counted: true,
+            source: 'checkout',
+          });
+        }
+        return newOrder;
+      }
+      const participationIncrement = orderedQuantityIncrement;
+      const updatedDeal = {
+        ...order.deal,
+        quantityTracking: true,
+        current: Math.min(target, Math.max(0, Number(order.deal.current || 0)) + participationIncrement),
+        participantCount: Math.max(0, Number(order.deal.participantCount || 0))
+          + (isNewDealParticipant && !alreadyJoinedRoom ? 1 : 0),
+      };
+      if (isNewDealParticipant) {
+        countedParticipations[participantKey] = true;
+        saveJson(COUNTED_PARTICIPATIONS_KEY, countedParticipations);
+      }
+
+      setSelectedDeal((current) => (
+        current?.id === updatedDeal.id ? updatedDeal : current
+      ));
+      setRemoteDeals((current) => mergeDeals(
+        [updatedDeal],
+        current.filter((item) => item.id !== updatedDeal.id),
+      ));
+
+      if (updatedDeal.source === 'customer') {
+        setCustomerGroups((current) => {
+          const hasLocalDeal = current.some((item) => item.id === updatedDeal.id);
+          if (!hasLocalDeal) return current;
+          const next = current.map((item) => (
+            item.id === updatedDeal.id ? updatedDeal : item
+          ));
+          saveJson(CUSTOMER_GROUPS_KEY, next);
+          return next;
+        });
+      } else {
+        setCreatedDeals((current) => {
+          const hasLocalDeal = current.some((item) => item.id === updatedDeal.id);
+          if (!hasLocalDeal) return current;
+          const next = current.map((item) => (
+            item.id === updatedDeal.id ? updatedDeal : item
+          ));
+          saveCreatedDeals(next);
+          return next;
+        });
+      }
+    }
+    return newOrder;
+  };
+
+  const updateOrderStatus = (orderId) => {
+    const order = orders.find((item) => item.id === orderId);
+    if (!order) return;
+    const currentStage = getOrderStage(order);
+    const currentIndex = ORDER_STAGES.findIndex((stage) => stage.id === currentStage.id);
+    const nextStage = ORDER_STAGES[Math.min(currentIndex + 1, ORDER_STAGES.length - 1)];
+    if (currentStage.id === nextStage.id) return;
+    const statusUpdatedAt = new Date().toISOString();
+
+    const next = orders.map((item) => (
+      item.id === orderId
+        ? {
+          ...item,
+          status: nextStage.id,
+          statusUpdatedAt,
+          statusHistory: [
+            ...(item.statusHistory || []),
+            { status: nextStage.id, actor: 'owner', action: currentStage.action, timestamp: statusUpdatedAt },
+          ],
+        }
+        : item
+    ));
+    setOrders(next);
+    saveJson(CUSTOMER_ORDERS_KEY, next);
+    track('owner_order_status_changed', {
+      order_id: orderId,
+      deal_id: order.dealId,
+      from_status: currentStage.id,
+      to_status: nextStage.id,
+      action: currentStage.action,
+      total: Number(order.total || 0),
+      status_updated_at: statusUpdatedAt,
+    });
+  };
+
+  const confirmCustomerPickup = (orderId) => {
+    const order = orders.find((item) => item.id === orderId);
+    if (!order || order.type !== 'purchase' || order.customerPickupConfirmedAt) return;
+    if (!['pickup_waiting', 'completed'].includes(getOrderStage(order).id)) return;
+    const confirmedAt = new Date().toISOString();
+    const next = orders.map((item) => (
+      item.id === orderId
+        ? {
+          ...item,
+          customerPickupConfirmedAt: confirmedAt,
+          statusHistory: [
+            ...(item.statusHistory || []),
+            { status: 'customer_pickup_confirmed', actor: 'customer', timestamp: confirmedAt },
+          ],
+        }
+        : item
+    ));
+    setOrders(next);
+    saveJson(CUSTOMER_ORDERS_KEY, next);
+    track('customer_pickup_confirmed', {
+      order_id: orderId,
+      deal_id: order.dealId,
+      owner_status: getOrderStage(order).id,
+      total: Number(order.total || 0),
+      confirmed_at: confirmedAt,
+      neighborhood: order.neighborhood || order.deal?.neighborhood,
+    });
+  };
+
+  const confirmManualPayment = (orderId) => {
+    const order = orders.find((item) => item.id === orderId);
+    if (!order || order.type !== 'purchase' || order.paymentConfirmedAt) return;
+    const confirmedAt = new Date().toISOString();
+    const next = orders.map((item) => (
+      item.id === orderId
+        ? {
+          ...item,
+          paymentStatus: 'confirmed',
+          paymentConfirmedAt: confirmedAt,
+          statusHistory: [
+            ...(item.statusHistory || []),
+            { status: 'manual_payment_confirmed', actor: 'owner', timestamp: confirmedAt },
+          ],
+        }
+        : item
+    ));
+    setOrders(next);
+    saveJson(CUSTOMER_ORDERS_KEY, next);
+    track('manual_payment_confirmed', {
+      order_id: orderId,
+      deal_id: order.dealId,
+      total: Number(order.total || 0),
+      confirmed_at: confirmedAt,
+      neighborhood: order.neighborhood || order.deal?.neighborhood,
     });
   };
 
@@ -236,14 +1544,51 @@ function App() {
     });
   };
 
-  const applyHost = (deal) => {
+  const applyHost = async (deal) => {
+    const properties = { deal_id: deal.id, method: deal.methods?.join(', ') };
+    track('host_apply_clicked', properties);
+    if (deal.source === 'customer') {
+      const actorId = getVisitorId();
+      const result = await claimGroupHost({
+        deal,
+        actorId,
+        nickname: profile?.name || '테스트 참여자',
+      });
+      const group = result?.snapshot?.group || {};
+      const updatedDeal = {
+        ...deal,
+        hostMode: group.hostMode || deal.hostMode || 'recruiting',
+        hostMatched: Boolean(group.hostMatched ?? group.hostActorId),
+        hostActorId: group.hostActorId || actorId,
+        creatorActorId: group.creatorActorId || deal.creatorActorId,
+        current: Number(group.currentCount ?? deal.current ?? 0),
+        currentPeople: Number(group.currentCount ?? deal.currentPeople ?? deal.current ?? 0),
+        currentCount: Number(group.currentCount ?? deal.currentCount ?? deal.current ?? 0),
+        participantCount: Number(group.currentCount ?? deal.participantCount ?? deal.current ?? 0),
+        orderedQuantity: Number(group.orderedQuantity ?? deal.orderedQuantity ?? 0),
+        updatedAt: group.updatedAt || new Date().toISOString(),
+      };
+      updateCustomerDeal(updatedDeal, { observed: true, sync: false });
+    }
     setHostDealIds((current) => {
       const next = current.includes(deal.id) ? current : [deal.id, ...current];
       saveJson(HOST_DEALS_KEY, next);
       return next;
     });
-    track('host_applied', { deal_id: deal.id, method: deal.methods?.join(', ') });
+    track('host_apply_completed', properties);
   };
+
+  const customerProfile = ownerPreviewMode
+    ? {
+      ...(profile || {}),
+      name: profile?.name || '사장님 미리보기',
+      ...previewLocation,
+      testerType: '사장님',
+      consent: true,
+    }
+    : profile?.testerType === '사장님'
+      ? { ...profile, ...ownerLocation }
+      : profile;
 
   if (route === '/') {
     return <AppLauncher onNavigate={navigateTo} />;
@@ -259,7 +1604,7 @@ function App() {
             active="dashboard"
             onNavigate={navigateTo}
           />
-          <Dashboard analyticsReady={analyticsReady} />
+          <Dashboard analyticsReady={analyticsReady} orders={orders} />
         </section>
         <EventMonitor analyticsReady={analyticsReady} />
       </main>
@@ -270,53 +1615,73 @@ function App() {
     <main className="app individual-app">
       <section className="workspace">
         <StandaloneHeader
-          eyebrow={route === '/customer' ? '사용자 테스트' : '사장님 등록'}
-          title={route === '/customer' ? '사용자 앱' : '사장님 앱'}
-          active={route === '/customer' ? 'customer' : 'owner'}
+          eyebrow={route === '/customer' ? '사용자 테스트' : route === '/admin' ? '운영 테스트' : '사장님 등록'}
+          title={route === '/customer' ? '사용자 앱' : route === '/admin' ? '관리자 앱' : '사장님 앱'}
+          active={route.replace('/', '')}
           onNavigate={navigateTo}
         />
 
         <PhoneFrame>
-          {route === '/customer' && (
-            <CustomerApp
-              deals={deals}
-              profile={profile}
-              orders={orders}
-              favoriteIds={favoriteIds}
-              hostDealIds={hostDealIds}
-              selectedDeal={selectedDeal}
-              screen={customerScreen}
-              onProfileSubmit={handleProfileSubmit}
-              onSelectDeal={(deal) => {
-                setSelectedDeal(deal);
-                setCustomerScreen('detail');
-                track('open_listing', {
-                  deal_id: deal.id,
-                  category: deal.category,
-                  store: deal.store,
-                  title: deal.title,
-                });
-              }}
-              onScreen={setCustomerScreen}
-              onOrderCreate={saveCustomerOrder}
-              onGroupCreate={createCustomerGroup}
-              onToggleFavorite={toggleFavorite}
-              onHostApply={applyHost}
-              onLogout={handleLogout}
-            />
+          {['/customer', '/admin'].includes(route) && (
+            route === '/admin' && profile?.testerType !== '관리자' ? (
+              <Onboarding onSubmit={handleProfileSubmit} defaultTesterType="관리자" lockTesterType />
+            ) : (
+              <CustomerApp
+                deals={deals}
+                profile={route === '/admin' ? profile : customerProfile}
+                orders={orders}
+                favoriteIds={favoriteIds}
+                hostDealIds={hostDealIds}
+                selectedDeal={selectedDeal}
+                screen={customerScreen}
+                adminMode={route === '/admin'}
+                unreadCounts={unreadCounts}
+                statusNotices={statusNotices}
+                onProfileSubmit={handleProfileSubmit}
+                onSelectDeal={(deal) => {
+                  acknowledgeGroupStatus(deal);
+                  setSelectedDeal(deal);
+                  setCustomerScreen('detail');
+                  track('open_listing', {
+                    deal_id: deal.id,
+                    category: deal.category,
+                    store: deal.store,
+                    title: deal.title,
+                  });
+                }}
+                onScreen={setCustomerScreen}
+                onOrderCreate={saveCustomerOrder}
+                onGroupCreate={createCustomerGroup}
+                onToggleFavorite={toggleFavorite}
+                onHostApply={applyHost}
+                editableDealIds={customerGroups.map((deal) => deal.id)}
+                onUpdateDeal={updateCustomerDeal}
+                onDeleteDeal={removeDeal}
+                onConfirmPickup={confirmCustomerPickup}
+                onNeighborhoodChange={handleNeighborhoodChange}
+                onLogout={handleLogout}
+              />
+            )
           )}
-          {route === '/owner' && (
+          {route === '/owner' && (profile?.testerType !== '사장님' ? (
+            <Onboarding onSubmit={handleProfileSubmit} defaultTesterType="사장님" lockTesterType />
+          ) : (
             <OwnerApp
               screen={ownerScreen}
               selectedDeal={selectedDeal}
+              deals={deals}
               onScreen={setOwnerScreen}
               onCreate={addOwnerDeal}
-              onPreviewCustomer={() => {
-                navigateTo('/customer');
-                setCustomerScreen('detail');
-              }}
+              createdDeals={createdDeals}
+              onDeleteDeal={removeDeal}
+              orders={orders}
+              onOrderStatusChange={updateOrderStatus}
+              onPaymentConfirm={confirmManualPayment}
+              onPreviewCustomer={openOwnerCustomerPreview}
+              location={ownerLocation}
+              onNeighborhoodChange={handleOwnerNeighborhoodChange}
             />
-          )}
+          ))}
         </PhoneFrame>
       </section>
     </main>
@@ -341,20 +1706,27 @@ function AppLauncher({ onNavigate }) {
       path: '/owner',
     },
     {
+      id: 'admin',
+      title: '관리자 앱',
+      description: '그룹별 채팅 열람·작성, 거래 상태 관리, 채팅 잠금',
+      icon: ShieldCheck,
+      path: '/admin',
+    },
+    {
       id: 'dashboard',
       title: '검증 대시보드',
       description: 'Funnel, 체류시간, 설문, CSV, 이벤트 로그 확인',
       icon: BarChart3,
       path: '/dashboard',
     },
-  ];
+  ].filter((app) => RELEASE_FEATURES.admin || app.id !== 'admin');
 
   return (
     <main className="launcher-page">
       <section className="launcher-hero">
         <p className="eyebrow">위치기반 공동구매 O2O</p>
         <h1>클릭형 MVP</h1>
-        <p>합의된 세 산출물을 각각 독립 화면으로 분리했습니다.</p>
+        <p>개발 {RELEASE_FEATURES.phase}일차 기능 검수본 · 승인된 기능만 단계적으로 공개합니다.</p>
       </section>
       <section className="launcher-grid">
         {apps.map(({ id, title, description, icon: Icon, path }) => (
@@ -373,8 +1745,9 @@ function StandaloneHeader({ eyebrow, title, active, onNavigate }) {
   const links = [
     { id: 'customer', label: '사용자 앱', path: '/customer', icon: Users },
     { id: 'owner', label: '사장님 앱', path: '/owner', icon: Store },
+    { id: 'admin', label: '관리자 앱', path: '/admin', icon: ShieldCheck },
     { id: 'dashboard', label: '대시보드', path: '/dashboard', icon: BarChart3 },
-  ];
+  ].filter((link) => RELEASE_FEATURES.admin || link.id !== 'admin');
 
   return (
     <header className="standalone-header">
@@ -428,6 +1801,9 @@ function CustomerApp({
   hostDealIds,
   selectedDeal,
   screen,
+  adminMode = false,
+  unreadCounts = {},
+  statusNotices = {},
   onProfileSubmit,
   onSelectDeal,
   onScreen,
@@ -435,8 +1811,21 @@ function CustomerApp({
   onGroupCreate,
   onToggleFavorite,
   onHostApply,
+  editableDealIds,
+  onUpdateDeal,
+  onDeleteDeal,
+  onConfirmPickup,
+  onNeighborhoodChange,
   onLogout,
 }) {
+  const visitorId = profile ? getVisitorId() : null;
+  const neighborhoodDeals = deals.filter(
+    (deal) => deal.visibility === 'public' || !deal.neighborhood || sameLocation(deal, profile),
+  );
+  const customerOrders = orders.filter(
+    (order) => isOrderForProfile(order, profile, visitorId),
+  );
+
   if (!profile || screen === 'onboarding') {
     return <Onboarding onSubmit={onProfileSubmit} />;
   }
@@ -449,8 +1838,54 @@ function CustomerApp({
         onScreen={onScreen}
         isFavorite={favoriteIds.includes(selectedDeal.id)}
         onToggleFavorite={onToggleFavorite}
-        hostMatched={Boolean(selectedDeal.hostMatched || hostDealIds.includes(selectedDeal.id))}
+        hostMatched={isDealHostMatched(selectedDeal, hostDealIds)}
         onHostApply={onHostApply}
+        editable={editableDealIds.includes(selectedDeal.id)}
+        onUpdateDeal={onUpdateDeal}
+        onDeleteDeal={async (deal) => {
+          await onDeleteDeal(deal);
+          onScreen('list');
+        }}
+        adminMode={adminMode}
+        unreadCount={unreadCounts[selectedDeal.id] || 0}
+        onOpenRoom={() => onScreen('room')}
+      />
+    );
+  }
+
+  if (screen === 'room') {
+    return (
+      <GroupRoom
+        deal={selectedDeal}
+        profile={profile}
+        adminMode={adminMode}
+        isCreator={editableDealIds.includes(selectedDeal.id)}
+        onBack={() => onScreen('detail')}
+        onDealUpdate={onUpdateDeal}
+      />
+    );
+  }
+
+  if (screen === 'calculator') {
+    return (
+      <SplitCalculator
+        initialTotal={selectedDeal?.simulation?.total || 39000}
+        initialPeople={selectedDeal?.simulation?.people || 3}
+        initialProductQuantity={selectedDeal?.simulation?.totalQuantity || selectedDeal?.simulation?.productQuantity || 3}
+        initialSelectedQuantity={selectedDeal?.simulation?.creatorQuantity || selectedDeal?.simulation?.creatorProductQuantity || 1}
+        onBack={() => onScreen('list')}
+        onCreateGroup={(simulation) => {
+          onSelectDeal({
+            ...NEW_CUSTOMER_GROUP_DEAL,
+            originalPrice: simulation.total,
+            target: simulation.people,
+            targetPeople: simulation.people,
+            totalQuantity: simulation.totalQuantity || simulation.productQuantity,
+            creatorQuantity: simulation.creatorQuantity || simulation.creatorProductQuantity,
+            simulation,
+          });
+          onScreen('group');
+        }}
       />
     );
   }
@@ -459,6 +1894,7 @@ function CustomerApp({
     return (
       <JoinFlow
         deal={selectedDeal}
+        orders={customerOrders}
         onBack={() => onScreen('detail')}
         onScreen={onScreen}
         onOrderCreate={onOrderCreate}
@@ -471,7 +1907,7 @@ function CustomerApp({
     return (
       <GroupCreator
         deal={selectedDeal}
-        onBack={() => onScreen('detail')}
+        onBack={() => onScreen(selectedDeal.isNewGroup ? 'explore' : 'detail')}
         onScreen={onScreen}
         onOrderCreate={onOrderCreate}
         onGroupCreate={onGroupCreate}
@@ -490,8 +1926,10 @@ function CustomerApp({
   if (screen === 'explore') {
     return (
       <ExploreTab
-        deals={deals}
+        deals={neighborhoodDeals}
         hostDealIds={hostDealIds}
+        unreadCounts={unreadCounts}
+        statusNotices={statusNotices}
         onSelectDeal={onSelectDeal}
         onScreen={onScreen}
       />
@@ -499,7 +1937,15 @@ function CustomerApp({
   }
 
   if (screen === 'orders') {
-    return <OrdersTab orders={orders} deals={deals} onSelectDeal={onSelectDeal} onScreen={onScreen} />;
+    return (
+      <OrdersTab
+        orders={customerOrders}
+        deals={deals}
+        onSelectDeal={onSelectDeal}
+        onConfirmPickup={onConfirmPickup}
+        onScreen={onScreen}
+      />
+    );
   }
 
   if (screen === 'favorites') {
@@ -507,6 +1953,8 @@ function CustomerApp({
       <FavoritesTab
         favoriteDeals={deals.filter((deal) => favoriteIds.includes(deal.id))}
         hostDealIds={hostDealIds}
+        unreadCounts={unreadCounts}
+        statusNotices={statusNotices}
         onSelectDeal={onSelectDeal}
         onScreen={onScreen}
       />
@@ -517,7 +1965,7 @@ function CustomerApp({
     return (
       <ProfileTab
         profile={profile}
-        orders={orders}
+        orders={customerOrders}
         favoriteCount={favoriteIds.length}
         onScreen={onScreen}
         onLogout={onLogout}
@@ -527,26 +1975,30 @@ function CustomerApp({
 
   return (
     <DealList
-      deals={deals}
+      deals={neighborhoodDeals}
       profile={profile}
       hostDealIds={hostDealIds}
+      unreadCounts={unreadCounts}
+      statusNotices={statusNotices}
       onSelectDeal={onSelectDeal}
       onScreen={onScreen}
+      onNeighborhoodChange={onNeighborhoodChange}
     />
   );
 }
 
-function Onboarding({ onSubmit }) {
+function Onboarding({ onSubmit, defaultTesterType = '사용자', lockTesterType = false }) {
   useScreenAnalytics('onboarding');
   const [form, setForm] = useState({
     name: '',
     phone: '',
-    neighborhood: '판교',
-    testerType: '사용자',
+    ...DEFAULT_LOCATION,
+    testerType: defaultTesterType,
     consent: false,
   });
-
-  const disabled = !form.name || !form.phone || !form.consent;
+  const selectedRegion = getRegion(form.region);
+  const selectedDistrict = getDistrict(selectedRegion, form.district);
+  const disabled = !form.name.trim() || !form.phone.trim() || !form.consent;
 
   return (
     <section className="screen onboarding-screen">
@@ -554,13 +2006,14 @@ function Onboarding({ onSubmit }) {
         <ShoppingBag size={30} />
         <p className="eyebrow">위치기반 공동구매</p>
         <h1>모여사요</h1>
+        <span>기본 정보와 활동할 지역·동네를 설정해 주세요.</span>
       </div>
 
       <form
         className="form-stack"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!disabled) onSubmit(form);
+          if (!disabled) onSubmit({ ...form, name: form.name.trim(), phone: form.phone.trim() });
         }}
       >
         <label>
@@ -580,30 +2033,73 @@ function Onboarding({ onSubmit }) {
             inputMode="tel"
           />
         </label>
-        <label>
-          동네
-          <select
-            value={form.neighborhood}
-            onChange={(event) => setForm({ ...form, neighborhood: event.target.value })}
-          >
-            <option>판교</option>
-            <option>화곡</option>
-            <option>목동</option>
-            <option>운중동</option>
-          </select>
-        </label>
-        <div className="segmented-control">
-          {['사용자', '사장님', '투자자'].map((type) => (
-            <button
-              type="button"
-              key={type}
-              className={form.testerType === type ? 'segment active' : 'segment'}
-              onClick={() => setForm({ ...form, testerType: type })}
+        <div className="region-neighborhood-fields">
+          <label>
+            시·도
+            <select
+              value={form.region}
+              onChange={(event) => {
+                const region = getRegion(event.target.value);
+                const district = region.districts[0];
+                setForm({
+                  ...form,
+                  region: region.name,
+                  district: district.name,
+                  neighborhood: district.neighborhoods[0],
+                });
+              }}
             >
-              {type}
-            </button>
-          ))}
+              {REGIONS.map((region) => <option key={region.name}>{region.name}</option>)}
+            </select>
+          </label>
+          <label>
+            시·군·구
+            <select
+              value={form.district}
+              onChange={(event) => {
+                const district = getDistrict(selectedRegion, event.target.value);
+                setForm({ ...form, district: district.name, neighborhood: district.neighborhoods[0] });
+              }}
+            >
+              {selectedRegion.districts.map((district) => (
+                <option key={district.code} value={district.name}>{district.name}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            읍·면·동
+            <select
+              value={form.neighborhood}
+              onChange={(event) => setForm({ ...form, neighborhood: event.target.value })}
+            >
+              {selectedDistrict.neighborhoods.map((neighborhood) => (
+                <option key={neighborhood}>{neighborhood}</option>
+              ))}
+            </select>
+          </label>
         </div>
+        {lockTesterType ? (
+          <div className="neighborhood-link-preview">
+            {defaultTesterType === '관리자' ? <ShieldCheck size={18} /> : <Store size={18} />}
+            <div>
+              <strong>{defaultTesterType} 테스트 계정 등록</strong>
+              <span>{defaultTesterType === '관리자' ? '관리자 PIN은 그룹 입장 시 별도로 확인합니다.' : '입력한 정보로 상품과 주문을 구분합니다.'}</span>
+            </div>
+          </div>
+        ) : (
+          <div className="segmented-control">
+            {['사용자', '사장님', '투자자'].map((type) => (
+              <button
+                type="button"
+                key={type}
+                className={form.testerType === type ? 'segment active' : 'segment'}
+                onClick={() => setForm({ ...form, testerType: type })}
+              >
+                {type}
+              </button>
+            ))}
+          </div>
+        )}
         <label className="check-row">
           <input
             type="checkbox"
@@ -612,6 +2108,16 @@ function Onboarding({ onSubmit }) {
           />
           개인정보 수집 및 테스트 행동 데이터 수집 동의
         </label>
+        <p className="evidence-note">
+          이름·연락처는 검증용 Google Sheets에 저장되며, PostHog에는 연락처와 이름을 제외한 고객번호·지역·행동 이벤트만 전송됩니다.
+        </p>
+        <div className="neighborhood-link-preview">
+          <MapPin size={18} />
+          <div>
+            <strong>{formatLocation(form)} 화면으로 연결</strong>
+            <span>같은 동네의 사장님 상품과 주문 상태만 표시됩니다.</span>
+          </div>
+        </div>
         <button className="primary-button" type="submit" disabled={disabled}>
           <Check size={18} />
           테스트 시작
@@ -621,13 +2127,26 @@ function Onboarding({ onSubmit }) {
   );
 }
 
-function DealList({ deals, profile, hostDealIds, onSelectDeal, onScreen }) {
-  useScreenAnalytics('deal_list', { neighborhood: profile.neighborhood });
+function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotices = {}, onSelectDeal, onScreen, onNeighborhoodChange }) {
+  useScreenAnalytics('deal_list', {
+    region: profile.region,
+    district: profile.district,
+    neighborhood: profile.neighborhood,
+  });
   const [category, setCategory] = useState('전체');
   const [query, setQuery] = useState('');
   const [source, setSource] = useState('all');
+  const [selectingNeighborhood, setSelectingNeighborhood] = useState(false);
+  const totalUnread = Object.values(unreadCounts).reduce((sum, value) => sum + Number(value || 0), 0);
+  const totalStatusNotices = Object.keys(statusNotices).length;
 
-  const categories = ['전체', '카페', '식사', '간식', '편의점', '음식', '장보기/마트', '식재료', '생활용품', '기타'];
+  useEffect(() => {
+    if (totalUnread > 0) {
+      track('unread_badge_viewed', { unread_count: totalUnread });
+    }
+  }, [totalUnread]);
+
+  const categories = ['전체', ...PRODUCT_CATEGORIES];
   const filtered = deals.filter((deal) => {
     const matchCategory = category === '전체' || deal.category === category;
     const matchSource = source === 'all' || deal.source === source;
@@ -640,17 +2159,44 @@ function DealList({ deals, profile, hostDealIds, onSelectDeal, onScreen }) {
       <header className="top-nav">
         <div>
           <p className="eyebrow">현재 위치</p>
-          <h1>{profile.neighborhood} 공동구매</h1>
+          <button className="location-trigger" onClick={() => setSelectingNeighborhood(true)}>
+            <MapPin size={19} />
+            <span>{profile.neighborhood} 공동구매</span>
+          </button>
         </div>
-        <button className="icon-button" aria-label="알림">
-          <Bell size={20} />
-        </button>
+        <div className="inline-actions">
+          <button className="icon-button" aria-label="예상 부담금 계산기" onClick={() => onScreen('calculator')}>
+            <Calculator size={20} />
+          </button>
+          {RELEASE_FEATURES.unreadBadges && (
+            <button className="icon-button notification-button" aria-label="그룹별 새 메시지">
+              <Bell size={20} />
+              {totalUnread + totalStatusNotices > 0 && (
+                <span>{Math.min(99, totalUnread + totalStatusNotices)}</span>
+              )}
+            </button>
+          )}
+        </div>
       </header>
+
+      <div className="neighborhood-sync-banner">
+        <MapPin size={16} />
+        <div>
+          <strong>{profile.neighborhood} 동네 연동 중</strong>
+          <span>동네 상품과 전체 공개 테스트 상품을 함께 표시합니다.</span>
+        </div>
+      </div>
 
       <div className="search-field">
         <Search size={18} />
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="매장 또는 상품 검색" />
       </div>
+
+      <button className="calculator-entry-card" onClick={() => onScreen('calculator')}>
+        <Calculator size={22} />
+        <div><strong>나눠 사면 1인당 얼마일까요?</strong><span>그룹 참여 없이 판매가와 인원만으로 바로 계산</span></div>
+        <ChevronRight size={18} />
+      </button>
 
       <div className="source-filter">
         {[
@@ -688,22 +2234,112 @@ function DealList({ deals, profile, hostDealIds, onSelectDeal, onScreen }) {
       </div>
 
       <div className="deal-list">
+        {filtered.length === 0 && (
+          <div className="inline-empty-state">
+            <MapPin size={26} />
+            <strong>{profile.neighborhood}에 표시할 공동구매가 없어요</strong>
+            <span>다른 지역을 선택하거나 첫 그룹을 만들어보세요.</span>
+          </div>
+        )}
         {filtered.map((deal) => (
           <DealCard
             key={deal.id}
             deal={deal}
-            hostMatched={Boolean(deal.hostMatched || hostDealIds.includes(deal.id))}
+            hostMatched={isDealHostMatched(deal, hostDealIds)}
+            unreadCount={unreadCounts[deal.id] || 0}
+            statusNotice={statusNotices[deal.id] || ''}
             onClick={() => onSelectDeal(deal)}
           />
         ))}
       </div>
 
       <BottomNav active="home" onSelect={onScreen} />
+      {selectingNeighborhood && (
+        <NeighborhoodPicker
+          current={profile}
+          onClose={() => setSelectingNeighborhood(false)}
+          onSelect={(location) => {
+            onNeighborhoodChange(location);
+            setSelectingNeighborhood(false);
+          }}
+        />
+      )}
     </section>
   );
 }
 
-function DealCard({ deal, hostMatched, onClick }) {
+function NeighborhoodPicker({ current, onSelect, onClose }) {
+  const [location, setLocation] = useState(() => normalizeLocation(current));
+  const selectedRegion = getRegion(location.region);
+  const selectedDistrict = getDistrict(selectedRegion, location.district);
+
+  return (
+    <div className="sheet-backdrop" role="dialog" aria-modal="true">
+      <div className="bottom-sheet neighborhood-sheet">
+        <div className="sheet-header">
+          <div>
+            <p className="eyebrow">지역별 공동구매</p>
+            <h2>지역 설정</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="닫기">
+            <X size={20} />
+          </button>
+        </div>
+        <div className="region-neighborhood-fields neighborhood-picker-fields">
+          <label>
+            시·도
+            <select
+              value={location.region}
+              onChange={(event) => {
+                const region = getRegion(event.target.value);
+                const district = region.districts[0];
+                setLocation({
+                  region: region.name,
+                  district: district.name,
+                  neighborhood: district.neighborhoods[0],
+                });
+              }}
+            >
+              {REGIONS.map((region) => <option key={region.code} value={region.name}>{region.name}</option>)}
+            </select>
+          </label>
+          <label>
+            시·군·구
+            <select
+              value={location.district}
+              onChange={(event) => {
+                const district = getDistrict(selectedRegion, event.target.value);
+                setLocation({ ...location, district: district.name, neighborhood: district.neighborhoods[0] });
+              }}
+            >
+              {selectedRegion.districts.map((district) => (
+                <option key={district.code} value={district.name}>{district.name}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            읍·면·동
+            <select
+              value={location.neighborhood}
+              onChange={(event) => setLocation({ ...location, neighborhood: event.target.value })}
+            >
+              {selectedDistrict.neighborhoods.map((neighborhood) => (
+                <option key={neighborhood}>{neighborhood}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <button className="primary-button" onClick={() => onSelect(location)}>
+          <MapPin size={17} />
+          {location.neighborhood} 적용
+        </button>
+        <p className="neighborhood-help">같은 동네로 설정된 사장님 상품, 사용자 그룹, 주문 상태만 서로 연결됩니다.</p>
+      </div>
+    </div>
+  );
+}
+
+function DealCard({ deal, hostMatched, unreadCount = 0, statusNotice = '', onClick }) {
   const isCustomerGroup = deal.source === 'customer';
   const isInstant = deal.saleType === 'instant';
   const typeLabel = isCustomerGroup ? '사용자 그룹' : isInstant ? '선착순 즉시할인' : '사장님 공구';
@@ -716,14 +2352,24 @@ function DealCard({ deal, hostMatched, onClick }) {
       <div className="deal-content">
         <div className="deal-title-row">
           <strong>{deal.title}</strong>
-          <span>{isInstant ? '선착순' : deal.deadline}</span>
+          <span>{unreadCount > 0
+            ? `새 메시지 ${Math.min(99, unreadCount)}`
+            : statusNotice
+              ? `새 알림 · ${GROUP_STATUS_LABELS[statusNotice] || statusNotice}`
+              : isInstant ? '선착순' : deal.deadline}</span>
         </div>
         <div className="deal-badges">
           <span className={isCustomerGroup ? 'type-badge customer' : 'type-badge merchant'}>
             <TypeIcon size={12} />
             {typeLabel}
           </span>
-          {hostMatched && <span className="type-badge host">호스트 모집 완료</span>}
+          {hostMatched && <span className="type-badge host">{isCustomerGroup && deal.hostMode !== 'recruiting' ? '생성자가 호스트' : '호스트 모집 완료'}</span>}
+          {isCustomerGroup && deal.hostMode === 'recruiting' && !hostMatched && (
+            <span className="type-badge host recruiting">호스트 모집 중</span>
+          )}
+          {isCustomerGroup && (
+            <span className="type-badge trade">{GROUP_STATUS_LABELS[deal.groupStatus || 'recruiting']}</span>
+          )}
         </div>
         <p>{isCustomerGroup ? deal.description : deal.store}</p>
         <p className="muted-line">
@@ -736,9 +2382,9 @@ function DealCard({ deal, hostMatched, onClick }) {
             오늘 {deal.eventStart} ~ {deal.eventEnd} 진행
           </p>
         )}
-        <Progress current={deal.current} target={deal.target} />
+        <Progress deal={deal} />
         <div className="price-row">
-          <span>{isCustomerGroup ? '예상 분담금' : `${deal.discountRate}% 할인`}</span>
+          <span>{isCustomerGroup ? '제품 1개 예상금액' : `${deal.discountRate}% 할인`}</span>
           <strong>{formatWon(price)}</strong>
         </div>
       </div>
@@ -746,7 +2392,7 @@ function DealCard({ deal, hostMatched, onClick }) {
   );
 }
 
-function ExploreTab({ deals, hostDealIds, onSelectDeal, onScreen }) {
+function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {}, onSelectDeal, onScreen }) {
   useScreenAnalytics('customer_explore');
   const urgentDeals = [...deals].sort((a, b) => b.discountRate - a.discountRate);
 
@@ -762,7 +2408,7 @@ function ExploreTab({ deals, hostDealIds, onSelectDeal, onScreen }) {
           aria-label="그룹 만들기"
           onClick={() => {
             track('bottom_tab_action_clicked', { action: 'create_group' });
-            onSelectDeal(deals[0]);
+            onSelectDeal(NEW_CUSTOMER_GROUP_DEAL);
             onScreen('group');
           }}
         >
@@ -777,7 +2423,7 @@ function ExploreTab({ deals, hostDealIds, onSelectDeal, onScreen }) {
         </div>
         <div>
           <span>최대 할인</span>
-          <strong>{Math.max(...deals.map((deal) => deal.discountRate))}%</strong>
+          <strong>{deals.length ? Math.max(...deals.map((deal) => deal.discountRate)) : 0}%</strong>
         </div>
         <div>
           <span>그룹배달</span>
@@ -791,11 +2437,19 @@ function ExploreTab({ deals, hostDealIds, onSelectDeal, onScreen }) {
       </div>
 
       <div className="deal-list compact-deal-list">
+        {deals.length === 0 && (
+          <div className="inline-empty-state">
+            <MapPin size={26} />
+            <strong>이 지역에 진행 중인 공구가 없어요</strong>
+          </div>
+        )}
         {urgentDeals.map((deal) => (
           <DealCard
             key={deal.id}
             deal={deal}
-            hostMatched={Boolean(deal.hostMatched || hostDealIds.includes(deal.id))}
+            hostMatched={isDealHostMatched(deal, hostDealIds)}
+            unreadCount={unreadCounts[deal.id] || 0}
+            statusNotice={statusNotices[deal.id] || ''}
             onClick={() => onSelectDeal(deal)}
           />
         ))}
@@ -806,7 +2460,7 @@ function ExploreTab({ deals, hostDealIds, onSelectDeal, onScreen }) {
   );
 }
 
-function OrdersTab({ orders, deals, onSelectDeal, onScreen }) {
+function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onScreen }) {
   useScreenAnalytics('customer_orders', { order_count: orders.length });
   const dealById = new Map(deals.map((deal) => [deal.id, deal]));
 
@@ -832,20 +2486,64 @@ function OrdersTab({ orders, deals, onSelectDeal, onScreen }) {
         <div className="order-card-list">
           {orders.map((order) => {
             const deal = dealById.get(order.dealId) || order.deal;
+            const orderStage = getOrderStage(order);
+            const orderStageIndex = ORDER_STAGES.findIndex((stage) => stage.id === orderStage.id);
+            const canConfirmPickup = order.type === 'purchase'
+              && ['pickup_waiting', 'completed'].includes(orderStage.id)
+              && !order.customerPickupConfirmedAt;
+            const verificationComplete = order.type === 'purchase'
+              && orderStage.id === 'completed'
+              && Boolean(order.customerPickupConfirmedAt)
+              && Boolean(order.paymentConfirmedAt);
             return (
-              <button className="order-card" key={order.id} onClick={() => deal && onSelectDeal(deal)}>
+              <article className="order-card" key={order.id}>
                 <div className="order-status-line">
-                  <span>{order.type === 'group' ? '그룹방 생성' : '참여 완료'}</span>
-                  <strong>{order.method}</strong>
+                  <span>{order.type === 'group' ? '그룹방 생성' : orderStage.label}</span>
+                  <strong>{order.type === 'group' ? order.method : '사장님 상태 반영'}</strong>
                 </div>
                 <h2>{deal?.title || order.title}</h2>
                 <p>{deal?.store || order.store}</p>
+                {order.type !== 'group' && (
+                  <div className="order-status-steps" aria-label={`주문 상태 ${orderStage.label}`}>
+                    {ORDER_STAGES.map((stage, index) => (
+                      <span key={stage.id} className={index <= orderStageIndex ? 'active' : ''}>
+                        {stage.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 <div className="order-meta-grid">
                   <span>수량 {order.selectedCount || order.quantity || 1}개</span>
                   <span>{formatWon(order.total || discountedPrice(deal?.originalPrice, deal?.discountRate))}</span>
                   <span>{order.time || order.deadline || deal?.deadline}</span>
                 </div>
-              </button>
+                {order.type === 'purchase' && (
+                  <div className={order.paymentConfirmedAt ? 'customer-payment-state confirmed' : 'customer-payment-state'}>
+                    <strong>{order.paymentConfirmedAt ? '수동 결제 확인 완료' : '가상 주문 접수 · 결제 확인 대기'}</strong>
+                    <span>{order.paymentConfirmedAt ? '사장님이 결제 확인 상태를 반영했습니다.' : '실제 결제 후 사장님이 확인하면 이 화면에 표시됩니다.'}</span>
+                  </div>
+                )}
+                {verificationComplete && (
+                  <div className="transaction-verified-label">
+                    <Check size={15} />
+                    사장님·사용자 양측 픽업 확인 완료
+                  </div>
+                )}
+                {order.customerPickupConfirmedAt && !verificationComplete && (
+                  <div className="customer-confirmed-label">사용자 픽업 확인 완료 · 사장님/결제 처리 확인 중</div>
+                )}
+                <div className="order-card-actions">
+                  <button className="secondary-button compact-button" onClick={() => deal && onSelectDeal(deal)}>
+                    상세보기
+                  </button>
+                  {canConfirmPickup && (
+                    <button className="primary-button compact-button" onClick={() => onConfirmPickup(order.id)}>
+                      <Check size={15} />
+                      픽업 완료 확인
+                    </button>
+                  )}
+                </div>
+              </article>
             );
           })}
         </div>
@@ -856,7 +2554,7 @@ function OrdersTab({ orders, deals, onSelectDeal, onScreen }) {
   );
 }
 
-function FavoritesTab({ favoriteDeals, hostDealIds, onSelectDeal, onScreen }) {
+function FavoritesTab({ favoriteDeals, hostDealIds, unreadCounts = {}, statusNotices = {}, onSelectDeal, onScreen }) {
   useScreenAnalytics('customer_favorites', { favorite_count: favoriteDeals.length });
 
   return (
@@ -883,7 +2581,9 @@ function FavoritesTab({ favoriteDeals, hostDealIds, onSelectDeal, onScreen }) {
             <DealCard
               key={deal.id}
               deal={deal}
-              hostMatched={Boolean(deal.hostMatched || hostDealIds.includes(deal.id))}
+              hostMatched={isDealHostMatched(deal, hostDealIds)}
+              unreadCount={unreadCounts[deal.id] || 0}
+              statusNotice={statusNotices[deal.id] || ''}
               onClick={() => onSelectDeal(deal)}
             />
           ))}
@@ -897,6 +2597,7 @@ function FavoritesTab({ favoriteDeals, hostDealIds, onSelectDeal, onScreen }) {
 
 function ProfileTab({ profile, orders, favoriteCount, onScreen, onLogout }) {
   useScreenAnalytics('customer_profile');
+  const customerNumber = getCustomerNumber();
 
   return (
     <section className="screen">
@@ -912,7 +2613,8 @@ function ProfileTab({ profile, orders, favoriteCount, onScreen, onLogout }) {
         <div className="profile-avatar">{profile.name.slice(0, 1)}</div>
         <div>
           <h2>{profile.name}</h2>
-          <p>{profile.neighborhood} · {profile.testerType}</p>
+          <p>{formatLocation(profile)} · {profile.testerType}</p>
+          <p className="customer-number">고객번호 {customerNumber}</p>
         </div>
       </div>
 
@@ -968,12 +2670,83 @@ function EmptyCustomerState({ icon: Icon, title, body, actionLabel, onAction }) 
   );
 }
 
-function DealDetail({ deal, onBack, onScreen, isFavorite, onToggleFavorite, hostMatched, onHostApply }) {
+function DealDetail({
+  deal,
+  onBack,
+  onScreen,
+  isFavorite,
+  onToggleFavorite,
+  hostMatched,
+  onHostApply,
+  editable = false,
+  onUpdateDeal,
+  onDeleteDeal,
+  adminMode = false,
+  unreadCount = 0,
+  onOpenRoom,
+}) {
   useScreenAnalytics('deal_detail', { deal_id: deal.id, category: deal.category });
   const [sharing, setSharing] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [hostApplying, setHostApplying] = useState(false);
+  const [hostApplyError, setHostApplyError] = useState('');
+  const [editForm, setEditForm] = useState({
+    title: deal.title,
+    description: deal.description || '',
+    address: deal.address || '',
+    deadline: deal.deadline || '',
+    price: String(deal.source === 'customer' ? deal.originalPrice : getDealPrice(deal)),
+    target: String(deal.target || 1),
+  });
   const isCustomerGroup = deal.source === 'customer';
   const isInstant = deal.saleType === 'instant';
-  const canHostApply = !isInstant && !isCustomerGroup && (deal.methods || []).some((method) => ['그룹배달', '픽업'].includes(method));
+  const dealQuantity = getDealQuantity(deal);
+  const split = isCustomerGroup
+    ? calculateSplit(
+      Math.max(0, Math.floor(Number(deal.originalPrice || 0))),
+      Math.max(1, Math.min(20, Number(deal.targetPeople || deal.target || 1))),
+      Math.max(0, Math.min(20, Number(deal.currentPeople ?? deal.current ?? 0))),
+    )
+    : null;
+  const productSplit = isCustomerGroup
+    ? calculateProductAllocation(
+      Math.max(0, Math.floor(Number(deal.originalPrice || 0))),
+      dealQuantity.target,
+      Math.min(1, dealQuantity.target),
+    )
+    : null;
+  const expectedPerPerson = isCustomerGroup
+    ? Number(deal.unitPrice ?? deal.expectedPerPerson ?? deal.menu?.[0]?.price ?? productSplit.unitPrice)
+    : getDealPrice(deal);
+  const customerHostRecruiting = isCustomerGroup && deal.hostMode === 'recruiting';
+  const recruitmentOpen = (deal.groupStatus || 'recruiting') === 'recruiting';
+  const existingGroupCredential = isCustomerGroup
+    ? getGroupCredential(deal.id, getVisitorId())
+    : null;
+  const newParticipantCapacityReached = isCustomerGroup
+    && !existingGroupCredential
+    && split.current >= split.people;
+  const canHostApply = !hostMatched && (
+    (customerHostRecruiting && recruitmentOpen)
+    || (!isInstant && !isCustomerGroup && (deal.methods || []).some((method) => ['그룹배달', '픽업'].includes(method)))
+  );
+
+  const handleHostApply = async () => {
+    if (!canHostApply || hostApplying) return;
+    setHostApplying(true);
+    setHostApplyError('');
+    try {
+      await onHostApply(deal);
+    } catch (applyError) {
+      setHostApplyError(applyError?.message === 'host_already_claimed'
+        ? '다른 참여자가 먼저 호스트로 확정되었습니다.'
+        : applyError?.message === 'host_claim_closed'
+          ? '현재는 호스트 지원을 받을 수 없는 상태입니다.'
+        : '호스트 지원을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+    } finally {
+      setHostApplying(false);
+    }
+  };
 
   return (
     <section className="screen detail-screen">
@@ -983,9 +2756,11 @@ function DealDetail({ deal, onBack, onScreen, isFavorite, onToggleFavorite, host
         </button>
         <h1>공동구매 상세</h1>
         <div className="inline-actions">
-          <button className="icon-button" onClick={() => setSharing(true)} aria-label="공유">
-            <Share2 size={20} />
-          </button>
+          {RELEASE_FEATURES.sharing && (
+            <button className="icon-button" onClick={() => setSharing(true)} aria-label="공유">
+              <Share2 size={20} />
+            </button>
+          )}
           <button
             className={isFavorite ? 'icon-button liked' : 'icon-button'}
             onClick={() => {
@@ -1000,13 +2775,40 @@ function DealDetail({ deal, onBack, onScreen, isFavorite, onToggleFavorite, host
 
       <img className="hero-image" src={deal.image} alt="" />
 
+      {customerHostRecruiting && (
+        <div className={hostMatched ? 'host-apply-box matched' : 'host-apply-box recruiting'}>
+          <div>
+            <strong>{hostMatched
+              ? '호스트 모집 완료'
+              : recruitmentOpen ? '구매·픽업 호스트 모집 중' : '호스트 모집 종료'}</strong>
+            <p>{hostMatched
+              ? '구매와 픽업을 맡을 참여자가 확정되었습니다.'
+              : recruitmentOpen
+                ? '이 그룹은 생성자와 별도로 상품 구매·픽업을 맡을 호스트를 찾고 있습니다.'
+                : '거래 모집이 종료되어 더 이상 호스트 지원을 받지 않습니다.'}</p>
+          </div>
+          <button
+            className={hostMatched ? 'secondary-button compact-button' : 'primary-button compact-button'}
+            onClick={handleHostApply}
+            disabled={hostMatched || hostApplying || !canHostApply}
+          >
+            <Users size={16} />
+            {hostMatched ? '확정됨' : !recruitmentOpen ? '모집 종료' : hostApplying ? '지원 중…' : '호스트 지원하기'}
+          </button>
+          {hostApplyError && <p className="form-error host-apply-error">{hostApplyError}</p>}
+        </div>
+      )}
+
       <div className="content-block">
         <div className="detail-badge-row">
           <span className={isCustomerGroup ? 'type-badge customer' : 'type-badge merchant'}>
             {isCustomerGroup ? <User size={12} /> : <Store size={12} />}
-            {isCustomerGroup ? '사용자 호스트 그룹' : isInstant ? '선착순 즉시할인 상품' : '사장님 공동구매'}
+            {isCustomerGroup ? '사용자 공동구매 그룹' : isInstant ? '선착순 즉시할인 상품' : '사장님 공동구매'}
           </span>
-          {hostMatched && <span className="type-badge host">호스트 모집 완료</span>}
+          {hostMatched && <span className="type-badge host">{isCustomerGroup && deal.hostMode !== 'recruiting' ? '생성자가 호스트' : '호스트 모집 완료'}</span>}
+          {isCustomerGroup && deal.hostMode === 'recruiting' && !hostMatched && (
+            <span className="type-badge host recruiting">호스트 모집 중</span>
+          )}
         </div>
         <p className="deadline-line">
           <Clock size={15} />
@@ -1021,16 +2823,133 @@ function DealDetail({ deal, onBack, onScreen, isFavorite, onToggleFavorite, host
       </div>
 
       <div className="content-block">
-        <Progress current={deal.current} target={deal.target} />
-        <div className="detail-price-grid">
-          <span>정상가</span>
-          <del>{formatWon(deal.originalPrice)}</del>
-          <span>{isCustomerGroup ? '예상 분담금' : isInstant ? '선착순 할인가' : '공동구매가'}</span>
-          <strong>{formatWon(getDealPrice(deal))}</strong>
-        </div>
+        <Progress deal={deal} />
+        {isCustomerGroup ? (
+          <div className="group-price-comparison">
+            <div><span>혼자 구매 시</span><del>{formatWon(deal.originalPrice)}</del></div>
+            <div><span>제품 1개당 예상금액</span><strong>{deal.approximatePrice || productSplit.approximate ? '약 ' : ''}{formatWon(expectedPerPerson)}</strong></div>
+            <div>
+              <span>상품 수량</span>
+              <strong>{recruitmentOpen
+                ? `배정 ${dealQuantity.ordered}개 · 남은 ${dealQuantity.remaining}개`
+                : `모집 종료 · 배정 ${dealQuantity.ordered}개 / 총 ${dealQuantity.target}개`}</strong>
+            </div>
+            <p>{recruitmentOpen
+              ? `목표 ${split.people}명 / 현재 ${split.current}명 / 추가 모집 ${split.remaining}명`
+              : `모집 종료 · 참여 ${split.current}명 / 목표 ${split.people}명`}</p>
+            <p>{recruitmentOpen
+              ? `총 ${dealQuantity.target}개 중 원하는 수량을 선택해 참여할 수 있습니다.`
+              : `모집 종료 시점 배정 ${dealQuantity.ordered}개 · 미배정 ${dealQuantity.remaining}개`}</p>
+            <p>1인 구매 부담액 <b>{formatWon(Math.max(0, Number(deal.originalPrice || 0) - expectedPerPerson))} 감소</b></p>
+            {productSplit.remainder > 0 && <p>나머지 {formatWon(productSplit.remainder)}은 호스트가 부담해 총액을 정확히 맞춥니다.</p>}
+          </div>
+        ) : (
+          <div className="detail-price-grid">
+            <span>정상가</span>
+            <del>{formatWon(deal.originalPrice)}</del>
+            <span>{isInstant ? '선착순 할인가' : '공동구매가'}</span>
+            <strong>{formatWon(getDealPrice(deal))}</strong>
+          </div>
+        )}
       </div>
 
-      {canHostApply && (
+      {editable && (
+        <div className="content-block deal-management">
+          <div className="deal-management-heading">
+            <div>
+              <strong>내가 등록한 상품</strong>
+              <p>이 기기에서 등록한 상품만 수정하거나 삭제할 수 있습니다.</p>
+            </div>
+            <button className="secondary-button compact-button" onClick={() => setEditing((value) => !value)}>
+              <Pencil size={15} />
+              {editing ? '취소' : '수정'}
+            </button>
+          </div>
+          {editing && (
+            <div className="form-stack compact-form">
+              <label>
+                제목
+                <input value={editForm.title} onChange={(event) => setEditForm({ ...editForm, title: event.target.value })} />
+              </label>
+              <label>
+                설명
+                <textarea value={editForm.description} onChange={(event) => setEditForm({ ...editForm, description: event.target.value })} />
+              </label>
+              <label>
+                수령 위치
+                <input value={editForm.address} onChange={(event) => setEditForm({ ...editForm, address: event.target.value })} />
+              </label>
+              <label>
+                마감 시간
+                <input value={editForm.deadline} onChange={(event) => setEditForm({ ...editForm, deadline: event.target.value })} />
+              </label>
+              <label>
+                {isCustomerGroup ? '상품 판매가(총액)' : '판매가'}
+                <input type="number" min="0" value={editForm.price} onChange={(event) => setEditForm({ ...editForm, price: event.target.value })} />
+              </label>
+              {isCustomerGroup && (
+                <p className="evidence-note">
+                  목표 인원({Number(deal.target || 1)}명)은 거래 관리 화면에서 변경해 주세요. 참여자 수와 거래 단계가 함께 검증됩니다.
+                </p>
+              )}
+              <button
+                className="primary-button"
+                disabled={
+                  !editForm.title.trim()
+                  || Number(editForm.price) <= 0
+                }
+                onClick={() => {
+                  const price = Number(editForm.price);
+                  const target = Number(deal.target || 1);
+                  const editedAllocation = isCustomerGroup
+                    ? calculateProductAllocation(
+                      Math.floor(price),
+                      Math.max(1, Number(deal.totalQuantity || deal.productQuantity || target)),
+                      1,
+                    )
+                    : null;
+                  onUpdateDeal({
+                    ...deal,
+                    title: editForm.title.trim(),
+                    description: editForm.description.trim(),
+                    address: editForm.address.trim(),
+                    deadline: editForm.deadline.trim(),
+                    originalPrice: price,
+                    target,
+                    expectedPerPerson: editedAllocation?.unitPrice ?? deal.expectedPerPerson,
+                    unitPrice: editedAllocation?.unitPrice ?? deal.unitPrice,
+                    unitRemainder: editedAllocation?.remainder ?? deal.unitRemainder,
+                    splitRemainder: editedAllocation?.remainder ?? deal.splitRemainder,
+                    approximatePrice: editedAllocation?.approximate ?? deal.approximatePrice,
+                    discountRate: 0,
+                    menu: (deal.menu || []).map((item, index) => (
+                      index === 0
+                        ? { ...item, name: editForm.title.trim(), price: editedAllocation?.unitPrice ?? price }
+                        : item
+                    )),
+                    updatedAt: new Date().toISOString(),
+                  });
+                  setEditing(false);
+                }}
+              >
+                <Check size={16} />
+                수정 내용 저장
+              </button>
+            </div>
+          )}
+          <button
+            className="danger-button"
+            onClick={() => {
+              if (window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) onDeleteDeal(deal);
+            }}
+          >
+            <Trash2 size={16} />
+            상품 삭제
+          </button>
+        </div>
+      )}
+
+      {canHostApply && !customerHostRecruiting && (
         <div className="host-apply-box">
           <div>
             <strong>{hostMatched ? '호스트 매칭 완료' : '호스트 지원 가능'}</strong>
@@ -1038,7 +2957,7 @@ function DealDetail({ deal, onBack, onScreen, isFavorite, onToggleFavorite, host
           </div>
           <button
             className={hostMatched ? 'secondary-button compact-button' : 'primary-button compact-button'}
-            onClick={() => onHostApply(deal)}
+            onClick={handleHostApply}
             disabled={hostMatched}
           >
             <Users size={16} />
@@ -1057,39 +2976,87 @@ function DealDetail({ deal, onBack, onScreen, isFavorite, onToggleFavorite, host
       </div>
 
       <div className="sticky-actions">
-        <button
-          className="secondary-button"
-          onClick={() => {
-            onScreen('group');
-            track('group_create_started', { deal_id: deal.id });
-          }}
-        >
-          <Users size={18} />
-          {isCustomerGroup ? '비슷한 그룹 만들기' : '그룹방 만들기'}
-        </button>
-        <button
-          className="primary-button"
-          onClick={() => {
-            onScreen('join');
-            track(isInstant ? 'instant_checkout_started' : 'join_started', { deal_id: deal.id });
-          }}
-        >
-          <ShoppingBag size={18} />
-          {isInstant ? '선착순 할인 받기' : '참여하기'}
-        </button>
+        {isCustomerGroup ? (
+          <>
+            <button className="secondary-button room-entry-button" onClick={onOpenRoom}>
+              {RELEASE_FEATURES.chat ? <MessageCircle size={18} /> : <Check size={18} />}
+              {RELEASE_FEATURES.chat ? `그룹 채팅${unreadCount > 0 ? ` · ${Math.min(99, unreadCount)}` : ''}` : '거래 상태 관리'}
+            </button>
+            {!adminMode && (
+              <button
+                className="primary-button"
+                disabled={!recruitmentOpen || dealQuantity.remaining <= 0 || newParticipantCapacityReached}
+                onClick={() => {
+                  onScreen('join');
+                  track('join_started', { deal_id: deal.id });
+                }}
+              >
+                <ShoppingBag size={18} /> {!recruitmentOpen || dealQuantity.remaining <= 0
+                  ? '모집 종료'
+                  : newParticipantCapacityReached ? '인원 마감' : '참여하기'}
+              </button>
+            )}
+          </>
+        ) : (
+          <>
+            <button
+              className="secondary-button"
+              onClick={() => {
+                onScreen('group');
+                track('group_create_started', { deal_id: deal.id });
+              }}
+            >
+              <Users size={18} /> 그룹방 만들기
+            </button>
+            {!adminMode && (
+              <button
+                className="primary-button"
+                onClick={() => {
+                  onScreen('join');
+                  track(isInstant ? 'instant_checkout_started' : 'join_started', { deal_id: deal.id });
+                }}
+              >
+                <ShoppingBag size={18} />
+                {isInstant ? '선착순 할인 받기' : '참여하기'}
+              </button>
+            )}
+          </>
+        )}
       </div>
 
-      {sharing && <ShareSheet deal={deal} onClose={() => setSharing(false)} />}
+      {RELEASE_FEATURES.sharing && sharing && <ShareSheet deal={deal} onClose={() => setSharing(false)} />}
     </section>
   );
 }
 
 function ShareSheet({ deal, onClose }) {
   const channels = [
-    { id: 'kakao', label: '카카오톡', icon: MessageCircle },
+    { id: 'native', label: '카카오·SNS', icon: Share2 },
     { id: 'message', label: '문자', icon: Send },
     { id: 'copy', label: '링크 복사', icon: LinkIcon },
   ];
+  const shareUrl = `${window.location.origin}/customer?group=${encodeURIComponent(deal.id)}&view=detail`;
+  const shareText = `${deal.title} · 목표 ${deal.target || 1}명 공동구매에 함께해요`;
+
+  const copyLink = async () => {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(shareUrl);
+        return true;
+      } catch {
+        // Fall through to the selection-based copy path.
+      }
+    }
+    const input = document.createElement('textarea');
+    input.value = shareUrl;
+    input.style.position = 'fixed';
+    input.style.opacity = '0';
+    document.body.appendChild(input);
+    input.select();
+    const copied = document.execCommand('copy');
+    input.remove();
+    return copied;
+  };
 
   return (
     <div className="sheet-backdrop" role="dialog" aria-modal="true">
@@ -1111,9 +3078,27 @@ function ShareSheet({ deal, onClose }) {
           {channels.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
-              onClick={() => {
-                if (id === 'copy') navigator.clipboard?.writeText(window.location.href);
+              onClick={async () => {
+                let completed = true;
+                if (id === 'native') {
+                  if (navigator.share) {
+                    try {
+                      await navigator.share({ title: deal.title, text: shareText, url: shareUrl });
+                    } catch (shareError) {
+                      if (shareError?.name === 'AbortError') return;
+                      completed = await copyLink();
+                    }
+                  } else {
+                    completed = await copyLink();
+                  }
+                }
+                if (id === 'copy') completed = await copyLink();
+                if (!completed) return;
                 track('share_clicked', { channel: id, deal_id: deal.id });
+                track('group_shared', { channel: id, group_id: deal.id, deep_link: true });
+                if (id === 'message') {
+                  window.location.href = `sms:?&body=${encodeURIComponent(`${shareText}\n${shareUrl}`)}`;
+                }
                 onClose();
               }}
             >
@@ -1127,25 +3112,51 @@ function ShareSheet({ deal, onClose }) {
   );
 }
 
-function JoinFlow({ deal, onBack, onScreen, onOrderCreate }) {
+function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
   useScreenAnalytics('join_flow', { deal_id: deal.id });
+  const { target, remaining } = getDealQuantity(deal);
   const initialQuantities = useMemo(
-    () => Object.fromEntries(deal.menu.map((item, index) => [item.id, index === 0 ? 1 : 0])),
-    [deal.id],
+    () => Object.fromEntries(deal.menu.map((item, index) => [item.id, index === 0 && remaining > 0 ? 1 : 0])),
+    [deal.id, remaining],
   );
   const receiptMethods = deal.methods?.length ? deal.methods : ['픽업', '배달', '그룹배달', '택배'];
   const [quantities, setQuantities] = useState(initialQuantities);
   const [method, setMethod] = useState(receiptMethods[0]);
   const [time, setTime] = useState('오늘 20:30');
   const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+  const reservationMutationIdRef = useRef(createMutationId('checkout_quantity'));
   const isInstant = deal.saleType === 'instant';
+  const isCustomerGroup = deal.source === 'customer';
 
-  const total = deal.menu.reduce((sum, item) => sum + item.price * quantities[item.id], 0);
   const selectedCount = Object.values(quantities).reduce((sum, value) => sum + value, 0);
+  const baseTotal = deal.menu.reduce((sum, item) => sum + item.price * quantities[item.id], 0);
+  const isCurrentHost = isCustomerGroup && deal.hostActorId === getVisitorId();
+  const hostRemainderAlreadyApplied = isCurrentHost && (
+    (deal.hostMode !== 'recruiting' && deal.creatorActorId === getVisitorId())
+    || orders.some((order) => (
+      order.dealId === deal.id
+      && order.visitorId === getVisitorId()
+      && Number(order.hostRemainderApplied || 0) > 0
+    ))
+  );
+  const hostRemainder = isCurrentHost && selectedCount > 0 && !hostRemainderAlreadyApplied
+    ? Number(deal.unitRemainder ?? deal.splitRemainder ?? 0)
+    : 0;
+  const total = baseTotal + hostRemainder;
 
   const changeQuantity = (id, delta) => {
-    const next = clamp((quantities[id] || 0) + delta, 0, 20);
+    const otherSelected = Object.entries(quantities)
+      .filter(([menuId]) => menuId !== id)
+      .reduce((sum, [, value]) => sum + value, 0);
+    const next = clamp(
+      (quantities[id] || 0) + delta,
+      0,
+      Math.max(0, remaining - otherSelected),
+    );
     setQuantities({ ...quantities, [id]: next });
+    reservationMutationIdRef.current = createMutationId('checkout_quantity');
     track('quantity_changed', { deal_id: deal.id, menu_id: id, quantity: next });
   };
 
@@ -1170,6 +3181,13 @@ function JoinFlow({ deal, onBack, onScreen, onOrderCreate }) {
             <Counter value={quantities[item.id]} onMinus={() => changeQuantity(item.id, -1)} onPlus={() => changeQuantity(item.id, 1)} />
           </div>
         ))}
+      </div>
+
+      <div className="quantity-status-panel">
+        <span>총 수량 {target}개</span>
+        <strong>{deal.groupStatus && deal.groupStatus !== 'recruiting'
+          ? `모집 종료 · 배정 ${target - remaining}개`
+          : `남은 수량 ${remaining}개`}</strong>
       </div>
 
       <div className="content-block">
@@ -1202,7 +3220,7 @@ function JoinFlow({ deal, onBack, onScreen, onOrderCreate }) {
         </label>
         <label>
           요청사항
-          <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="매장에 전달할 내용" />
+          <input maxLength={200} value={note} onChange={(event) => setNote(event.target.value)} placeholder="매장에 전달할 내용" />
         </label>
       </div>
 
@@ -1215,32 +3233,52 @@ function JoinFlow({ deal, onBack, onScreen, onOrderCreate }) {
           <span>주문 금액</span>
           <strong>{formatWon(total)}</strong>
         </div>
+        {hostRemainder > 0 && (
+          <small>호스트 나머지 부담액 {formatWon(hostRemainder)} 포함</small>
+        )}
       </div>
+
+      {submitError && <p className="form-error join-submit-error">{submitError}</p>}
 
       <div className="sticky-actions single">
         <button
           className="primary-button"
-          disabled={selectedCount === 0}
-          onClick={() => {
+          disabled={submitting || selectedCount === 0 || remaining === 0 || (isCustomerGroup && deal.groupStatus !== 'recruiting')}
+          onClick={async () => {
+            setSubmitting(true);
+            setSubmitError('');
             track('checkout_started', { deal_id: deal.id, total, method, time });
-            track('purchase_completed', { deal_id: deal.id, total, method, time, note, selected_count: selectedCount });
-            onOrderCreate({
-              type: 'purchase',
-              dealId: deal.id,
-              deal,
-              title: deal.title,
-              store: deal.store,
-              total,
-              method,
-              time,
-              note,
-              selectedCount,
-            });
-            onScreen('complete');
+            try {
+              await onOrderCreate({
+                type: 'purchase',
+                dealId: deal.id,
+                groupId: deal.source === 'customer' ? (deal.groupId || deal.id) : '',
+                deal,
+                title: deal.title,
+                store: deal.store,
+                total,
+                method,
+                time,
+                note,
+                selectedCount,
+                hostRemainderApplied: hostRemainder,
+                clientMutationId: reservationMutationIdRef.current,
+              });
+              track('purchase_completed', { deal_id: deal.id, total, method, time, note, selected_count: selectedCount });
+              onScreen('complete');
+            } catch (orderError) {
+              setSubmitError(['quantity_unavailable', 'quantity_exceeds_total', 'group_full'].includes(orderError?.message)
+                ? '다른 참여자가 먼저 남은 수량을 선택했습니다. 최신 수량을 확인해 주세요.'
+                : ['quantity_reservation_closed', 'group_not_recruiting'].includes(orderError?.message)
+                  ? '모집이 종료되어 더 이상 수량을 선택할 수 없습니다.'
+                : '참여 신청을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+            } finally {
+              setSubmitting(false);
+            }
           }}
         >
           <Check size={18} />
-          {isInstant ? '구매 신청 완료' : '참여 완료하기'}
+          {submitting ? '처리 중…' : isInstant ? '구매 신청 완료' : '참여 완료하기'}
         </button>
       </div>
     </section>
@@ -1249,34 +3287,86 @@ function JoinFlow({ deal, onBack, onScreen, onOrderCreate }) {
 
 function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) {
   useScreenAnalytics('group_creator', { deal_id: deal.id });
+  const isStandaloneGroup = Boolean(deal.isNewGroup);
+  const draftGroupIdRef = useRef(`customer-${globalThis.crypto?.randomUUID?.() || Date.now()}`);
   const [form, setForm] = useState({
-    title: deal.source === 'customer' ? deal.title : `${deal.title} 같이 구매해요`,
-    category: deal.category || '음식',
-    description: deal.description || '',
+    title: isStandaloneGroup ? '' : deal.source === 'customer' ? deal.title : `${deal.title} 같이 구매해요`,
+    category: normalizeCategory(deal.category || '음식·간편식'),
+    description: isStandaloneGroup ? '' : deal.description || '',
     image: '',
-    minPeople: 3,
-    maxPeople: 5,
-    quantity: 5,
+    minPeople: 2,
+    maxPeople: Math.min(20, Number(deal.simulation?.people || deal.target || 5)),
+    quantity: Math.min(20, Math.max(1, Number(deal.simulation?.people || deal.target || 5))),
+    totalQuantity: Math.min(999, Math.max(1, Number(
+      deal.simulation?.totalQuantity
+      || deal.simulation?.productQuantity
+      || deal.totalQuantity
+      || deal.target
+      || 5,
+    ))),
+    creatorQuantity: Math.max(1, Number(
+      deal.simulation?.creatorQuantity
+      || deal.simulation?.creatorProductQuantity
+      || 1,
+    )),
+    hostMode: deal.hostMode === 'recruiting' ? 'recruiting' : 'self',
     method: '그룹배달',
-    expectedPrice: getDealPrice(deal),
-    deadlineDate: '2026-07-12',
+    totalPrice: String(deal.simulation?.total || (isStandaloneGroup ? '' : deal.originalPrice || getDealPrice(deal))),
+    deadlineDate: new Date().toISOString().slice(0, 10),
     deadlineTime: '20:00',
-    pickupPlace: '아파트 정문 앞',
+    pickupPlace: isStandaloneGroup ? '' : '아파트 정문 앞',
     conditionSave: true,
     conditionFirstCome: false,
     memo: '',
   });
+  const [imageProcessing, setImageProcessing] = useState(false);
+  const [imageError, setImageError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+  const splitPreview = calculateSplit(
+    Math.max(0, Math.floor(Number(form.totalPrice || 0))),
+    Math.max(1, Math.min(20, Number(form.quantity || 1))),
+    1,
+  );
+  const productPreview = calculateProductAllocation(
+    Math.max(0, Math.floor(Number(form.totalPrice || 0))),
+    Math.max(1, Math.min(999, Number(form.totalQuantity || 1))),
+    Math.max(1, Math.min(Number(form.totalQuantity || 1), Number(form.creatorQuantity || 1))),
+  );
 
   const updateNumber = (key, delta, min, max) => {
-    setForm((current) => ({ ...current, [key]: clamp(current[key] + delta, min, max) }));
+    setForm((current) => {
+      const nextValue = clamp(current[key] + delta, min, max);
+      if (key === 'quantity') {
+        return {
+          ...current,
+          quantity: nextValue,
+        };
+      }
+      if (key === 'totalQuantity') {
+        return {
+          ...current,
+          totalQuantity: nextValue,
+          creatorQuantity: Math.min(current.creatorQuantity, nextValue),
+        };
+      }
+      return { ...current, [key]: nextValue };
+    });
   };
 
-  const handleImage = (file) => {
+  const handleImage = async (file) => {
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => setForm((current) => ({ ...current, image: reader.result }));
-    reader.readAsDataURL(file);
-    track('group_image_uploaded', { file_type: file.type, size: file.size });
+    setImageProcessing(true);
+    setImageError('');
+    try {
+      const image = await compressImage(file, 900, 0.7);
+      setForm((current) => ({ ...current, image }));
+      track('group_image_uploaded', { file_type: file.type, size: file.size, compressed: true });
+    } catch (error) {
+      setImageError(error.message);
+    } finally {
+      setImageProcessing(false);
+    }
   };
 
   return (
@@ -1285,49 +3375,48 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
         <button className="icon-button" onClick={onBack} aria-label="뒤로">
           <ArrowLeft size={22} />
         </button>
-        <h1>호스트 그룹 생성</h1>
+        <h1>공동구매 그룹 생성</h1>
         <Heart size={19} />
       </header>
 
-      <div className="content-block">
-        <h2>참고 상품</h2>
-        <div className="selected-store">
-          <img src={deal.image} alt="" />
-          <div>
-            <strong>{deal.store}</strong>
-            <p>{deal.address}</p>
+      {!isStandaloneGroup && (
+        <div className="content-block">
+          <h2>참고 상품</h2>
+          <div className="selected-store">
+            <img src={deal.image} alt="" />
+            <div>
+              <strong>{deal.store}</strong>
+              <p>{deal.address}</p>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       <div className="group-image-uploader">
         <img src={form.image || deal.image} alt="" />
         <label className="secondary-button">
           <Upload size={18} />
-          그룹 이미지 변경
+          {imageProcessing ? '이미지 처리 중…' : '그룹 이미지 변경'}
           <input type="file" accept="image/*" onChange={(event) => handleImage(event.target.files?.[0])} />
         </label>
+        {imageError && <p className="form-error">{imageError}</p>}
       </div>
 
       <div className="form-stack compact-form">
         <label>
           그룹 제목
-          <input value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} />
+          <input maxLength={80} value={form.title} onChange={(event) => setForm({ ...form, title: event.target.value })} />
         </label>
         <label>
           카테고리
           <select value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>
-            <option>음식</option>
-            <option>장보기/마트</option>
-            <option>카페</option>
-            <option>식재료</option>
-            <option>생활용품</option>
-            <option>기타</option>
+            {PRODUCT_CATEGORIES.map((category) => <option key={category}>{category}</option>)}
           </select>
         </label>
         <label>
           간단 설명
           <textarea
+            maxLength={500}
             value={form.description}
             onChange={(event) => setForm({ ...form, description: event.target.value })}
             placeholder="예: 배달비 아끼실 분 같이 주문해요"
@@ -1336,9 +3425,32 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
       </div>
 
       <div className="creator-grid">
-        <FieldCounter label="최소 인원" value={form.minPeople} onMinus={() => updateNumber('minPeople', -1, 2, 20)} onPlus={() => updateNumber('minPeople', 1, 2, 20)} />
-        <FieldCounter label="최대 인원" value={form.maxPeople} onMinus={() => updateNumber('maxPeople', -1, form.minPeople, 50)} onPlus={() => updateNumber('maxPeople', 1, form.minPeople, 50)} />
-        <FieldCounter label="총 수량" value={form.quantity} onMinus={() => updateNumber('quantity', -1, 1, 100)} onPlus={() => updateNumber('quantity', 1, 1, 100)} />
+        <FieldCounter label="목표 인원" value={form.quantity} onMinus={() => updateNumber('quantity', -1, 1, 20)} onPlus={() => updateNumber('quantity', 1, 1, 20)} />
+        <div className="field-counter fixed-field-counter"><span>현재 인원</span><strong>그룹 생성자 1명</strong></div>
+      </div>
+
+      <div className="content-block host-mode-section">
+        <h2>구매·픽업 호스트</h2>
+        <p>그룹 아이디어만 올리고 실제 구매 담당자를 따로 모집할 수도 있습니다.</p>
+        <div className="segmented-control host-mode-control">
+          <button
+            type="button"
+            className={form.hostMode === 'self' ? 'segment active' : 'segment'}
+            onClick={() => setForm({ ...form, hostMode: 'self' })}
+          >
+            호스트로 참여
+          </button>
+          <button
+            type="button"
+            className={form.hostMode === 'recruiting' ? 'segment active' : 'segment'}
+            onClick={() => setForm({ ...form, hostMode: 'recruiting' })}
+          >
+            호스트 지원 요청
+          </button>
+        </div>
+        <small>{form.hostMode === 'self'
+          ? '그룹 생성자가 구매·픽업과 거래 상태 관리를 맡습니다.'
+          : '그룹 생성자는 아이디어를 올리고, 다른 참여자가 호스트로 지원할 수 있습니다.'}</small>
       </div>
 
       <div className="content-block">
@@ -1374,23 +3486,55 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
           </select>
         </label>
         <label>
-          예상 분담금
+          상품 판매가(총액)
           <input
             type="number"
-            value={form.expectedPrice}
-            onChange={(event) => setForm({ ...form, expectedPrice: Number(event.target.value) })}
+            min="0"
+            inputMode="numeric"
+            value={form.totalPrice}
+            onChange={(event) => setForm({ ...form, totalPrice: event.target.value })}
           />
         </label>
+        <div className="creator-grid product-allocation-counters">
+          <FieldCounter
+            label="상품 총수량"
+            value={form.totalQuantity}
+            onMinus={() => updateNumber('totalQuantity', -1, 1, 999)}
+            onPlus={() => updateNumber('totalQuantity', 1, 1, 999)}
+          />
+          <FieldCounter
+            label="내가 가져갈 수량"
+            value={form.creatorQuantity}
+            onMinus={() => updateNumber('creatorQuantity', -1, 1, form.totalQuantity)}
+            onPlus={() => updateNumber('creatorQuantity', 1, 1, form.totalQuantity)}
+          />
+        </div>
+        <div className="group-create-price-preview">
+          <span>제품 1개당 예상금액</span>
+          <strong>{productPreview.approximate ? '약 ' : ''}{formatWon(productPreview.unitPrice)}</strong>
+          <p>내가 {productPreview.selectedQuantity}개 선택 · 약 {formatWon(productPreview.selectedAmount)}</p>
+          {productPreview.remainder > 0 && (
+            <p>{form.hostMode === 'self'
+              ? `호스트 부담액 약 ${formatWon(productPreview.hostSelectedAmount)} · 나머지 ${formatWon(productPreview.remainder)} 포함`
+              : `남는 ${formatWon(productPreview.remainder)}은 지원할 호스트가 부담합니다.`}</p>
+          )}
+          <div className="allocation-inline-summary">
+            <span>현재 1명 / 목표 {splitPreview.people}명</span>
+            <strong>남은 제품 {productPreview.remainingQuantity}개 / 총 {productPreview.productQuantity}개</strong>
+          </div>
+          <p>혼자 전체 구매할 때보다 {formatWon(Math.max(0, productPreview.total - productPreview.selectedAmount))} 감소</p>
+        </div>
         <label>
           픽업 위치
           <input
+            maxLength={200}
             value={form.pickupPlace}
             onChange={(event) => setForm({ ...form, pickupPlace: event.target.value })}
           />
         </label>
         <label>
           기타 조건
-          <input value={form.memo} onChange={(event) => setForm({ ...form, memo: event.target.value })} placeholder="예: 같은 동 주민 우선" />
+          <input maxLength={300} value={form.memo} onChange={(event) => setForm({ ...form, memo: event.target.value })} placeholder="예: 같은 동 주민 우선" />
         </label>
         <label className="check-row">
           <input
@@ -1410,29 +3554,48 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
         </label>
       </div>
 
+      {submitError && <p className="form-error join-submit-error" role="alert">{submitError}</p>}
+
       <div className="sticky-actions single">
         <button
           className="primary-button"
-          onClick={() => {
-            const createdGroup = onGroupCreate({ ...form, baseDeal: deal });
-            onOrderCreate({
-              type: 'group',
-              dealId: createdGroup.id,
-              deal: createdGroup,
-              title: createdGroup.title,
-              store: createdGroup.store,
-              total: form.expectedPrice * form.quantity,
-              method: form.method,
-              deadline: `${form.deadlineDate} ${form.deadlineTime}`,
-              quantity: form.quantity,
-              selectedCount: form.quantity,
-            });
-            onScreen('complete');
+          onClick={async () => {
+            if (submitting) return;
+            setSubmitting(true);
+            setSubmitError('');
+            try {
+              const createdGroup = await onGroupCreate({
+                ...form,
+                groupId: draftGroupIdRef.current,
+                baseDeal: deal,
+              });
+              await onOrderCreate({
+                type: 'group',
+                dealId: createdGroup.id,
+                groupId: createdGroup.groupId || createdGroup.id,
+                deal: createdGroup,
+                title: createdGroup.title,
+                store: createdGroup.store,
+                total: form.hostMode === 'self'
+                  ? productPreview.hostSelectedAmount
+                  : productPreview.selectedAmount,
+                method: form.method,
+                deadline: `${form.deadlineDate} ${form.deadlineTime}`,
+                quantity: productPreview.selectedQuantity,
+                selectedCount: productPreview.selectedQuantity,
+                hostRemainderApplied: form.hostMode === 'self' ? productPreview.remainder : 0,
+              });
+              onScreen('room');
+            } catch {
+              setSubmitError('그룹방을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+            } finally {
+              setSubmitting(false);
+            }
           }}
-          disabled={!form.title || !form.category}
+          disabled={submitting || imageProcessing || !form.title || !form.category || Number(form.totalPrice) <= 0}
         >
           <Users size={18} />
-          그룹방 생성
+          {submitting ? '그룹방 생성 중…' : '그룹방 생성'}
         </button>
       </div>
     </section>
@@ -1450,6 +3613,13 @@ function Completion({ deal, onScreen }) {
       </div>
       <h1>{isInstant ? '구매 신청 완료' : isCustomerGroup ? '그룹 참여 완료' : '공동구매 참여 완료'}</h1>
       <p>{deal.store} {isInstant ? '선착순 즉시할인 신청이' : '공동구매 신청이'} 저장되었습니다.</p>
+
+      {!isCustomerGroup && (
+        <div className="completion-payment-note">
+          <strong>가상 주문 접수 완료</strong>
+          <span>실제 결제 후 사장님이 ‘결제 확인’을 누르면 내 주문 화면에 반영됩니다.</span>
+        </div>
+      )}
 
       <div className="completion-summary">
         <div>
@@ -1476,11 +3646,14 @@ function Completion({ deal, onScreen }) {
 
 function Survey({ onScreen }) {
   useScreenAnalytics('survey');
+  const [submitting, setSubmitting] = useState(false);
+  const [submittedLocally, setSubmittedLocally] = useState(false);
+  const [submitError, setSubmitError] = useState('');
   const [answer, setAnswer] = useState({
     reason: '더 저렴하게 구매할 수 있어서',
     discountExpectation: '15%',
     hostIntent: '조건이 맞으면 해보고 싶다',
-    preferredCategory: '음식',
+    preferredCategory: '음식·간편식',
     revisitIntent: '이용할 것 같다',
     feedback: '',
   });
@@ -1511,7 +3684,7 @@ function Survey({ onScreen }) {
     {
       key: 'preferredCategory',
       title: '가장 이용해 보고 싶은 공동구매',
-      options: ['음식', '카페/음료', '마트·장보기', '과일·농산물', '생활용품'],
+      options: PRODUCT_CATEGORIES,
     },
     {
       key: 'revisitIntent',
@@ -1550,6 +3723,7 @@ function Survey({ onScreen }) {
         <label>
           피드백 및 의견
           <textarea
+            maxLength={1000}
             value={answer.feedback}
             onChange={(event) => update('feedback', event.target.value)}
             placeholder="서비스를 이용하면서 느낀 점이나 개선 의견"
@@ -1557,46 +3731,177 @@ function Survey({ onScreen }) {
         </label>
       </div>
 
+      <p className="evidence-note">제출 즉시 고객번호·이름·연락처·응답 내용·제출 시간이 Google Sheets에 자동 저장됩니다.</p>
+      {submitError && <p className="form-error">{submitError}</p>}
+
       <button
         className="primary-button"
-        onClick={() => {
-          track('survey_submitted', answer);
-          onScreen('list');
+        disabled={submitting || submittedLocally}
+        onClick={async () => {
+          setSubmitting(true);
+          setSubmitError('');
+          const event = track('survey_submitted', answer);
+          const stored = await event.collectionPromise;
+          if (stored) {
+            onScreen('list');
+            return;
+          }
+          setSubmitting(false);
+          setSubmittedLocally(true);
+          setSubmitError('네트워크 연결을 확인해 주세요. 응답은 기기에 보관되며 온라인 상태에서 자동으로 다시 전송됩니다.');
         }}
       >
         <Check size={18} />
-        제출
+        {submitting ? '설문 저장 중…' : submittedLocally ? '기기에 안전하게 보관됨' : '설문 제출하기'}
       </button>
+      {submittedLocally && (
+        <button className="secondary-button" onClick={() => onScreen('list')}>
+          목록으로 돌아가기
+        </button>
+      )}
     </section>
   );
 }
 
-function OwnerApp({ screen, selectedDeal, onScreen, onCreate, onPreviewCustomer }) {
-  if (screen === 'done') {
-    return <OwnerDone deal={selectedDeal} onCreateAnother={() => onScreen('form')} onPreviewCustomer={onPreviewCustomer} />;
+function OwnerApp({
+  screen,
+  selectedDeal,
+  deals,
+  createdDeals,
+  orders,
+  location,
+  onScreen,
+  onCreate,
+  onDeleteDeal,
+  onPreviewCustomer,
+  onOrderStatusChange,
+  onPaymentConfirm,
+  onNeighborhoodChange,
+}) {
+  const [formVersion, setFormVersion] = useState(0);
+  const [editingDeal, setEditingDeal] = useState(null);
+  const neighborhoodOrders = orders.filter(
+    (order) => ['purchase', 'group'].includes(order.type)
+      && (!order.neighborhood || sameLocation(order, location)),
+  );
+  const neighborhoodGroups = deals.filter(
+    (deal) => deal.source === 'customer' && sameLocation(deal, location),
+  );
+
+  if (screen === 'orders') {
+    return (
+      <OwnerOrders
+        orders={neighborhoodOrders}
+        location={location}
+        onBack={() => onScreen('form')}
+        onStatusChange={onOrderStatusChange}
+        onPaymentConfirm={onPaymentConfirm}
+      />
+    );
   }
-  return <OwnerForm onCreate={onCreate} />;
+  if (screen === 'products') {
+    return (
+      <OwnerProducts
+        deals={createdDeals}
+        onBack={() => onScreen('form')}
+        onEdit={(deal) => {
+          setEditingDeal(deal);
+          setFormVersion((current) => current + 1);
+          onScreen('form');
+        }}
+        onDelete={onDeleteDeal}
+      />
+    );
+  }
+  if (screen === 'done') {
+    return (
+      <OwnerDone
+        deal={selectedDeal}
+        onCreateAnother={() => {
+          setEditingDeal(null);
+          setFormVersion((current) => current + 1);
+          onScreen('form');
+        }}
+        onOpenOrders={() => onScreen('orders')}
+        onPreviewCustomer={onPreviewCustomer}
+      />
+    );
+  }
+  return (
+    <OwnerForm
+      key={formVersion}
+      initialDeal={editingDeal}
+      onCreate={(payload) => {
+        onCreate(payload, editingDeal?.id || null);
+        setEditingDeal(null);
+      }}
+      onOpenOrders={() => onScreen('orders')}
+      onOpenProducts={() => onScreen('products')}
+      onPreviewCustomer={onPreviewCustomer}
+      orderCount={neighborhoodOrders.length}
+      communityGroups={neighborhoodGroups}
+      location={location}
+      onNeighborhoodChange={onNeighborhoodChange}
+    />
+  );
 }
 
-function OwnerForm({ onCreate }) {
+function OwnerForm({
+  initialDeal,
+  onCreate,
+  onOpenOrders,
+  onOpenProducts,
+  onPreviewCustomer,
+  orderCount,
+  communityGroups,
+  location,
+  onNeighborhoodChange,
+}) {
   useScreenAnalytics('owner_product_form');
+  const deadlineParts = String(initialDeal?.deadline || '').split(' ');
   const [form, setForm] = useState({
     saleType: 'group',
-    storeName: '반하다 테스트 매장',
-    productName: '불고기 피자',
-    category: '식사',
-    description: '마감 전 함께 주문하면 할인되는 테스트 상품입니다.',
-    originalPrice: 18000,
+    ...normalizeLocation(location),
+    storeName: '',
+    productName: '',
+    category: '음식·간편식',
+    description: '',
+    originalPrice: '',
     discountRate: 15,
-    stock: 10,
-    maxQuantity: 20,
-    deadline: '오늘 21:00',
+    stock: 0,
+    maxQuantity: 1,
+    deadlineDate: new Date().toISOString().slice(0, 10),
+    deadlineTime: '20:00',
     eventStart: '14:30',
     eventEnd: '16:00',
-    pickupPlace: '매장 앞 픽업대',
-    methods: ['픽업', '그룹배달'],
+    pickupPlace: '',
+    methods: [],
     image: '',
+    ...(initialDeal ? {
+      saleType: initialDeal.saleType || 'group',
+      ...normalizeLocation(initialDeal),
+      storeName: initialDeal.store || '',
+      productName: initialDeal.title || '',
+      category: normalizeCategory(initialDeal.category || '음식·간편식'),
+      description: initialDeal.description || '',
+      originalPrice: String(initialDeal.originalPrice || ''),
+      discountRate: Number(initialDeal.discountRate || 0),
+      stock: Number(initialDeal.stock || 0),
+      maxQuantity: Number(initialDeal.target || 1),
+      deadlineDate: /^\d{4}-\d{2}-\d{2}$/.test(deadlineParts[0]) ? deadlineParts[0] : new Date().toISOString().slice(0, 10),
+      deadlineTime: /^\d{2}:\d{2}$/.test(deadlineParts[1]) ? deadlineParts[1] : '20:00',
+      eventStart: initialDeal.eventStart || '14:30',
+      eventEnd: initialDeal.eventEnd || '16:00',
+      pickupPlace: initialDeal.address || '',
+      methods: initialDeal.methods || [],
+      image: initialDeal.image || '',
+    } : {}),
   });
+  const [imageProcessing, setImageProcessing] = useState(false);
+  const [imageError, setImageError] = useState('');
+
+  const selectedRegion = getRegion(form.region);
+  const selectedDistrict = getDistrict(selectedRegion, form.district);
 
   const price = discountedPrice(form.originalPrice, form.discountRate);
 
@@ -1607,12 +3912,19 @@ function OwnerForm({ onCreate }) {
     setForm({ ...form, methods });
   };
 
-  const handleImage = (file) => {
+  const handleImage = async (file) => {
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => setForm((current) => ({ ...current, image: reader.result }));
-    reader.readAsDataURL(file);
-    track('owner_image_uploaded', { file_type: file.type, size: file.size });
+    setImageProcessing(true);
+    setImageError('');
+    try {
+      const image = await compressImage(file);
+      setForm((current) => ({ ...current, image }));
+      track('owner_image_uploaded', { file_type: file.type, size: file.size, compressed: true });
+    } catch (error) {
+      setImageError(error.message);
+    } finally {
+      setImageProcessing(false);
+    }
   };
 
   return (
@@ -1622,24 +3934,160 @@ function OwnerForm({ onCreate }) {
           <p className="eyebrow">사장님 등록</p>
           <h1>메뉴 상세</h1>
         </div>
-        <Store size={22} />
+        <div className="inline-actions">
+          <button
+            className="icon-button"
+            onClick={() => onPreviewCustomer('list', form)}
+            aria-label="메인 화면 미리보기"
+          >
+            <Home size={19} />
+          </button>
+          <button className="owner-orders-button" onClick={onOpenOrders}>
+            <ShoppingBag size={18} />
+            <span>주문 {orderCount}</span>
+          </button>
+          <button className="icon-button" onClick={onOpenProducts} aria-label="등록 상품 관리">
+            <Pencil size={18} />
+          </button>
+        </div>
       </header>
+
+      <div className="owner-neighborhood-link">
+        <div>
+          <MapPin size={17} />
+          <span>연동 동네</span>
+        </div>
+        <div className="region-neighborhood-fields owner-location-fields">
+          <label>
+            시·도
+            <select
+              aria-label="사장님 연동 시도"
+              value={form.region}
+              onChange={(event) => {
+                const region = getRegion(event.target.value);
+                const district = region.districts[0];
+                const nextLocation = {
+                  region: region.name,
+                  district: district.name,
+                  neighborhood: district.neighborhoods[0],
+                };
+                setForm({ ...form, ...nextLocation });
+                onNeighborhoodChange(nextLocation);
+              }}
+            >
+              {REGIONS.map((region) => <option key={region.code} value={region.name}>{region.name}</option>)}
+            </select>
+          </label>
+          <label>
+            시·군·구
+            <select
+              aria-label="사장님 연동 시군구"
+              value={form.district}
+              onChange={(event) => {
+                const district = getDistrict(selectedRegion, event.target.value);
+                const nextLocation = {
+                  region: selectedRegion.name,
+                  district: district.name,
+                  neighborhood: district.neighborhoods[0],
+                };
+                setForm({ ...form, ...nextLocation });
+                onNeighborhoodChange(nextLocation);
+              }}
+            >
+              {selectedRegion.districts.map((district) => (
+                <option key={district.code} value={district.name}>{district.name}</option>
+              ))}
+            </select>
+          </label>
+          <label>
+            읍·면·동
+            <select
+              aria-label="사장님 연동 읍면동"
+              value={form.neighborhood}
+              onChange={(event) => {
+                const nextLocation = { ...normalizeLocation(form), neighborhood: event.target.value };
+                setForm({ ...form, ...nextLocation });
+                onNeighborhoodChange(nextLocation);
+              }}
+            >
+              {selectedDistrict.neighborhoods.map((neighborhood) => (
+                <option key={neighborhood}>{neighborhood}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <p>{formatLocation(form)} 사용자에게 상품과 주문 상태가 표시됩니다.</p>
+      </div>
+
+      {communityGroups.length > 0 && (
+        <div className="content-block owner-community-groups">
+          <div>
+            <p className="eyebrow">같은 동네 사용자 수요</p>
+            <h2>진행 중인 공동구매</h2>
+          </div>
+          {communityGroups.slice(0, 5).map((group) => {
+            const quantityState = getDealQuantity(group);
+            const unitAllocation = calculateProductAllocation(
+              Number(group.originalPrice || 0),
+              quantityState.target,
+              Math.min(1, quantityState.target),
+            );
+            return (
+              <article key={group.id}>
+                <div>
+                  <span>{normalizeCategory(group.category)} · {GROUP_STATUS_LABELS[group.groupStatus || 'recruiting']}</span>
+                  <strong>{group.title}</strong>
+                  <small>
+                    목표 {quantityState.targetPeople}명 / 현재 {quantityState.currentPeople}명 ·{' '}
+                    {formatGroupQuantityAllocation(quantityState, group.groupStatus || 'recruiting')}
+                  </small>
+                </div>
+                <b>{group.approximatePrice || unitAllocation.approximate ? '약 ' : ''}{formatWon(group.unitPrice ?? group.expectedPerPerson ?? unitAllocation.unitPrice)} / 1개</b>
+              </article>
+            );
+          })}
+        </div>
+      )}
 
       <div className="owner-image-uploader">
         {form.image ? <img src={form.image} alt="" /> : <Upload size={38} />}
         <label className="secondary-button">
           <Upload size={18} />
-          이미지 변경
+          {imageProcessing ? '이미지 처리 중…' : '이미지 변경'}
           <input type="file" accept="image/*" onChange={(event) => handleImage(event.target.files?.[0])} />
         </label>
+        {imageError && <p className="form-error">{imageError}</p>}
       </div>
 
       <form
         className="form-stack"
         onSubmit={(event) => {
           event.preventDefault();
-          const payload = { ...form, calculatedPrice: price };
-          track('owner_product_created', payload);
+          const payload = {
+            ...form,
+            deadline: form.saleType === 'instant'
+              ? `${form.eventStart} ~ ${form.eventEnd}`
+              : `${form.deadlineDate} ${form.deadlineTime}`,
+            calculatedPrice: price,
+          };
+          track(initialDeal ? 'owner_product_updated' : 'owner_product_created', {
+            sale_type: form.saleType,
+            region: form.region,
+            district: form.district,
+            neighborhood: form.neighborhood,
+            store_name: form.storeName,
+            product_name: form.productName,
+            category: form.category,
+            original_price: Number(form.originalPrice),
+            discount_rate: Number(form.discountRate),
+            calculated_price: price,
+            stock: Number(form.stock),
+            max_quantity: Number(form.maxQuantity),
+            deadline: payload.deadline,
+            pickup_place: form.pickupPlace,
+            methods: form.methods,
+            has_image: Boolean(form.image),
+          });
           onCreate(payload);
         }}
       >
@@ -1668,27 +4116,30 @@ function OwnerForm({ onCreate }) {
 
         <label>
           매장명
-          <input value={form.storeName} onChange={(event) => setForm({ ...form, storeName: event.target.value })} />
+          <input maxLength={80} value={form.storeName} onChange={(event) => setForm({ ...form, storeName: event.target.value })} />
+        </label>
+        <label>
+          매장 지역
+          <input value={formatLocation(form)} readOnly />
         </label>
         <label>
           상품명
-          <input value={form.productName} onChange={(event) => setForm({ ...form, productName: event.target.value })} />
+          <input maxLength={120} value={form.productName} onChange={(event) => setForm({ ...form, productName: event.target.value })} />
         </label>
         <label>
           카테고리
           <select value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>
-            <option>식사</option>
-            <option>카페</option>
-            <option>간식</option>
-            <option>편의점</option>
+            {PRODUCT_CATEGORIES.map((category) => <option key={category}>{category}</option>)}
           </select>
         </label>
         <label>
           정상가
           <input
             type="number"
+            min="0"
+            inputMode="numeric"
             value={form.originalPrice}
-            onChange={(event) => setForm({ ...form, originalPrice: Number(event.target.value) })}
+            onChange={(event) => setForm({ ...form, originalPrice: event.target.value })}
           />
         </label>
         <label>
@@ -1717,8 +4168,8 @@ function OwnerForm({ onCreate }) {
             <FieldCounter
               label="공구 최대 수량"
               value={form.maxQuantity}
-              onMinus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity - 1, 1, 999) })}
-              onPlus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity + 1, 1, 999) })}
+              onMinus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity - 1, 1, 20) })}
+              onPlus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity + 1, 1, 20) })}
             />
           )}
         </div>
@@ -1739,10 +4190,29 @@ function OwnerForm({ onCreate }) {
           </div>
         </div>
 
-        <label>
-          {form.saleType === 'instant' ? '선착순 즉시할인 표시 문구' : '마감 시간'}
-          <input value={form.deadline} onChange={(event) => setForm({ ...form, deadline: event.target.value })} />
-        </label>
+        {form.saleType === 'group' && (
+          <div className="content-block flush">
+            <h2>마감 시간</h2>
+            <div className="date-time-row">
+              <label>
+                <Calendar size={16} />
+                <input
+                  type="date"
+                  value={form.deadlineDate}
+                  onChange={(event) => setForm({ ...form, deadlineDate: event.target.value })}
+                />
+              </label>
+              <label>
+                <Clock size={16} />
+                <input
+                  type="time"
+                  value={form.deadlineTime}
+                  onChange={(event) => setForm({ ...form, deadlineTime: event.target.value })}
+                />
+              </label>
+            </div>
+          </div>
+        )}
         {form.saleType === 'instant' && (
           <div className="content-block flush">
             <h2>이벤트 진행 시간</h2>
@@ -1768,23 +4238,80 @@ function OwnerForm({ onCreate }) {
         )}
         <label>
           픽업 위치
-          <input value={form.pickupPlace} onChange={(event) => setForm({ ...form, pickupPlace: event.target.value })} />
+          <input maxLength={200} value={form.pickupPlace} onChange={(event) => setForm({ ...form, pickupPlace: event.target.value })} />
         </label>
         <label>
           설명
-          <textarea value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} />
+          <textarea maxLength={500} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} />
         </label>
 
-        <button className="primary-button" type="submit" disabled={!form.productName || form.methods.length === 0}>
+        <button className="primary-button" type="submit" disabled={imageProcessing || !form.storeName.trim() || !form.productName.trim() || Number(form.originalPrice) <= 0 || form.methods.length === 0}>
           <Check size={18} />
-          상품 등록 완료
+          {initialDeal ? '상품 수정 완료' : '상품 등록 완료'}
         </button>
       </form>
     </section>
   );
 }
 
-function OwnerDone({ deal, onCreateAnother, onPreviewCustomer }) {
+function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
+  useScreenAnalytics('owner_products', { product_count: deals.length });
+  return (
+    <section className="screen">
+      <header className="top-nav compact">
+        <button className="icon-button" onClick={onBack} aria-label="뒤로">
+          <ArrowLeft size={22} />
+        </button>
+        <h1>등록 상품 관리</h1>
+        <Store size={20} />
+      </header>
+      {deals.length === 0 ? (
+        <EmptyCustomerState
+          icon={Store}
+          title="등록한 상품이 없습니다"
+          body="상품을 등록하면 이 화면에서 수정하거나 삭제할 수 있습니다."
+          actionLabel="상품 등록하기"
+          onAction={onBack}
+        />
+      ) : (
+        <div className="owner-product-list">
+          {deals.map((deal) => (
+            <article className="owner-product-card" key={deal.id}>
+              <img src={deal.image} alt="" />
+              <div>
+                <strong>{deal.title}</strong>
+                <p>{deal.store} · {formatLocation(deal)}</p>
+                <span>{formatWon(getDealPrice(deal))}</span>
+                {deal.quantityTracking && (
+                  <span className="owner-quantity-state">
+                    주문 {getDealQuantity(deal).ordered}개 · 남은 수량 {getDealQuantity(deal).remaining}개
+                  </span>
+                )}
+              </div>
+              <div className="owner-product-actions">
+                <button className="secondary-button compact-button" onClick={() => onEdit(deal)}>
+                  <Pencil size={14} />
+                  수정
+                </button>
+                <button
+                  className="danger-button compact-button"
+                  onClick={() => {
+                    if (window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) onDelete(deal);
+                  }}
+                >
+                  <Trash2 size={14} />
+                  삭제
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
   useScreenAnalytics('owner_product_done', { deal_id: deal.id });
   const isInstant = deal.saleType === 'instant';
   return (
@@ -1805,7 +4332,7 @@ function OwnerDone({ deal, onCreateAnother, onPreviewCustomer }) {
           <strong>{deal.target}개</strong>
         </div>
       </div>
-      <button className="primary-button" onClick={onPreviewCustomer}>
+      <button className="primary-button" onClick={() => onPreviewCustomer('detail', deal)}>
         <ShoppingBag size={18} />
         사용자 화면에서 보기
       </button>
@@ -1813,20 +4340,120 @@ function OwnerDone({ deal, onCreateAnother, onPreviewCustomer }) {
         <Plus size={18} />
         추가 등록
       </button>
+      <button className="secondary-button" onClick={onOpenOrders}>
+        <ShoppingBag size={18} />
+        주문 관리
+      </button>
     </section>
   );
 }
 
-function Dashboard({ analyticsReady }) {
+function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfirm }) {
+  useScreenAnalytics('owner_orders', { order_count: orders.length, ...normalizeLocation(location) });
+
+  return (
+    <section className="screen">
+      <header className="top-nav compact">
+        <button className="icon-button" onClick={onBack} aria-label="뒤로">
+          <ArrowLeft size={22} />
+        </button>
+        <h1>주문 관리</h1>
+        <span className="order-count-badge">{location.neighborhood} · {orders.length}건</span>
+      </header>
+
+      <div className="neighborhood-sync-banner owner-sync-banner">
+        <MapPin size={16} />
+        <div>
+          <strong>{formatLocation(location)} 주문만 연동 중</strong>
+          <span>같은 동네 사용자의 가상 주문과 수동 결제 상태가 표시됩니다.</span>
+        </div>
+      </div>
+
+      <div className="owner-order-flow">
+        {ORDER_STAGES.map((stage, index) => (
+          <React.Fragment key={stage.id}>
+            <span>{stage.label}</span>
+            {index < ORDER_STAGES.length - 1 && <i>→</i>}
+          </React.Fragment>
+        ))}
+      </div>
+
+      {orders.length === 0 ? (
+        <EmptyCustomerState
+          icon={ShoppingBag}
+          title="신규 주문이 없습니다"
+          body="사용자가 공동구매에 참여하면 여기서 상태를 변경할 수 있습니다."
+          actionLabel="상품 등록으로"
+          onAction={onBack}
+        />
+      ) : (
+        <div className="owner-order-list">
+          {orders.map((order) => {
+            const stage = getOrderStage(order);
+            return (
+              <article className="owner-order-card" key={order.id}>
+                <div className="owner-order-heading">
+                  <div>
+                    <span>{stage.label}</span>
+                    <h2>{order.title}</h2>
+                  </div>
+                  <strong>{formatWon(order.total)}</strong>
+                </div>
+                <p>{order.method} · {order.time} · 수량 {order.selectedCount || 1}개</p>
+                <p className="owner-customer-contact">
+                  <User size={14} />
+                  <strong>{order.customerName || '테스트 사용자'}</strong>
+                  <a href={`tel:${order.customerPhone || ''}`}>{order.customerPhone || '연락처 미수집'}</a>
+                </p>
+                <div className={order.paymentConfirmedAt ? 'manual-payment-state confirmed' : 'manual-payment-state'}>
+                  <div>
+                    <strong>{order.paymentConfirmedAt ? '수동 결제 확인 완료' : '수동 결제 확인 대기'}</strong>
+                    <span>{order.paymentConfirmedAt ? '사용자 화면에도 결제 확인 상태가 반영됩니다.' : '실제 입금·결제를 확인한 뒤 눌러주세요.'}</span>
+                  </div>
+                  {!order.paymentConfirmedAt && (
+                    <button className="secondary-button compact-button" onClick={() => onPaymentConfirm(order.id)}>
+                      결제 확인
+                    </button>
+                  )}
+                </div>
+                <div className={order.customerPickupConfirmedAt ? 'owner-customer-confirm active' : 'owner-customer-confirm'}>
+                  <User size={14} />
+                  {order.customerPickupConfirmedAt ? '사용자 픽업 확인 완료' : '사용자 픽업 확인 대기'}
+                </div>
+                <div className="owner-order-actions">
+                  <code>{order.id}</code>
+                  {stage.action ? (
+                    <button className="primary-button compact-button" onClick={() => onStatusChange(order.id)}>
+                      {stage.action}
+                    </button>
+                  ) : (
+                    <span className="completed-order-label">
+                      {order.customerPickupConfirmedAt && order.paymentConfirmedAt ? '거래 검증 완료' : '사장님 처리 완료'}
+                    </span>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function Dashboard({ analyticsReady, orders }) {
   useScreenAnalytics('analytics_dashboard');
   const events = useEvents();
+  const central = useCentralStats();
   const [qr, setQr] = useState('');
 
   useEffect(() => {
     QRCode.toDataURL(window.location.href, { width: 180, margin: 1 }).then(setQr);
   }, []);
 
-  const stats = useMemo(() => buildStats(events), [events]);
+  const localStats = useMemo(() => buildStats(events), [events]);
+  const stats = useMemo(() => mergeCentralStats(localStats, central.stats), [localStats, central.stats]);
+  const commerceStats = useMemo(() => buildCommerceStats(orders), [orders]);
 
   return (
     <section className="dashboard">
@@ -1835,8 +4462,8 @@ function Dashboard({ analyticsReady }) {
           <p className="eyebrow">User Validation / Data Validation</p>
           <h1>검증 대시보드</h1>
         </div>
-        <div className={analyticsReady ? 'status-pill active' : 'status-pill'}>
-          {analyticsReady ? 'PostHog 연동' : '로컬 로그 모드'}
+        <div className="status-pill active">
+          {analyticsReady ? 'PostHog + Google Sheets 연동' : 'Google Sheets 중앙 수집'}
         </div>
       </header>
 
@@ -1846,12 +4473,43 @@ function Dashboard({ analyticsReady }) {
         <Metric label="상세 진입" value={stats.openListing} />
         <Metric label="참여 완료" value={stats.completed} />
         <Metric label="그룹 생성" value={stats.groupCreated} />
-        <Metric label="설문 제출" value={stats.surveys} />
-        <Metric label="공유 클릭" value={stats.shares} />
-        <Metric label="총 이벤트" value={events.length} />
+        <Metric label="호스트 지원 클릭" value={stats.hostApplyClicked} />
+        <Metric label="호스트 지원 완료" value={stats.hostApplyCompleted} />
+        <Metric label="설문 제출자" value={stats.surveys} />
+        {RELEASE_FEATURES.sharing && <Metric label="공유 클릭" value={stats.shares} />}
+        <Metric label="총 이벤트(발생)" value={stats.totalEvents} />
       </div>
+      <p className="metric-note">
+        {central.error
+          ? central.stats
+            ? `중앙 통계 재연결 중 · 마지막 성공 반영 ${central.updatedAt}`
+            : '중앙 통계를 불러오지 못해 현재 브라우저 기록을 표시하고 있습니다.'
+          : central.stats
+            ? `전체 사용자 중앙 데이터 · 5초마다 자동 갱신 · 마지막 반영 ${central.updatedAt}`
+            : '전체 사용자 중앙 데이터를 불러오는 중입니다.'}
+      </p>
 
       <div className="dashboard-layout">
+        <div className="dashboard-section csv-guide-section">
+          <div className="section-title">
+            <div>
+              <h2>전체 데이터 확인</h2>
+              <p>모든 사용자의 신규 이벤트는 Google Sheets로 자동 전송됩니다.</p>
+            </div>
+          </div>
+          <ol className="csv-guide-list">
+            <li><code>전체 이벤트</code> 탭에서 원본 기록을 확인합니다.</li>
+            <li><code>설문 응답</code> 탭에서 고객번호·이름·연락처와 각 문항 답변을 한 줄로 확인합니다.</li>
+            <li>웹 <code>검증 대시보드</code>에서 전체 방문자·참여·설문·지역 지표를 5초 단위로 확인합니다.</li>
+            <li>필요한 경우 시트에서 CSV 또는 Excel로 내려받습니다.</li>
+          </ol>
+          <p className="evidence-note">
+            {analyticsReady
+              ? <>PostHog 행동 분석과 Google Sheets 원본 기록이 함께 수집됩니다. 설문은 <code>설문 응답</code> 탭에 읽기 쉬운 열로 자동 정리됩니다.</>
+              : <>PostHog 키는 아직 설정되지 않았습니다. 중요 행동은 <code>전체 이벤트</code>, 설문은 <code>설문 응답</code> 탭에 중앙 수집됩니다.</>}
+          </p>
+        </div>
+
         <div className="dashboard-section">
           <div className="section-title">
             <h2>Funnel</h2>
@@ -1876,9 +4534,104 @@ function Dashboard({ analyticsReady }) {
           </div>
         </div>
 
+        <div className="dashboard-section commerce-proof-section">
+          <div className="section-title">
+            <div>
+              <h2>Wizard of Oz 거래 검증</h2>
+              <p>사용자 참여와 사장님 처리, 사용자 픽업 확인을 주문별로 연결합니다.</p>
+            </div>
+            <button className="secondary-button compact-button" onClick={() => exportOrdersCsv(orders)}>
+              <Download size={16} />
+              거래 CSV
+            </button>
+          </div>
+          <p className="evidence-note">결제·정산 증빙이 아닌 MVP 행동 기록입니다. 수동 결제 확인, 사장님 픽업 완료, 사용자 수령 확인이 모두 있을 때만 ‘양측 검증 완료’로 집계합니다.</p>
+          <div className="commerce-metric-grid">
+            <Metric label="참여 주문" value={commerceStats.orderCount} />
+            <Metric label="수동 결제 확인" value={commerceStats.paymentConfirmedCount} />
+            <Metric label="사장님 수락" value={commerceStats.acceptedCount} />
+            <Metric label="사장님 픽업 완료" value={commerceStats.ownerCompletedCount} />
+            <Metric label="사용자 픽업 확인" value={commerceStats.customerConfirmedCount} />
+            <Metric label="양측 검증 완료" value={commerceStats.verifiedCount} />
+            <Metric label="참여 거래액" value={formatWon(commerceStats.candidateAmount)} />
+            <Metric label="결제 확인 거래액" value={formatWon(commerceStats.paymentConfirmedAmount)} />
+            <Metric label="검증 완료 거래액" value={formatWon(commerceStats.verifiedAmount)} />
+          </div>
+          <div className="transaction-table">
+            <div className="transaction-head">
+              <span>주문</span>
+              <strong>결제</strong>
+              <strong>사장님</strong>
+              <strong>사용자</strong>
+              <strong>검증</strong>
+            </div>
+            {commerceStats.rows.length === 0 && <p className="empty-state">참여 주문이 생기면 여기에 거래 이력이 표시됩니다.</p>}
+            {commerceStats.rows.map((row) => (
+              <div key={row.id}>
+                <span>
+                  <b>{row.title}</b>
+                  <code>{row.id}</code>
+                  <small>{row.neighborhood} · {formatWon(row.total)}</small>
+                </span>
+                <strong>{row.paymentConfirmed ? '확인' : '대기'}</strong>
+                <strong>{row.ownerStatus}</strong>
+                <strong>{row.customerConfirmed ? '픽업 확인' : '확인 대기'}</strong>
+                <strong className={row.verified ? 'verified' : ''}>{row.verified ? '완료' : '검증 중'}</strong>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="dashboard-section event-breakdown-section">
+          <div className="section-title">
+            <div>
+              <h2>이벤트 종류별 집계</h2>
+              <p>발생 횟수와 고유 사용자 수를 나란히 표시합니다.</p>
+            </div>
+          </div>
+          <div className="breakdown-table">
+            <div className="breakdown-head">
+              <span>이벤트</span>
+              <strong>발생</strong>
+              <strong>고유 사용자</strong>
+            </div>
+            {stats.eventBreakdown.map((row) => (
+              <div key={row.name}>
+                <span>
+                  <b>{row.label}</b>
+                  <code>{row.name}</code>
+                </span>
+                <strong>{row.count}</strong>
+                <strong>{row.visitors}</strong>
+              </div>
+            ))}
+          </div>
+        </div>
+
         <div className="dashboard-section">
           <div className="section-title">
-            <h2>화면 체류시간</h2>
+            <div>
+              <h2>지역별 이벤트</h2>
+              <p>모든 신규 이벤트에 지역 값이 태그되며 5초마다 자동 갱신됩니다.</p>
+            </div>
+          </div>
+          <div className="neighborhood-stats">
+            {stats.neighborhoodBreakdown.map((row) => (
+              <div key={row.location}>
+                <span>{row.location}</span>
+                <strong>{row.count}건</strong>
+                <small>{row.visitors}명</small>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="dashboard-section">
+          <div className="section-title">
+            <div>
+              <h2>현재 기기 화면 체류시간</h2>
+              <p>전체 사용자 체류시간은 PostHog에서 확인합니다.</p>
+            </div>
           </div>
           <div className="dwell-list">
             {stats.dwell.map((row) => (
@@ -1892,18 +4645,12 @@ function Dashboard({ analyticsReady }) {
 
         <div className="dashboard-section">
           <div className="section-title">
-            <h2>설문 응답</h2>
+            <div>
+              <h2>현재 기기 설문 미리보기</h2>
+              <p>전체 응답과 연락처는 Google Sheets의 <code>설문 응답</code> 탭에서 확인합니다.</p>
+            </div>
           </div>
-          <div className="survey-table">
-            {stats.surveyRows.length === 0 && <p className="empty-state">아직 제출된 설문이 없습니다.</p>}
-            {stats.surveyRows.map((row) => (
-              <div key={row.id}>
-                <span>{row.reason}</span>
-                <span>{row.hostIntent}</span>
-                <strong>{row.revisitIntent}</strong>
-              </div>
-            ))}
-          </div>
+          <SurveyResponses rows={stats.surveyRows} />
         </div>
 
         <div className="dashboard-section qr-section">
@@ -1929,7 +4676,8 @@ function Dashboard({ analyticsReady }) {
 
 function EventMonitor({ analyticsReady }) {
   const events = useEvents();
-  const recent = events.slice(-8).reverse();
+  const recent = events.filter((event) => isEventVisibleInRelease(event.name)).slice(-8).reverse();
+  const isRecording = events.length > 0;
 
   return (
     <aside className="event-monitor">
@@ -1938,12 +4686,18 @@ function EventMonitor({ analyticsReady }) {
           <p className="eyebrow">Tracking</p>
           <h2>이벤트 로그</h2>
         </div>
-        <span className={analyticsReady ? 'dot active' : 'dot'} />
+        <span className={(analyticsReady || isRecording) ? 'dot active' : 'dot'} />
       </div>
 
+      <p className="evidence-note">
+        {analyticsReady
+          ? 'PostHog와 Google Sheets에 중앙 수집 중입니다.'
+          : 'Google Sheets 중앙 수집 중 · 이 화면은 현재 브라우저 기록만 보여주며 전체 합산은 통합 시트에서 확인합니다.'}
+      </p>
+
       <div className="visitor-box">
-        <span>익명 ID</span>
-        <code>{getVisitorId().slice(0, 18)}...</code>
+        <span>고객번호</span>
+        <code>{getCustomerNumber()}</code>
       </div>
 
       <div className="monitor-actions">
@@ -1961,14 +4715,17 @@ function EventMonitor({ analyticsReady }) {
         {recent.map((event) => (
           <div key={event.id} className="event-row">
             <strong>{event.name}</strong>
-            <span>{new Date(event.timestamp).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}</span>
+            <span>
+              {event.properties?.neighborhood || '미설정'} ·{' '}
+              {new Date(event.timestamp).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })}
+            </span>
           </div>
         ))}
       </div>
 
       <div className="definition-list">
         <h3>이벤트 정의</h3>
-        {eventDefinitions.map((event) => (
+        {visibleEventDefinitions.map((event) => (
           <div key={event.name}>
             <span>{event.label}</span>
             <code>{event.name}</code>
@@ -1979,13 +4736,30 @@ function EventMonitor({ analyticsReady }) {
   );
 }
 
-function Progress({ current, target }) {
-  const rate = clamp(Math.round((current / target) * 100), 0, 100);
+function Progress({ deal }) {
+  const {
+    ordered,
+    target,
+    remaining,
+    participants,
+    targetPeople,
+  } = getDealQuantity(deal);
+  const rate = clamp(Math.round((ordered / target) * 100), 0, 100);
+  const tracksQuantity = Boolean(deal.quantityTracking);
+  const isCustomerGroup = deal.source === 'customer';
+  const groupStatus = deal.groupStatus || 'recruiting';
+  const quantityLabel = groupStatus === 'recruiting'
+    ? `남은 ${remaining}개 / 총 ${target}개`
+    : `${GROUP_STATUS_LABELS[groupStatus] || '모집 종료'} · 배정 ${ordered}개 / 총 ${target}개`;
   return (
     <div className="progress-wrap">
       <div className="progress-label">
-        <span>참여 {current}명</span>
-        <strong>목표 {target}명</strong>
+        <span>{tracksQuantity
+          ? isCustomerGroup
+            ? `참여 ${participants}명 / 목표 ${targetPeople}명`
+            : `참여 ${participants}명 · 주문 ${ordered}개`
+          : `참여 ${ordered}명`}</span>
+        <strong>{tracksQuantity ? quantityLabel : `목표 ${target}명`}</strong>
       </div>
       <div className="progress-bar">
         <i style={{ width: `${rate}%` }} />
@@ -2021,6 +4795,7 @@ function BottomNav({ active, onSelect }) {
   const items = [
     { id: 'home', screen: 'list', label: '홈', icon: Home },
     { id: 'explore', screen: 'explore', label: '탐색', icon: Users },
+    { id: 'calculator', screen: 'calculator', label: '계산', icon: Calculator },
     { id: 'orders', screen: 'orders', label: '내 주문', icon: ShoppingBag },
     { id: 'favorites', screen: 'favorites', label: '찜', icon: Heart },
     { id: 'profile', screen: 'profile', label: '마이', icon: User },
@@ -2054,6 +4829,45 @@ function Metric({ label, value }) {
   );
 }
 
+function SurveyResponses({ rows }) {
+  const pageSize = 5;
+  const [page, setPage] = useState(0);
+  const pageCount = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(page, pageCount - 1);
+  const visibleRows = rows.slice(safePage * pageSize, (safePage + 1) * pageSize);
+
+  useEffect(() => {
+    if (page >= pageCount) setPage(pageCount - 1);
+  }, [page, pageCount]);
+
+  return (
+    <>
+      <div className="survey-table">
+        {rows.length === 0 && <p className="empty-state">아직 제출된 설문이 없습니다.</p>}
+        {visibleRows.map((row) => (
+          <div key={row.id}>
+            <span>
+              <b>{row.testerName}</b><br />
+              <code>{row.customerNumber}</code><br />
+              <small>{row.submittedAt}</small><br />
+              {row.reason}
+            </span>
+            <span>{row.hostIntent}</span>
+            <strong>{row.revisitIntent}</strong>
+          </div>
+        ))}
+      </div>
+      {rows.length > pageSize && (
+        <div className="survey-pagination">
+          <button className="ghost-button" disabled={safePage === 0} onClick={() => setPage(safePage - 1)}>이전</button>
+          <span>{safePage + 1} / {pageCount} · 총 {rows.length}건</span>
+          <button className="ghost-button" disabled={safePage >= pageCount - 1} onClick={() => setPage(safePage + 1)}>다음</button>
+        </div>
+      )}
+    </>
+  );
+}
+
 function useEvents() {
   const [events, setEvents] = useState(() => getEvents());
 
@@ -2066,9 +4880,116 @@ function useEvents() {
   return events;
 }
 
+function useCentralStats() {
+  const [state, setState] = useState({ stats: null, updatedAt: '', error: false });
+
+  useEffect(() => {
+    let active = true;
+    let inFlight = false;
+    const load = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const response = await fetch('/api/stats', { cache: 'no-store' });
+        const result = await response.json();
+        if (!response.ok || !result.ok || !result.stats) throw new Error('central_stats_failed');
+        if (active) {
+          setState({
+            stats: result.stats,
+            updatedAt: new Date(result.stats.generatedAt || Date.now()).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+            error: false,
+          });
+        }
+      } catch {
+        if (active) setState((current) => ({ ...current, error: true }));
+      } finally {
+        inFlight = false;
+      }
+    };
+    load();
+    const timer = window.setInterval(load, 5000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  return state;
+}
+
+function mergeCentralStats(localStats, centralStats) {
+  if (!centralStats) return { ...localStats, totalEvents: localStats.totalEvents || 0 };
+  const counts = centralStats.eventCounts || {};
+  const unique = centralStats.uniqueByEvent || {};
+  const eventLabelByName = new Map(visibleEventDefinitions.map((definition) => [definition.name, definition.label]));
+  const visibleBreakdown = (centralStats.eventBreakdown || [])
+    .filter((row) => isEventVisibleInRelease(row.name));
+  return {
+    ...localStats,
+    visitors: centralStats.visitors || 0,
+    ownerCreated: counts.owner_product_created || 0,
+    openListing: counts.open_listing || 0,
+    completed: counts.purchase_completed || 0,
+    groupCreated: counts.group_created || 0,
+    hostApplyClicked: counts.host_apply_clicked || 0,
+    hostApplyCompleted: (counts.host_apply_completed || 0) + (counts.host_applied || 0),
+    surveys: unique.survey_submitted || 0,
+    shares: RELEASE_FEATURES.sharing ? counts.share_clicked || 0 : 0,
+    totalEvents: visibleBreakdown.length
+      ? visibleBreakdown.reduce((sum, row) => sum + Number(row.count || 0), 0)
+      : localStats.totalEvents,
+    funnel: centralStats.funnel || localStats.funnel,
+    neighborhoodBreakdown: centralStats.neighborhoodBreakdown || localStats.neighborhoodBreakdown,
+    eventBreakdown: visibleBreakdown.map((row) => ({
+      ...row,
+      label: eventLabelByName.get(row.name) || row.name,
+    })),
+  };
+}
+
+function buildCommerceStats(orders) {
+  const purchaseOrders = orders.filter((order) => order.type === 'purchase');
+  const rows = purchaseOrders
+    .map((order) => {
+      const stage = getOrderStage(order);
+      const ownerCompleted = stage.id === 'completed';
+      const customerConfirmed = Boolean(order.customerPickupConfirmedAt);
+      const paymentConfirmed = Boolean(order.paymentConfirmedAt);
+      return {
+        id: order.id,
+        title: order.title,
+        neighborhood: order.neighborhood || order.deal?.neighborhood || '미설정',
+        total: Number(order.total || 0),
+        ownerStatus: stage.label,
+        ownerCompleted,
+        paymentConfirmed,
+        customerConfirmed,
+        verified: paymentConfirmed && ownerCompleted && customerConfirmed,
+        createdAt: order.createdAt,
+        accepted: ORDER_STAGES.findIndex((item) => item.id === stage.id) >= 1,
+      };
+    })
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  return {
+    rows,
+    orderCount: rows.length,
+    paymentConfirmedCount: rows.filter((row) => row.paymentConfirmed).length,
+    acceptedCount: rows.filter((row) => row.accepted).length,
+    ownerCompletedCount: rows.filter((row) => row.ownerCompleted).length,
+    customerConfirmedCount: rows.filter((row) => row.customerConfirmed).length,
+    verifiedCount: rows.filter((row) => row.verified).length,
+    candidateAmount: rows.reduce((sum, row) => sum + row.total, 0),
+    paymentConfirmedAmount: rows.filter((row) => row.paymentConfirmed).reduce((sum, row) => sum + row.total, 0),
+    verifiedAmount: rows.filter((row) => row.verified).reduce((sum, row) => sum + row.total, 0),
+  };
+}
+
 function buildStats(events) {
+  events = events.filter((event) => isEventVisibleInRelease(event.name));
   const unique = (predicate) => new Set(events.filter(predicate).map((event) => event.visitorId)).size;
   const visitors = new Set(events.map((event) => event.visitorId)).size;
+  const eventLabelByName = new Map(visibleEventDefinitions.map((definition) => [definition.name, definition.label]));
   const funnelSeed = Math.max(1, unique((event) => event.name === 'screen_view' && event.properties.screen === 'deal_list'));
   const funnel = [
     { label: '리스트 방문', count: unique((event) => event.name === 'screen_view' && event.properties.screen === 'deal_list') },
@@ -2076,7 +4997,7 @@ function buildStats(events) {
     { label: '참여 시작', count: unique((event) => event.name === 'join_started') },
     { label: '참여 완료', count: unique((event) => event.name === 'purchase_completed') },
     { label: '설문 제출', count: unique((event) => event.name === 'survey_submitted') },
-  ].map((stage) => ({ ...stage, rate: Math.round((stage.count / funnelSeed) * 100) }));
+  ].map((stage) => ({ ...stage, rate: Math.min(100, Math.round((stage.count / funnelSeed) * 100)) }));
 
   const dwellMap = events
     .filter((event) => event.name === 'screen_dwell')
@@ -2085,7 +5006,7 @@ function buildStats(events) {
       acc[screen] = acc[screen] || [];
       acc[screen].push(event.properties.dwell_ms || 0);
       return acc;
-    }, {});
+    }, Object.create(null));
 
   const dwell = Object.entries(dwellMap)
     .map(([screen, values]) => ({
@@ -2097,13 +5018,53 @@ function buildStats(events) {
 
   const surveyRows = events
     .filter((event) => event.name === 'survey_submitted')
-    .slice(-5)
+    .slice()
+    .reverse()
     .map((event) => ({
       id: event.id,
+      testerName: event.properties.tester_name || '이름 미수집',
+      customerNumber: event.properties.customer_number || getCustomerNumber(event.visitorId),
+      submittedAt: new Date(event.timestamp).toLocaleString('ko-KR'),
       reason: event.properties.reason,
       hostIntent: event.properties.hostIntent,
       revisitIntent: event.properties.revisitIntent,
     }));
+
+  const eventGroups = events.reduce((acc, event) => {
+    acc[event.name] = acc[event.name] || { count: 0, visitors: new Set() };
+    acc[event.name].count += 1;
+    acc[event.name].visitors.add(event.visitorId);
+    return acc;
+  }, Object.create(null));
+
+  const eventBreakdown = Object.entries(eventGroups)
+    .map(([name, group]) => ({
+      name,
+      label: eventLabelByName.get(name) || name,
+      count: group.count,
+      visitors: group.visitors.size,
+    }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+
+  const neighborhoodGroups = events.reduce((acc, event) => {
+    const location = [
+      event.properties?.region,
+      event.properties?.district,
+      event.properties?.neighborhood || '미설정',
+    ].filter(Boolean).join(' · ');
+    acc[location] = acc[location] || { count: 0, visitors: new Set() };
+    acc[location].count += 1;
+    acc[location].visitors.add(event.visitorId);
+    return acc;
+  }, Object.create(null));
+
+  const neighborhoodBreakdown = Object.entries(neighborhoodGroups)
+    .map(([location, group]) => ({
+      location,
+      count: group.count,
+      visitors: group.visitors.size,
+    }))
+    .sort((a, b) => b.count - a.count);
 
   return {
     visitors,
@@ -2111,11 +5072,16 @@ function buildStats(events) {
     openListing: events.filter((event) => event.name === 'open_listing').length,
     completed: events.filter((event) => event.name === 'purchase_completed').length,
     groupCreated: events.filter((event) => event.name === 'group_created').length,
-    surveys: events.filter((event) => event.name === 'survey_submitted').length,
+    hostApplyClicked: events.filter((event) => event.name === 'host_apply_clicked').length,
+    hostApplyCompleted: events.filter((event) => ['host_apply_completed', 'host_applied'].includes(event.name)).length,
+    surveys: unique((event) => event.name === 'survey_submitted'),
     shares: events.filter((event) => event.name === 'share_clicked').length,
+    totalEvents: events.length,
     funnel,
     dwell,
     surveyRows,
+    eventBreakdown,
+    neighborhoodBreakdown,
   };
 }
 
