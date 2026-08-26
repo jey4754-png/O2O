@@ -702,8 +702,13 @@ export function transitionParticipantPayment(groupId, participantActorId, direct
   });
 }
 
-export function updateGroupTarget(groupId, targetCount, actorId) {
-  return mutateGroup(groupId, actorId, 'update_target', { targetCount: Number(targetCount) }, (snapshot, actor) => {
+export function updateGroupTarget(groupId, targetCount, actorId, expectedVersion) {
+  return mutateGroup(groupId, actorId, 'update_target', {
+    targetCount: Number(targetCount),
+    ...(Number.isInteger(Number(expectedVersion)) && Number(expectedVersion) > 0
+      ? { expectedVersion: Number(expectedVersion) }
+      : {}),
+  }, (snapshot, actor) => {
     if (!actor || !['creator', 'host', 'admin'].includes(actor.role)) throw new Error('forbidden');
     const next = Number(targetCount);
     if (!Number.isInteger(next) || next < snapshot.group.currentCount || next > 20) throw new Error('invalid_target');

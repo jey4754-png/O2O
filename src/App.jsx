@@ -41,10 +41,12 @@ import {
   claimGroupHost,
   createMutationId,
   createGroupRoom as initializeGroupRoom,
+  fetchGroupSnapshot,
   fetchUnreadCounts,
   getGroupCredential,
   joinGroupRoom,
   reserveGroupQuantity,
+  updateGroupTarget,
 } from './groupApi';
 import {
   calculateProductAllocation,
@@ -1125,7 +1127,7 @@ function App() {
     setOwnerScreen('done');
   };
 
-  const updateCustomerDeal = (deal, options = {}) => {
+  const updateCustomerDeal = async (deal, options = {}) => {
     const updated = {
       ...deal,
       category: normalizeCategory(deal.category),
@@ -1145,10 +1147,39 @@ function App() {
     setSelectedDeal(updated);
     if (!options.observed) track('customer_deal_updated', { deal_id: updated.id });
     if (options.sync !== false) {
-      publishPublicDeal(updated).then((published) => {
-        if (published) setRemoteDeals((current) => mergeDeals([published], current));
-      });
+      const published = await publishPublicDeal(updated);
+      if (published) setRemoteDeals((current) => mergeDeals([published], current));
+      return published || updated;
     }
+    return updated;
+  };
+
+  const updateCustomerGroupTarget = async (
+    deal,
+    targetCount,
+    { mutate = true, expectedVersion } = {},
+  ) => {
+    const actorId = getVisitorId();
+    const result = mutate
+      ? await updateGroupTarget(deal.id, targetCount, actorId, expectedVersion)
+      : await fetchGroupSnapshot(deal.id, { actorId });
+    const group = result?.snapshot?.group || result?.group;
+    if (!group) throw new Error('group_update_failed');
+    return {
+      target: Number(group.targetCount),
+      targetPeople: Number(group.targetCount),
+      targetCount: Number(group.targetCount),
+      current: Number(group.currentCount),
+      currentPeople: Number(group.currentCount),
+      currentCount: Number(group.currentCount),
+      participantCount: Number(group.currentCount),
+      groupStatus: group.status || group.groupStatus || deal.groupStatus,
+      totalQuantity: Number(group.totalQuantity || deal.totalQuantity || 1),
+      orderedQuantity: Number(group.orderedQuantity ?? deal.orderedQuantity ?? 0),
+      allocatedProductQuantity: Number(group.orderedQuantity ?? deal.orderedQuantity ?? 0),
+      version: Number(group.version || deal.version || 1),
+      updatedAt: group.updatedAt || new Date().toISOString(),
+    };
   };
 
   const removeDeal = async (deal) => {
@@ -1656,6 +1687,7 @@ function App() {
                 onHostApply={applyHost}
                 editableDealIds={customerGroups.map((deal) => deal.id)}
                 onUpdateDeal={updateCustomerDeal}
+                onUpdateTarget={updateCustomerGroupTarget}
                 onDeleteDeal={removeDeal}
                 onConfirmPickup={confirmCustomerPickup}
                 onNeighborhoodChange={handleNeighborhoodChange}
@@ -1813,6 +1845,7 @@ function CustomerApp({
   onHostApply,
   editableDealIds,
   onUpdateDeal,
+  onUpdateTarget,
   onDeleteDeal,
   onConfirmPickup,
   onNeighborhoodChange,
@@ -1842,6 +1875,7 @@ function CustomerApp({
         onHostApply={onHostApply}
         editable={editableDealIds.includes(selectedDeal.id)}
         onUpdateDeal={onUpdateDeal}
+        onUpdateTarget={onUpdateTarget}
         onDeleteDeal={async (deal) => {
           await onDeleteDeal(deal);
           onScreen('list');
@@ -2680,6 +2714,7 @@ function DealDetail({
   onHostApply,
   editable = false,
   onUpdateDeal,
+  onUpdateTarget,
   onDeleteDeal,
   adminMode = false,
   unreadCount = 0,
@@ -2688,6 +2723,8 @@ function DealDetail({
   useScreenAnalytics('deal_detail', { deal_id: deal.id, category: deal.category });
   const [sharing, setSharing] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState('');
   const [hostApplying, setHostApplying] = useState(false);
   const [hostApplyError, setHostApplyError] = useState('');
   const [editForm, setEditForm] = useState({
@@ -2696,7 +2733,7 @@ function DealDetail({
     address: deal.address || '',
     deadline: deal.deadline || '',
     price: String(deal.source === 'customer' ? deal.originalPrice : getDealPrice(deal)),
-    target: String(deal.target || 1),
+    target: String(deal.targetCount || deal.targetPeople || deal.target || 1),
   });
   const isCustomerGroup = deal.source === 'customer';
   const isInstant = deal.saleType === 'instant';
@@ -2708,6 +2745,17 @@ function DealDetail({
       Math.max(0, Math.min(20, Number(deal.currentPeople ?? deal.current ?? 0))),
     )
     : null;
+  const currentParticipantCount = isCustomerGroup
+    ? Math.max(1, Number(deal.currentCount ?? deal.currentPeople ?? deal.current ?? 1) || 1)
+    : 0;
+  const parsedEditTarget = Number(editForm.target);
+  const targetInputInvalid = isCustomerGroup && (
+    !Number.isInteger(parsedEditTarget)
+    || parsedEditTarget < currentParticipantCount
+    || parsedEditTarget > 20
+  );
+  const targetUpdateLocked = isCustomerGroup
+    && ['purchased', 'delivered'].includes(deal.groupStatus || deal.status || 'recruiting');
   const productSplit = isCustomerGroup
     ? calculateProductAllocation(
       Math.max(0, Math.floor(Number(deal.originalPrice || 0))),
@@ -2745,6 +2793,77 @@ function DealDetail({
         : '호스트 지원을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.');
     } finally {
       setHostApplying(false);
+    }
+  };
+
+  const handleEditSave = async () => {
+    if (editSaving || !editForm.title.trim() || Number(editForm.price) <= 0 || targetInputInvalid) return;
+    setEditSaving(true);
+    setEditError('');
+    try {
+      const price = Number(editForm.price);
+      const previousTarget = Number(deal.targetCount || deal.targetPeople || deal.target || 1);
+      const targetChanged = isCustomerGroup && parsedEditTarget !== previousTarget;
+      if (targetChanged && targetUpdateLocked) throw new Error('target_locked');
+      const centralGroupFields = isCustomerGroup
+        ? await onUpdateTarget?.(deal, parsedEditTarget, {
+          mutate: targetChanged,
+          expectedVersion: Number(deal.version || 0) || undefined,
+        })
+        : {};
+      if (isCustomerGroup && !centralGroupFields) throw new Error('group_update_failed');
+      const target = Number(centralGroupFields?.target || parsedEditTarget || previousTarget);
+      const editedAllocation = isCustomerGroup
+        ? calculateProductAllocation(
+          Math.floor(price),
+          Math.max(1, Number(deal.totalQuantity || deal.productQuantity || target)),
+          1,
+        )
+        : null;
+      await onUpdateDeal({
+        ...deal,
+        title: editForm.title.trim(),
+        description: editForm.description.trim(),
+        address: editForm.address.trim(),
+        deadline: editForm.deadline.trim(),
+        originalPrice: price,
+        target,
+        targetPeople: isCustomerGroup ? target : deal.targetPeople,
+        targetCount: isCustomerGroup ? target : deal.targetCount,
+        expectedPerPerson: editedAllocation?.unitPrice ?? deal.expectedPerPerson,
+        unitPrice: editedAllocation?.unitPrice ?? deal.unitPrice,
+        unitRemainder: editedAllocation?.remainder ?? deal.unitRemainder,
+        splitRemainder: editedAllocation?.remainder ?? deal.splitRemainder,
+        approximatePrice: editedAllocation?.approximate ?? deal.approximatePrice,
+        discountRate: 0,
+        menu: (deal.menu || []).map((item, index) => (
+          index === 0
+            ? { ...item, name: editForm.title.trim(), price: editedAllocation?.unitPrice ?? price }
+            : item
+        )),
+        ...centralGroupFields,
+        updatedAt: centralGroupFields?.updatedAt || new Date().toISOString(),
+      });
+      if (targetChanged) {
+        track('group_target_changed', {
+          group_id: deal.id,
+          target_count: target,
+          source: 'detail_edit',
+        });
+      }
+      setEditing(false);
+    } catch (error) {
+      setEditError(
+        error?.message === 'state_conflict'
+          ? '다른 사용자의 변경이 먼저 반영되었습니다. 최신 화면을 확인한 뒤 다시 시도해 주세요.'
+          : error?.message === 'target_locked'
+            ? '상품 구매 완료 이후에는 목표 인원을 변경할 수 없습니다.'
+            : ['invalid_target', 'target_below_current'].includes(error?.message)
+              ? `목표 인원은 현재 참여자 ${currentParticipantCount}명 이상, 최대 20명으로 설정해 주세요.`
+              : '수정 내용을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.',
+      );
+    } finally {
+      setEditSaving(false);
     }
   };
 
@@ -2860,7 +2979,14 @@ function DealDetail({
               <strong>내가 등록한 상품</strong>
               <p>이 기기에서 등록한 상품만 수정하거나 삭제할 수 있습니다.</p>
             </div>
-            <button className="secondary-button compact-button" onClick={() => setEditing((value) => !value)}>
+            <button
+              className="secondary-button compact-button"
+              disabled={editSaving}
+              onClick={() => {
+                setEditing((value) => !value);
+                setEditError('');
+              }}
+            >
               <Pencil size={15} />
               {editing ? '취소' : '수정'}
             </button>
@@ -2869,76 +2995,65 @@ function DealDetail({
             <div className="form-stack compact-form">
               <label>
                 제목
-                <input value={editForm.title} onChange={(event) => setEditForm({ ...editForm, title: event.target.value })} />
+                <input disabled={editSaving} value={editForm.title} onChange={(event) => setEditForm({ ...editForm, title: event.target.value })} />
               </label>
               <label>
                 설명
-                <textarea value={editForm.description} onChange={(event) => setEditForm({ ...editForm, description: event.target.value })} />
+                <textarea disabled={editSaving} value={editForm.description} onChange={(event) => setEditForm({ ...editForm, description: event.target.value })} />
               </label>
               <label>
                 수령 위치
-                <input value={editForm.address} onChange={(event) => setEditForm({ ...editForm, address: event.target.value })} />
+                <input disabled={editSaving} value={editForm.address} onChange={(event) => setEditForm({ ...editForm, address: event.target.value })} />
               </label>
               <label>
                 마감 시간
-                <input value={editForm.deadline} onChange={(event) => setEditForm({ ...editForm, deadline: event.target.value })} />
+                <input disabled={editSaving} value={editForm.deadline} onChange={(event) => setEditForm({ ...editForm, deadline: event.target.value })} />
               </label>
               <label>
                 {isCustomerGroup ? '상품 판매가(총액)' : '판매가'}
-                <input type="number" min="0" value={editForm.price} onChange={(event) => setEditForm({ ...editForm, price: event.target.value })} />
+                <input disabled={editSaving} type="number" min="0" value={editForm.price} onChange={(event) => setEditForm({ ...editForm, price: event.target.value })} />
               </label>
               {isCustomerGroup && (
-                <p className="evidence-note">
-                  목표 인원({Number(deal.target || 1)}명)은 거래 관리 화면에서 변경해 주세요. 참여자 수와 거래 단계가 함께 검증됩니다.
-                </p>
+                <>
+                  <label>
+                    목표 인원
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      min={currentParticipantCount}
+                      max="20"
+                      step="1"
+                      value={editForm.target}
+                      disabled={editSaving || targetUpdateLocked}
+                      onChange={(event) => setEditForm({ ...editForm, target: event.target.value })}
+                    />
+                  </label>
+                  <p className={targetInputInvalid ? 'evidence-note form-error' : 'evidence-note'}>
+                    {targetUpdateLocked
+                      ? '상품 구매 완료 이후에는 목표 인원을 변경할 수 없습니다.'
+                      : `현재 참여자 ${currentParticipantCount}명 이상, 최대 20명까지 변경할 수 있습니다.`}
+                  </p>
+                </>
               )}
+              {editError && <p className="form-error" role="alert">{editError}</p>}
               <button
                 className="primary-button"
                 disabled={
-                  !editForm.title.trim()
+                  editSaving
+                  || !editForm.title.trim()
                   || Number(editForm.price) <= 0
+                  || targetInputInvalid
                 }
-                onClick={() => {
-                  const price = Number(editForm.price);
-                  const target = Number(deal.target || 1);
-                  const editedAllocation = isCustomerGroup
-                    ? calculateProductAllocation(
-                      Math.floor(price),
-                      Math.max(1, Number(deal.totalQuantity || deal.productQuantity || target)),
-                      1,
-                    )
-                    : null;
-                  onUpdateDeal({
-                    ...deal,
-                    title: editForm.title.trim(),
-                    description: editForm.description.trim(),
-                    address: editForm.address.trim(),
-                    deadline: editForm.deadline.trim(),
-                    originalPrice: price,
-                    target,
-                    expectedPerPerson: editedAllocation?.unitPrice ?? deal.expectedPerPerson,
-                    unitPrice: editedAllocation?.unitPrice ?? deal.unitPrice,
-                    unitRemainder: editedAllocation?.remainder ?? deal.unitRemainder,
-                    splitRemainder: editedAllocation?.remainder ?? deal.splitRemainder,
-                    approximatePrice: editedAllocation?.approximate ?? deal.approximatePrice,
-                    discountRate: 0,
-                    menu: (deal.menu || []).map((item, index) => (
-                      index === 0
-                        ? { ...item, name: editForm.title.trim(), price: editedAllocation?.unitPrice ?? price }
-                        : item
-                    )),
-                    updatedAt: new Date().toISOString(),
-                  });
-                  setEditing(false);
-                }}
+                onClick={handleEditSave}
               >
                 <Check size={16} />
-                수정 내용 저장
+                {editSaving ? '저장 중…' : '수정 내용 저장'}
               </button>
             </div>
           )}
           <button
             className="danger-button"
+            disabled={editSaving}
             onClick={() => {
               if (window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) onDeleteDeal(deal);
             }}
@@ -3161,7 +3276,7 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
   };
 
   return (
-    <section className="screen">
+    <section className="screen join-flow-screen">
       <header className="top-nav compact">
         <button className="icon-button" onClick={onBack} aria-label="뒤로">
           <ArrowLeft size={22} />
@@ -3224,21 +3339,22 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
         </label>
       </div>
 
-      <div className="order-summary">
-        <div>
-          <span>선택 수량</span>
-          <strong>{selectedCount}개</strong>
+      <div className="join-review">
+        <div className="order-summary">
+          <div>
+            <span>선택 수량</span>
+            <strong>{selectedCount}개</strong>
+          </div>
+          <div>
+            <span>주문 금액</span>
+            <strong>{formatWon(total)}</strong>
+          </div>
+          {hostRemainder > 0 && (
+            <small>호스트 나머지 부담액 {formatWon(hostRemainder)} 포함</small>
+          )}
         </div>
-        <div>
-          <span>주문 금액</span>
-          <strong>{formatWon(total)}</strong>
-        </div>
-        {hostRemainder > 0 && (
-          <small>호스트 나머지 부담액 {formatWon(hostRemainder)} 포함</small>
-        )}
+        {submitError && <p className="form-error join-submit-error" role="alert">{submitError}</p>}
       </div>
-
-      {submitError && <p className="form-error join-submit-error">{submitError}</p>}
 
       <div className="sticky-actions single">
         <button

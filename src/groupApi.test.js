@@ -1,7 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createGroupRoom, normalizeSnapshot, resolveUnreadCount } from './groupApi.js';
+import {
+  createGroupRoom,
+  normalizeSnapshot,
+  resolveUnreadCount,
+  updateGroupTarget,
+} from './groupApi.js';
 
 function memoryStorage() {
   const values = new Map();
@@ -126,6 +131,66 @@ test('group creation retries reuse the same membership mutation id after a lost 
     assert.equal(result.snapshot.group.hostActorId, input.actorId);
     assert.equal(payloads.length, 2);
     assert.equal(payloads[0].clientMutationId, payloads[1].clientMutationId);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
+test('target updates preserve the version captured when the edit form opened', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  const storage = memoryStorage();
+  globalThis.localStorage = storage;
+  storage.setItem('o2o_mvp_group_credentials_v1', JSON.stringify({
+    'customer-target-version::visitor-target-version': {
+      groupId: 'customer-target-version',
+      actorId: 'visitor-target-version',
+      role: 'host',
+      capabilityToken: `capability-${'v'.repeat(64)}`,
+    },
+  }));
+  const payloads = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    payloads.push(payload);
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          ok: true,
+          snapshot: {
+            group: {
+              groupId: payload.groupId,
+              status: 'recruiting',
+              targetCount: payload.action === 'update_target' ? payload.targetCount : 3,
+              currentCount: 1,
+              totalQuantity: 3,
+              orderedQuantity: 1,
+              version: payload.action === 'update_target' ? 5 : 9,
+            },
+            participants: [{
+              actorId: payload.actorId,
+              role: 'host',
+              counted: true,
+              selectedQuantity: 1,
+              version: 1,
+            }],
+          },
+        };
+      },
+    };
+  };
+
+  try {
+    await updateGroupTarget('customer-target-version', 5, 'visitor-target-version', 4);
+    assert.equal(payloads.length, 2);
+    assert.equal(payloads[0].action, 'snapshot');
+    assert.equal(payloads[1].action, 'update_target');
+    assert.equal(payloads[1].targetCount, 5);
+    assert.equal(payloads[1].expectedVersion, 4);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousStorage === undefined) delete globalThis.localStorage;

@@ -1016,6 +1016,14 @@ button:disabled {
   grid-template-columns: 1fr;
 }
 
+.join-flow-screen .join-review {
+  padding-bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+}
+
+.join-flow-screen .sticky-actions {
+  padding-bottom: calc(18px + env(safe-area-inset-bottom, 0px));
+}
+
 .primary-button,
 .secondary-button,
 .ghost-button {
@@ -1362,6 +1370,20 @@ button:disabled {
 .completion-summary span {
   color: var(--muted);
   font-size: 13px;
+}
+
+.order-summary > div {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.order-summary > div > strong {
+  min-width: 0;
+  max-width: 100%;
+  margin-left: auto;
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .creator-grid {

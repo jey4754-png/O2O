@@ -289,7 +289,7 @@ test('customer deals and grouped orders require canonical group/deal binding', a
   assert.deepEqual(groupResponse.body, { ok: false, error: 'invalid_group_deal_binding' });
 });
 
-test('group API forwards host mode, quantity, claim, and reserve contracts without raw capabilities', async () => {
+test('group API forwards host mode, quantity, target edit, claim, and reserve contracts without raw capabilities', async () => {
   const previousUrl = process.env.GOOGLE_SHEETS_COLLECTOR_URL;
   const previousToken = process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN;
   const previousCapabilitySecret = process.env.O2O_CAPABILITY_SECRET;
@@ -401,6 +401,24 @@ test('group API forwards host mode, quantity, claim, and reserve contracts witho
     assert.equal(reserve.statusCode, 200);
     assert.equal(forwarded[3].payload.quantity, 2);
     assert.equal(forwarded[3].payload.expectedVersion, 3);
+
+    const targetEdit = await invoke(groupHandler, {
+      headers: { origin: 'http://localhost:5173' },
+      body: {
+        action: 'update_target',
+        groupId: 'customer-host-recruiting',
+        actorId: 'visitor-host-creator',
+        capabilityToken: rawCapability,
+        targetCount: 5,
+        expectedVersion: 4,
+        clientMutationId: 'mutation-target-detail-edit',
+      },
+    });
+    assert.equal(targetEdit.statusCode, 200);
+    assert.equal(forwarded[4].payload.targetCount, 5);
+    assert.equal(forwarded[4].payload.expectedVersion, 4);
+    assert.match(forwarded[4].payload.capabilityHash, /^[a-f0-9]{64}$/);
+    assert.equal(forwarded[4].payload.capabilityToken, undefined);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousUrl === undefined) delete process.env.GOOGLE_SHEETS_COLLECTOR_URL;
