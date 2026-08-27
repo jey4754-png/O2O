@@ -136,7 +136,10 @@ function sanitizeDeal(input) {
     eventStart: text(input.eventStart, 80),
     eventEnd: text(input.eventEnd, 80),
     originalPrice: number(input.originalPrice),
+    splitPricing: Boolean(input.splitPricing),
     expectedPerPerson: number(input.expectedPerPerson),
+    unitPrice: number(input.unitPrice ?? input.expectedPerPerson),
+    unitRemainder: number(input.unitRemainder ?? input.splitRemainder),
     splitRemainder: number(input.splitRemainder),
     approximatePrice: Boolean(input.approximatePrice),
     discountRate: number(input.discountRate),
@@ -158,7 +161,9 @@ function sanitizeDeal(input) {
     hostActorId: text(input.hostActorId, 128),
     hostMatched: Boolean(input.hostActorId),
     totalQuantity,
+    productQuantity: totalQuantity,
     orderedQuantity,
+    allocatedProductQuantity: orderedQuantity,
     lastMessageSeq: number(input.lastMessageSeq),
     version: number(input.version ?? input.stateVersion, 1),
     stateVersion: number(input.stateVersion ?? input.version, 1),
@@ -200,7 +205,12 @@ function publicResult(result, action) {
 
 function statusForError(code) {
   if (['missing_owner_capability', 'invalid_owner_capability', 'forbidden'].includes(code)) return 403;
-  if (['deal_ownership_unclaimable', 'deal_owner_conflict'].includes(code)) return 409;
+  if ([
+    'deal_ownership_unclaimable',
+    'deal_owner_conflict',
+    'quantity_below_active_allocations',
+    'active_allocations_require_group_sale',
+  ].includes(code)) return 409;
   if (String(code).includes('not_configured')) return 503;
   return 502;
 }

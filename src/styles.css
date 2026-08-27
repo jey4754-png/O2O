@@ -668,6 +668,16 @@ button:disabled {
   background: #fff;
 }
 
+.order-card.cancelled {
+  border-color: #e1e5ea;
+  background: #f8f9fb;
+}
+
+.order-card.cancelled h2,
+.order-card.cancelled > p {
+  color: #747d89;
+}
+
 .order-card h2 {
   margin: 0;
   font-size: 17px;
@@ -748,6 +758,35 @@ button:disabled {
 
 .order-card-actions > button:only-child {
   grid-column: 1 / -1;
+}
+
+.customer-payment-state.cancelled {
+  border-color: #dfe4e9;
+  background: #eef1f4;
+  color: #5f6873;
+}
+
+.customer-payment-state.cancelled strong {
+  color: #5f6873;
+}
+
+.owner-order-card.cancelled {
+  border-color: #e1e5ea;
+  background: #f8f9fb;
+}
+
+.manual-payment-state.cancelled {
+  background: #eef1f4;
+  color: #5f6873;
+}
+
+.order-cancel-error {
+  margin: 0;
+}
+
+.merchant-direct-group-note {
+  margin: 0 0 12px;
+  text-align: center;
 }
 
 .transaction-verified-label,
@@ -1744,6 +1783,14 @@ button:disabled {
 .owner-product-card span {
   font-size: 13px;
   font-weight: 900;
+}
+
+.owner-product-card .owner-bundle-total {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .owner-product-actions {
@@ -2776,6 +2823,10 @@ code {
 .group-create-price-preview strong {
   color: var(--accent);
   font-size: 23px;
+}
+
+.owner-split-price-preview {
+  margin-top: -2px;
 }
 
 .allocation-inline-summary {

@@ -92,13 +92,17 @@ function sanitizeOrder(input) {
   const deal = input.deal || {};
   const dealId = text(input.dealId || deal.id, 120);
   const groupId = text(input.groupId, 128);
+  const reservationMutationId = text(input.reservationMutationId || input.clientMutationId, 128);
   if (groupId && (!ID_PATTERN.test(groupId) || groupId !== dealId)) return null;
+  if (reservationMutationId && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/.test(reservationMutationId)) {
+    return null;
+  }
   return {
     id: text(input.id, 40),
     createdAt: text(input.createdAt, 80),
     statusUpdatedAt: text(input.statusUpdatedAt, 80),
     status: text(input.status || 'new', 40),
-    paymentStatus: ['pending', 'requested', 'confirmed'].includes(input.paymentStatus)
+    paymentStatus: ['pending', 'requested', 'confirmed', 'cancelled'].includes(input.paymentStatus)
       ? input.paymentStatus
       : 'pending',
     visitorId: text(input.visitorId, 120),
@@ -111,12 +115,16 @@ function sanitizeOrder(input) {
     dealId,
     groupId,
     participantActorId: text(input.participantActorId || input.visitorId, 128),
+    reservationMutationId,
+    reservationAction: text(input.reservationAction, 30),
+    reservationQuantity: number(input.reservationQuantity),
     type: text(input.type, 30),
     method: text(input.method, 30),
     time: text(input.time, 80),
     deadline: text(input.deadline, 80),
     selectedCount: number(input.selectedCount),
     quantity: number(input.quantity),
+    unitPrice: number(input.unitPrice),
     total: number(input.total),
     hostRemainderApplied: number(input.hostRemainderApplied),
     title: text(input.title || deal.title, 200),
@@ -124,6 +132,7 @@ function sanitizeOrder(input) {
     customerPickupConfirmedAt: text(input.customerPickupConfirmedAt, 80),
     paymentRequestedAt: text(input.paymentRequestedAt, 80),
     paymentConfirmedAt: text(input.paymentConfirmedAt, 80),
+    cancelledAt: text(input.cancelledAt, 80),
     version: number(input.version ?? input.paymentVersion, 1),
     paymentVersion: number(input.paymentVersion ?? input.version, 1),
     statusHistory: Array.isArray(input.statusHistory)
@@ -254,6 +263,9 @@ function legacyOrderEvent(order, customerCapabilityHash) {
       order.paymentRequestedAt || '',
       order.paymentConfirmedAt || '',
       order.customerPickupConfirmedAt || '',
+      order.cancelledAt || '',
+      order.selectedCount || order.quantity || '',
+      order.total || '',
       latestHistory.clientMutationId || latestHistory.timestamp || '',
     ].join('|'))
     .digest('hex')
@@ -326,7 +338,17 @@ function statusForOrderError(code) {
     'invalid_customer_capability',
     'forbidden',
   ].includes(code)) return 403;
-  if (['order_owner_conflict', 'order_ownership_unclaimable'].includes(code)) return 409;
+  if ([
+    'order_owner_conflict',
+    'order_ownership_unclaimable',
+    'order_deal_conflict',
+    'order_identity_conflict',
+    'order_reservation_conflict',
+    'order_reservation_unverified',
+    'order_transition_forbidden',
+    'quantity_unavailable',
+    'state_conflict',
+  ].includes(code)) return 409;
   if (code === 'group_not_found' || code === 'participant_not_found') return 404;
   if (String(code).includes('not_configured')) return 503;
   if (String(code).startsWith('invalid_')) return 400;

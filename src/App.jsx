@@ -38,6 +38,7 @@ import SplitCalculator from './Calculator';
 import GroupRoom from './GroupRoom';
 import { RELEASE_FEATURES } from './releasePhase';
 import {
+  cancelGroupParticipation,
   claimGroupHost,
   createMutationId,
   createGroupRoom as initializeGroupRoom,
@@ -48,6 +49,14 @@ import {
   reserveGroupQuantity,
   updateGroupTarget,
 } from './groupApi';
+import {
+  applyMerchantParticipationCancellation,
+  canCancelParticipation,
+  cancelledOrderSnapshot,
+  isCancelledOrder,
+} from './participation';
+import { buildCommerceStats } from './commerceStats';
+import { mergeDeals } from './dealMerge';
 import {
   calculateProductAllocation,
   calculateSplit,
@@ -311,7 +320,10 @@ async function fetchPublicDeals() {
     });
     const result = await response.json();
     return response.ok && result.ok && Array.isArray(result.deals)
-      ? result.deals.map((deal) => ({ ...migrateLocationFields(deal), category: normalizeCategory(deal.category) }))
+      ? result.deals.map((deal) => migrateMerchantSplitDeal({
+        ...migrateLocationFields(deal),
+        category: normalizeCategory(deal.category),
+      }))
       : [];
   } catch {
     return [];
@@ -361,7 +373,7 @@ async function fetchCustomerOrders(phone) {
   }
 }
 
-async function publishCustomerOrder(order) {
+async function publishCustomerOrder(order, options = {}) {
   try {
     const response = await fetch('/api/customer-orders', {
       method: 'POST',
@@ -374,8 +386,13 @@ async function publishCustomerOrder(order) {
       }),
     });
     const result = await response.json();
-    return response.ok && result.ok ? result.order : null;
-  } catch {
+    if (!response.ok || !result.ok) {
+      if (options.throwOnError) throw new Error(result.error || 'order_sync_failed');
+      return null;
+    }
+    return result.order;
+  } catch (error) {
+    if (options.throwOnError) throw error;
     return null;
   }
 }
@@ -396,48 +413,9 @@ async function deletePublicDeal(dealId) {
   }
 }
 
-function dealTimestamp(deal) {
-  if (deal?.updatedAt || deal?.syncedAt) return new Date(deal.updatedAt || deal.syncedAt).getTime() || 0;
-  if (deal?.createdAt) return new Date(deal.createdAt).getTime() || 0;
-  const match = String(deal?.id || '').match(/^(?:owner|customer)-(\d+)/);
-  return match ? Number(match[1]) : 0;
-}
-
 function dealSyncFingerprint(deal) {
   const { syncedAt, ...content } = deal || {};
   return JSON.stringify({ imageSyncVersion: 2, ...content });
-}
-
-function mergeDeals(...collections) {
-  const merged = new Map();
-  collections.flat().forEach((deal) => {
-    if (!deal?.id) return;
-    if (!merged.has(deal.id)) {
-      merged.set(deal.id, deal);
-      return;
-    }
-    const preferred = merged.get(deal.id);
-    const preferredTime = dealTimestamp(preferred);
-    const candidateTime = dealTimestamp(deal);
-    const hasVersionedUpdate = Boolean(
-      preferred?.updatedAt || preferred?.syncedAt || deal?.updatedAt || deal?.syncedAt,
-    );
-    if (hasVersionedUpdate && candidateTime > preferredTime) {
-      merged.set(deal.id, { ...preferred, ...deal });
-      return;
-    }
-    merged.set(deal.id, {
-      ...deal,
-      ...preferred,
-      current: hasVersionedUpdate
-        ? Number(preferred.current || 0)
-        : Math.max(Number(preferred.current || 0), Number(deal.current || 0)),
-      participantCount: hasVersionedUpdate
-        ? Number(preferred.participantCount || 0)
-        : Math.max(Number(preferred.participantCount || 0), Number(deal.participantCount || 0)),
-    });
-  });
-  return [...merged.values()].sort((left, right) => dealTimestamp(right) - dealTimestamp(left));
 }
 
 function getRegion(regionName) {
@@ -480,7 +458,7 @@ function formatLocation(value = {}, separator = ' · ') {
 
 function loadCreatedDeals() {
   const deals = loadJson(CREATED_DEALS_KEY, []);
-  const migrated = deals.map((deal) => ({
+  const migrated = deals.map((deal) => migrateMerchantSplitDeal({
     ...migrateLocationFields(deal),
     category: normalizeCategory(deal.category),
     visibility: deal.visibility || 'public',
@@ -615,8 +593,51 @@ function loadProfile() {
   return migrated;
 }
 
+function isSplitMerchantDeal(deal = {}) {
+  if (deal.source !== 'merchant' || deal.saleType !== 'group' || deal.menu?.length !== 1) return false;
+  return deal.splitPricing === true
+    || Number(deal.expectedPerPerson || 0) > 0
+    || (Boolean(deal.approximatePrice) && Number(deal.totalQuantity || 0) > 0);
+}
+
+function migrateMerchantSplitDeal(deal = {}) {
+  if (isSplitMerchantDeal(deal)) return deal;
+  const target = Math.min(999, Math.max(1, Math.floor(Number(deal.totalQuantity ?? deal.target ?? 1))));
+  const discountedTotal = discountedPrice(deal.originalPrice, deal.discountRate);
+  const isLegacyOwnerBundle = deal.source === 'merchant'
+    && deal.saleType === 'group'
+    && /^owner-/.test(String(deal.id || ''))
+    && deal.menu?.length === 1
+    && target > 1
+    && Number(deal.menu[0]?.price || 0) === discountedTotal;
+  if (!isLegacyOwnerBundle) return deal;
+  const allocation = calculateProductAllocation(discountedTotal, target, 1);
+  const orderedQuantity = Math.min(target, Math.max(0, Number(deal.orderedQuantity ?? deal.current ?? 0)));
+  return {
+    ...deal,
+    splitPricing: true,
+    totalQuantity: target,
+    productQuantity: target,
+    orderedQuantity,
+    allocatedProductQuantity: orderedQuantity,
+    expectedPerPerson: allocation.unitPrice,
+    unitPrice: allocation.unitPrice,
+    splitRemainder: allocation.remainder,
+    unitRemainder: allocation.remainder,
+    approximatePrice: allocation.approximate,
+    menu: [{
+      ...deal.menu[0],
+      price: allocation.unitPrice,
+      option: `${deal.menu[0].option || ''}${deal.menu[0].option ? ' · ' : ''}1개 예상금액`,
+    }],
+  };
+}
+
 function getDealPrice(deal) {
   if (deal.source === 'customer' && deal.menu?.[0]?.price !== undefined) return Number(deal.menu[0].price || 0);
+  if (isSplitMerchantDeal(deal)) {
+    return Number(deal.expectedPerPerson ?? deal.menu?.[0]?.price ?? 0);
+  }
   return discountedPrice(deal.originalPrice, deal.discountRate);
 }
 
@@ -637,7 +658,9 @@ function getDealQuantity(deal = {}) {
   ), 0, target);
   const targetPeople = Math.max(1, Number(deal.targetPeople ?? deal.targetCount ?? deal.target ?? 1));
   const currentPeople = Math.max(0, Number(
-    deal.currentPeople ?? deal.currentCount ?? deal.participantCount ?? deal.current ?? 0,
+    deal.source === 'customer'
+      ? deal.currentPeople ?? deal.currentCount ?? deal.participantCount ?? deal.current ?? 0
+      : deal.participantCount ?? deal.currentPeople ?? deal.currentCount ?? 0,
   ));
   return {
     target,
@@ -697,6 +720,13 @@ function App() {
     ),
     [createdDeals, customerGroups, remoteDeals],
   );
+
+  useEffect(() => {
+    setSelectedDeal((current) => {
+      const latest = deals.find((deal) => deal.id === current?.id);
+      return latest && latest !== current ? latest : current;
+    });
+  }, [deals]);
 
   useEffect(() => {
     if (!profile || !RELEASE_FEATURES.unreadBadges) {
@@ -1074,12 +1104,29 @@ function App() {
     const centralVersion = editingId
       ? remoteDeals.find((deal) => deal.id === editingId)
       : null;
+    const previousOrderedQuantity = centralVersion?.syncedAt
+      ? Number(centralVersion.orderedQuantity ?? centralVersion.current ?? 0)
+      : Math.max(
+        Number(previous?.orderedQuantity ?? previous?.current ?? 0),
+        Number(centralVersion?.orderedQuantity ?? centralVersion?.current ?? 0),
+      );
+    const hasActiveGroupOrders = previous?.saleType === 'group' && previousOrderedQuantity > 0;
+    const splitPricing = ownerProduct.saleType === 'group' || hasActiveGroupOrders;
+    const requestedTotalQuantity = Math.min(999, Math.max(1, Math.floor(Number(
+      splitPricing ? ownerProduct.maxQuantity : ownerProduct.stock,
+    ) || 1)));
+    const totalQuantity = splitPricing
+      ? Math.max(requestedTotalQuantity, Math.ceil(previousOrderedQuantity))
+      : requestedTotalQuantity;
+    const discountedTotal = discountedPrice(ownerProduct.originalPrice, ownerProduct.discountRate);
+    const splitAllocation = calculateProductAllocation(discountedTotal, totalQuantity, 1);
+    const orderedQuantity = editingId ? previousOrderedQuantity : 0;
     const deal = {
       id: editingId || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`,
       createdAt: previous?.createdAt || new Date().toISOString(),
       visibility: 'public',
       source: 'merchant',
-      saleType: ownerProduct.saleType,
+      saleType: splitPricing ? 'group' : ownerProduct.saleType,
       category: normalizeCategory(ownerProduct.category),
       region: ownerProduct.region,
       district: ownerProduct.district,
@@ -1096,22 +1143,32 @@ function App() {
       eventEnd: ownerProduct.eventEnd,
       originalPrice: Number(ownerProduct.originalPrice),
       discountRate: Number(ownerProduct.discountRate),
-      current: editingId
-        ? Math.max(Number(previous?.current || 0), Number(centralVersion?.current || 0))
-        : 0,
+      current: editingId ? orderedQuantity : 0,
       participantCount: editingId
-        ? Math.max(Number(previous?.participantCount || 0), Number(centralVersion?.participantCount || 0))
+        ? centralVersion?.syncedAt
+          ? Number(centralVersion.participantCount || 0)
+          : Math.max(Number(previous?.participantCount || 0), Number(centralVersion?.participantCount || 0))
         : 0,
       quantityTracking: true,
-      target: Number(ownerProduct.saleType === 'instant' ? ownerProduct.stock : ownerProduct.maxQuantity),
+      target: totalQuantity,
+      totalQuantity,
+      productQuantity: totalQuantity,
+      orderedQuantity: editingId ? orderedQuantity : 0,
+      allocatedProductQuantity: editingId ? orderedQuantity : 0,
+      splitPricing,
+      expectedPerPerson: splitPricing ? splitAllocation.unitPrice : 0,
+      splitRemainder: splitPricing ? splitAllocation.remainder : 0,
+      approximatePrice: splitPricing ? splitAllocation.approximate : false,
       likes: 0,
       image: ownerProduct.image || fallbackImage,
       menu: [
         {
           id: 'owner-menu-1',
           name: ownerProduct.productName,
-          price: discountedPrice(ownerProduct.originalPrice, ownerProduct.discountRate),
-          option: ownerProduct.methods.join(', '),
+          price: splitPricing ? splitAllocation.unitPrice : discountedTotal,
+          option: splitPricing
+            ? `${ownerProduct.methods.join(', ')} · 1개 예상금액`
+            : ownerProduct.methods.join(', '),
         },
       ],
       updatedAt: new Date().toISOString(),
@@ -1378,17 +1435,32 @@ function App() {
       statusHistory: [{ status: 'new', actor: 'customer', timestamp: createdAt }],
       ...order,
     };
+    let storedOrder = newOrder;
+    if (isPurchase && order.deal?.source === 'merchant') {
+      const published = await publishCustomerOrder(newOrder, { throwOnError: true });
+      if (!published) throw new Error('order_sync_failed');
+      storedOrder = {
+        ...newOrder,
+        ...published,
+        deal: { ...newOrder.deal, ...(published.deal || {}) },
+      };
+      const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+      fingerprints[newOrder.id] = orderSyncFingerprint(storedOrder);
+      saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+    }
     setOrders((current) => {
-      const next = [newOrder, ...current];
+      const next = [storedOrder, ...current];
       saveJson(CUSTOMER_ORDERS_KEY, next);
       return next;
     });
-    publishCustomerOrder(newOrder).then((published) => {
-      if (!published) return;
-      const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
-      fingerprints[newOrder.id] = orderSyncFingerprint(newOrder);
-      saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
-    });
+    if (!(isPurchase && order.deal?.source === 'merchant')) {
+      publishCustomerOrder(newOrder).then((published) => {
+        if (!published) return;
+        const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+        fingerprints[newOrder.id] = orderSyncFingerprint(newOrder);
+        saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+      });
+    }
 
     if (isPurchase && order.deal?.id) {
       const target = Math.max(1, Number(order.deal.target || 1));
@@ -1425,13 +1497,22 @@ function App() {
             source: 'checkout',
           });
         }
-        return newOrder;
+        return storedOrder;
       }
       const participationIncrement = orderedQuantityIncrement;
+      const previousOrderedQuantity = Number(
+        order.deal.orderedQuantity
+        ?? order.deal.allocatedProductQuantity
+        ?? order.deal.current
+        ?? 0,
+      );
+      const nextOrderedQuantity = Math.min(target, previousOrderedQuantity + participationIncrement);
       const updatedDeal = {
         ...order.deal,
         quantityTracking: true,
-        current: Math.min(target, Math.max(0, Number(order.deal.current || 0)) + participationIncrement),
+        current: nextOrderedQuantity,
+        orderedQuantity: nextOrderedQuantity,
+        allocatedProductQuantity: nextOrderedQuantity,
         participantCount: Math.max(0, Number(order.deal.participantCount || 0))
           + (isNewDealParticipant && !alreadyJoinedRoom ? 1 : 0),
       };
@@ -1470,12 +1551,120 @@ function App() {
         });
       }
     }
-    return newOrder;
+    return storedOrder;
+  };
+
+  const cancelParticipation = async (order) => {
+    const deal = deals.find((item) => item.id === order.dealId) || order.deal;
+    if (!deal) throw new Error('deal_not_found');
+    const actorId = getVisitorId();
+    const mutationId = createMutationId('cancel_participation');
+    let cancelledOrder;
+    let updatedDeal;
+    let cancellationSnapshot = null;
+
+    if (deal.source === 'customer') {
+      const result = await cancelGroupParticipation({
+        groupId: deal.groupId || deal.id,
+        order,
+        actorId,
+        customerCapabilityToken: getCustomerOrderCapability(),
+        clientMutationId: mutationId,
+      });
+      cancelledOrder = result.order;
+      cancellationSnapshot = result.snapshot || null;
+      const group = cancellationSnapshot?.group || {};
+      updatedDeal = {
+        ...deal,
+        current: Number(group.currentCount ?? deal.current ?? 0),
+        currentPeople: Number(group.currentCount ?? deal.currentPeople ?? deal.current ?? 0),
+        currentCount: Number(group.currentCount ?? deal.currentCount ?? deal.current ?? 0),
+        participantCount: Number(group.currentCount ?? deal.participantCount ?? deal.current ?? 0),
+        orderedQuantity: Number(group.orderedQuantity ?? deal.orderedQuantity ?? 0),
+        allocatedProductQuantity: Number(group.orderedQuantity ?? deal.orderedQuantity ?? 0),
+        version: Number(group.version ?? deal.version ?? 1),
+        stateVersion: Number(group.version ?? deal.stateVersion ?? deal.version ?? 1),
+        updatedAt: group.updatedAt || cancelledOrder?.cancelledAt || new Date().toISOString(),
+      };
+    } else {
+      cancelledOrder = cancelledOrderSnapshot(order, {
+        timestamp: new Date().toISOString(),
+        clientMutationId: mutationId,
+      });
+      const published = await publishCustomerOrder(cancelledOrder);
+      if (!published) throw new Error('participation_cancel_failed');
+      cancelledOrder = { ...cancelledOrder, ...published };
+      const hasOtherActiveOrder = orders.some((candidate) => (
+        candidate.id !== order.id
+        && candidate.type === 'purchase'
+        && candidate.dealId === order.dealId
+        && candidate.visitorId === order.visitorId
+        && !isCancelledOrder(candidate)
+      ));
+      updatedDeal = applyMerchantParticipationCancellation(deal, order, hasOtherActiveOrder);
+    }
+
+    if (!cancelledOrder) throw new Error('participation_cancel_failed');
+    setOrders((current) => {
+      const next = current.map((item) => (
+        item.id === order.id ? { ...item, ...cancelledOrder } : item
+      ));
+      saveJson(CUSTOMER_ORDERS_KEY, next);
+      return next;
+    });
+    const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+    fingerprints[cancelledOrder.id] = orderSyncFingerprint(cancelledOrder);
+    saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+
+    const participantStorageKey = participationKey(order);
+    const countedParticipations = loadJson(COUNTED_PARTICIPATIONS_KEY, {});
+    const groupParticipant = cancellationSnapshot?.participants
+      ?.find((item) => item.actorId === actorId);
+    const stillCounted = deal.source === 'customer'
+      ? Boolean(groupParticipant?.counted)
+      : orders.some((candidate) => (
+        candidate.id !== order.id
+        && candidate.type === 'purchase'
+        && candidate.dealId === order.dealId
+        && candidate.visitorId === order.visitorId
+        && !isCancelledOrder(candidate)
+      ));
+    if (stillCounted) countedParticipations[participantStorageKey] = true;
+    else delete countedParticipations[participantStorageKey];
+    saveJson(COUNTED_PARTICIPATIONS_KEY, countedParticipations);
+
+    setSelectedDeal((current) => (current?.id === updatedDeal.id ? updatedDeal : current));
+    setRemoteDeals((current) => mergeDeals(
+      [updatedDeal],
+      current.filter((item) => item.id !== updatedDeal.id),
+    ));
+    if (updatedDeal.source === 'customer') {
+      setCustomerGroups((current) => {
+        if (!current.some((item) => item.id === updatedDeal.id)) return current;
+        const next = current.map((item) => (item.id === updatedDeal.id ? updatedDeal : item));
+        saveJson(CUSTOMER_GROUPS_KEY, next);
+        return next;
+      });
+    } else {
+      setCreatedDeals((current) => {
+        if (!current.some((item) => item.id === updatedDeal.id)) return current;
+        const next = current.map((item) => (item.id === updatedDeal.id ? updatedDeal : item));
+        saveCreatedDeals(next);
+        return next;
+      });
+    }
+    track('participation_cancelled', {
+      order_id: order.id,
+      deal_id: order.dealId,
+      selected_count: Number(order.selectedCount ?? order.quantity ?? 0),
+      source: deal.source,
+    });
+    return cancelledOrder;
   };
 
   const updateOrderStatus = (orderId) => {
     const order = orders.find((item) => item.id === orderId);
-    if (!order) return;
+    if (!order || isCancelledOrder(order)) return;
     const currentStage = getOrderStage(order);
     const currentIndex = ORDER_STAGES.findIndex((stage) => stage.id === currentStage.id);
     const nextStage = ORDER_STAGES[Math.min(currentIndex + 1, ORDER_STAGES.length - 1)];
@@ -1510,7 +1699,7 @@ function App() {
 
   const confirmCustomerPickup = (orderId) => {
     const order = orders.find((item) => item.id === orderId);
-    if (!order || order.type !== 'purchase' || order.customerPickupConfirmedAt) return;
+    if (!order || isCancelledOrder(order) || order.type !== 'purchase' || order.customerPickupConfirmedAt) return;
     if (!['pickup_waiting', 'completed'].includes(getOrderStage(order).id)) return;
     const confirmedAt = new Date().toISOString();
     const next = orders.map((item) => (
@@ -1539,7 +1728,7 @@ function App() {
 
   const confirmManualPayment = (orderId) => {
     const order = orders.find((item) => item.id === orderId);
-    if (!order || order.type !== 'purchase' || order.paymentConfirmedAt) return;
+    if (!order || isCancelledOrder(order) || order.type !== 'purchase' || order.paymentConfirmedAt) return;
     const confirmedAt = new Date().toISOString();
     const next = orders.map((item) => (
       item.id === orderId
@@ -1690,6 +1879,7 @@ function App() {
                 onUpdateTarget={updateCustomerGroupTarget}
                 onDeleteDeal={removeDeal}
                 onConfirmPickup={confirmCustomerPickup}
+                onCancelParticipation={cancelParticipation}
                 onNeighborhoodChange={handleNeighborhoodChange}
                 onLogout={handleLogout}
               />
@@ -1848,6 +2038,7 @@ function CustomerApp({
   onUpdateTarget,
   onDeleteDeal,
   onConfirmPickup,
+  onCancelParticipation,
   onNeighborhoodChange,
   onLogout,
 }) {
@@ -1977,6 +2168,7 @@ function CustomerApp({
         deals={deals}
         onSelectDeal={onSelectDeal}
         onConfirmPickup={onConfirmPickup}
+        onCancelParticipation={onCancelParticipation}
         onScreen={onScreen}
       />
     );
@@ -2376,6 +2568,7 @@ function NeighborhoodPicker({ current, onSelect, onClose }) {
 function DealCard({ deal, hostMatched, unreadCount = 0, statusNotice = '', onClick }) {
   const isCustomerGroup = deal.source === 'customer';
   const isInstant = deal.saleType === 'instant';
+  const isSplitMerchant = isSplitMerchantDeal(deal);
   const typeLabel = isCustomerGroup ? '사용자 그룹' : isInstant ? '선착순 즉시할인' : '사장님 공구';
   const TypeIcon = isCustomerGroup ? User : Store;
   const price = getDealPrice(deal);
@@ -2418,7 +2611,7 @@ function DealCard({ deal, hostMatched, unreadCount = 0, statusNotice = '', onCli
         )}
         <Progress deal={deal} />
         <div className="price-row">
-          <span>{isCustomerGroup ? '제품 1개 예상금액' : `${deal.discountRate}% 할인`}</span>
+          <span>{isCustomerGroup || isSplitMerchant ? '제품 1개 예상금액' : `${deal.discountRate}% 할인`}</span>
           <strong>{formatWon(price)}</strong>
         </div>
       </div>
@@ -2494,9 +2687,37 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
   );
 }
 
-function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onScreen }) {
+function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onCancelParticipation, onScreen }) {
   useScreenAnalytics('customer_orders', { order_count: orders.length });
   const dealById = new Map(deals.map((deal) => [deal.id, deal]));
+  const [cancellingId, setCancellingId] = useState('');
+  const [cancelError, setCancelError] = useState(null);
+
+  const handleCancellation = async (order, deal) => {
+    if (cancellingId) return;
+    const confirmed = window.confirm(
+      `“${deal?.title || order.title}” 참여를 취소할까요?\n배정된 수량이 다시 모집 가능 수량으로 돌아갑니다.`,
+    );
+    if (!confirmed) return;
+    setCancellingId(order.id);
+    setCancelError(null);
+    try {
+      await onCancelParticipation(order);
+    } catch (error) {
+      const message = ['payment_already_processed', 'order_not_cancellable'].includes(error?.message)
+        ? '입금 확인 요청 또는 거래 처리가 시작된 주문은 취소할 수 없습니다.'
+        : error?.message === 'participation_cancellation_closed'
+          ? '모집이 종료되어 이 참여를 취소할 수 없습니다.'
+          : error?.message === 'forbidden'
+            ? '그룹 생성자·호스트 주문은 여기에서 참여 취소할 수 없습니다.'
+            : error?.message === 'state_conflict'
+              ? '다른 변경이 먼저 반영되었습니다. 잠시 후 다시 시도해 주세요.'
+              : '참여 취소를 반영하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.';
+      setCancelError({ orderId: order.id, message });
+    } finally {
+      setCancellingId('');
+    }
+  };
 
   return (
     <section className="screen">
@@ -2520,24 +2741,29 @@ function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onScreen }) {
         <div className="order-card-list">
           {orders.map((order) => {
             const deal = dealById.get(order.dealId) || order.deal;
+            const cancelled = isCancelledOrder(order);
             const orderStage = getOrderStage(order);
             const orderStageIndex = ORDER_STAGES.findIndex((stage) => stage.id === orderStage.id);
-            const canConfirmPickup = order.type === 'purchase'
+            const groupRole = deal?.source === 'customer'
+              ? getGroupCredential(deal.id, order.visitorId)?.role || ''
+              : '';
+            const canCancel = canCancelParticipation(order, deal, groupRole);
+            const canConfirmPickup = !cancelled && order.type === 'purchase'
               && ['pickup_waiting', 'completed'].includes(orderStage.id)
               && !order.customerPickupConfirmedAt;
-            const verificationComplete = order.type === 'purchase'
+            const verificationComplete = !cancelled && order.type === 'purchase'
               && orderStage.id === 'completed'
               && Boolean(order.customerPickupConfirmedAt)
               && Boolean(order.paymentConfirmedAt);
             return (
-              <article className="order-card" key={order.id}>
+              <article className={cancelled ? 'order-card cancelled' : 'order-card'} key={order.id}>
                 <div className="order-status-line">
-                  <span>{order.type === 'group' ? '그룹방 생성' : orderStage.label}</span>
-                  <strong>{order.type === 'group' ? order.method : '사장님 상태 반영'}</strong>
+                  <span>{cancelled ? '참여 취소' : order.type === 'group' ? '그룹방 생성' : orderStage.label}</span>
+                  <strong>{cancelled ? '수량 배정 복구 완료' : order.type === 'group' ? order.method : '사장님 상태 반영'}</strong>
                 </div>
                 <h2>{deal?.title || order.title}</h2>
                 <p>{deal?.store || order.store}</p>
-                {order.type !== 'group' && (
+                {order.type !== 'group' && !cancelled && (
                   <div className="order-status-steps" aria-label={`주문 상태 ${orderStage.label}`}>
                     {ORDER_STAGES.map((stage, index) => (
                       <span key={stage.id} className={index <= orderStageIndex ? 'active' : ''}>
@@ -2547,11 +2773,16 @@ function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onScreen }) {
                   </div>
                 )}
                 <div className="order-meta-grid">
-                  <span>수량 {order.selectedCount || order.quantity || 1}개</span>
-                  <span>{formatWon(order.total || discountedPrice(deal?.originalPrice, deal?.discountRate))}</span>
+                  <span>{cancelled ? '취소 수량' : '수량'} {order.selectedCount ?? order.quantity ?? 1}개</span>
+                  <span>{cancelled ? '취소 전 ' : ''}{formatWon(order.total ?? discountedPrice(deal?.originalPrice, deal?.discountRate))}</span>
                   <span>{order.time || order.deadline || deal?.deadline}</span>
                 </div>
-                {order.type === 'purchase' && (
+                {order.type === 'purchase' && cancelled ? (
+                  <div className="customer-payment-state cancelled">
+                    <strong>참여 취소 완료</strong>
+                    <span>선택했던 수량이 공동구매의 남은 수량에 다시 반영되었습니다.</span>
+                  </div>
+                ) : order.type === 'purchase' && (
                   <div className={order.paymentConfirmedAt ? 'customer-payment-state confirmed' : 'customer-payment-state'}>
                     <strong>{order.paymentConfirmedAt ? '수동 결제 확인 완료' : '가상 주문 접수 · 결제 확인 대기'}</strong>
                     <span>{order.paymentConfirmedAt ? '사장님이 결제 확인 상태를 반영했습니다.' : '실제 결제 후 사장님이 확인하면 이 화면에 표시됩니다.'}</span>
@@ -2566,10 +2797,23 @@ function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onScreen }) {
                 {order.customerPickupConfirmedAt && !verificationComplete && (
                   <div className="customer-confirmed-label">사용자 픽업 확인 완료 · 사장님/결제 처리 확인 중</div>
                 )}
+                {cancelError?.orderId === order.id && (
+                  <p className="form-error order-cancel-error" role="alert">{cancelError.message}</p>
+                )}
                 <div className="order-card-actions">
                   <button className="secondary-button compact-button" onClick={() => deal && onSelectDeal(deal)}>
                     상세보기
                   </button>
+                  {canCancel && (
+                    <button
+                      className="danger-button compact-button"
+                      disabled={Boolean(cancellingId)}
+                      onClick={() => handleCancellation(order, deal)}
+                    >
+                      <X size={15} />
+                      {cancellingId === order.id ? '취소 반영 중…' : '참여 취소'}
+                    </button>
+                  )}
                   {canConfirmPickup && (
                     <button className="primary-button compact-button" onClick={() => onConfirmPickup(order.id)}>
                       <Check size={15} />
@@ -2737,6 +2981,7 @@ function DealDetail({
   });
   const isCustomerGroup = deal.source === 'customer';
   const isInstant = deal.saleType === 'instant';
+  const isSplitMerchant = isSplitMerchantDeal(deal);
   const dealQuantity = getDealQuantity(deal);
   const split = isCustomerGroup
     ? calculateSplit(
@@ -2962,6 +3207,17 @@ function DealDetail({
             <p>1인 구매 부담액 <b>{formatWon(Math.max(0, Number(deal.originalPrice || 0) - expectedPerPerson))} 감소</b></p>
             {productSplit.remainder > 0 && <p>나머지 {formatWon(productSplit.remainder)}은 호스트가 부담해 총액을 정확히 맞춥니다.</p>}
           </div>
+        ) : isSplitMerchant ? (
+          <div className="detail-price-grid split-merchant-price-grid">
+            <span>정상가</span>
+            <del>{formatWon(deal.originalPrice)}</del>
+            <span>할인 묶음 총액</span>
+            <strong>{formatWon(discountedPrice(deal.originalPrice, deal.discountRate))}</strong>
+            <span>제품 1개 예상금액</span>
+            <strong>{deal.approximatePrice ? '약 ' : ''}{formatWon(getDealPrice(deal))}</strong>
+            <span>공구 총수량</span>
+            <strong>{dealQuantity.target}개</strong>
+          </div>
         ) : (
           <div className="detail-price-grid">
             <span>정상가</span>
@@ -3090,7 +3346,13 @@ function DealDetail({
         ))}
       </div>
 
-      <div className="sticky-actions">
+      {isSplitMerchant && (
+        <p className="evidence-note merchant-direct-group-note">
+          사장님 상품 등록과 동시에 이 공동구매가 생성되어, 별도 그룹방을 다시 만들지 않고 바로 참여할 수 있습니다.
+        </p>
+      )}
+
+      <div className={isSplitMerchant ? 'sticky-actions single' : 'sticky-actions'}>
         {isCustomerGroup ? (
           <>
             <button className="secondary-button room-entry-button" onClick={onOpenRoom}>
@@ -3114,15 +3376,17 @@ function DealDetail({
           </>
         ) : (
           <>
-            <button
-              className="secondary-button"
-              onClick={() => {
-                onScreen('group');
-                track('group_create_started', { deal_id: deal.id });
-              }}
-            >
-              <Users size={18} /> 그룹방 만들기
-            </button>
+            {!isSplitMerchant && (
+              <button
+                className="secondary-button"
+                onClick={() => {
+                  onScreen('group');
+                  track('group_create_started', { deal_id: deal.id });
+                }}
+              >
+                <Users size={18} /> 그룹방 만들기
+              </button>
+            )}
             {!adminMode && (
               <button
                 className="primary-button"
@@ -3903,6 +4167,19 @@ function OwnerApp({
   const neighborhoodGroups = deals.filter(
     (deal) => deal.source === 'customer' && sameLocation(deal, location),
   );
+  const managedOwnerDeals = createdDeals.map((localDeal) => {
+    const centralDeal = deals.find((deal) => deal.id === localDeal.id);
+    if (!centralDeal) return localDeal;
+    const orderedQuantity = Number(centralDeal.orderedQuantity ?? centralDeal.current ?? 0);
+    return {
+      ...localDeal,
+      orderedQuantity,
+      allocatedProductQuantity: orderedQuantity,
+      current: orderedQuantity,
+      currentCount: Number(centralDeal.currentCount ?? orderedQuantity),
+      participantCount: Number(centralDeal.participantCount || 0),
+    };
+  });
 
   if (screen === 'orders') {
     return (
@@ -3918,7 +4195,7 @@ function OwnerApp({
   if (screen === 'products') {
     return (
       <OwnerProducts
-        deals={createdDeals}
+        deals={managedOwnerDeals}
         onBack={() => onScreen('form')}
         onEdit={(deal) => {
           setEditingDeal(deal);
@@ -3975,6 +4252,14 @@ function OwnerForm({
 }) {
   useScreenAnalytics('owner_product_form');
   const deadlineParts = String(initialDeal?.deadline || '').split(' ');
+  const activeAllocatedQuantity = initialDeal?.saleType === 'group'
+    ? Math.max(0, Math.ceil(Number(
+      initialDeal.orderedQuantity
+      ?? initialDeal.allocatedProductQuantity
+      ?? initialDeal.current
+      ?? 0,
+    )))
+    : 0;
   const [form, setForm] = useState({
     saleType: 'group',
     ...normalizeLocation(location),
@@ -4003,7 +4288,10 @@ function OwnerForm({
       originalPrice: String(initialDeal.originalPrice || ''),
       discountRate: Number(initialDeal.discountRate || 0),
       stock: Number(initialDeal.stock || 0),
-      maxQuantity: Number(initialDeal.target || 1),
+      maxQuantity: Math.max(
+        activeAllocatedQuantity,
+        Number(initialDeal.totalQuantity || initialDeal.productQuantity || initialDeal.target || 1),
+      ),
       deadlineDate: /^\d{4}-\d{2}-\d{2}$/.test(deadlineParts[0]) ? deadlineParts[0] : new Date().toISOString().slice(0, 10),
       deadlineTime: /^\d{2}:\d{2}$/.test(deadlineParts[1]) ? deadlineParts[1] : '20:00',
       eventStart: initialDeal.eventStart || '14:30',
@@ -4020,6 +4308,8 @@ function OwnerForm({
   const selectedDistrict = getDistrict(selectedRegion, form.district);
 
   const price = discountedPrice(form.originalPrice, form.discountRate);
+  const groupTotalQuantity = Math.min(999, Math.max(1, Math.floor(Number(form.maxQuantity || 1))));
+  const groupPricePreview = calculateProductAllocation(price, groupTotalQuantity, 1);
 
   const toggleMethod = (method) => {
     const methods = form.methods.includes(method)
@@ -4197,6 +4487,8 @@ function OwnerForm({
             original_price: Number(form.originalPrice),
             discount_rate: Number(form.discountRate),
             calculated_price: price,
+            expected_per_item: form.saleType === 'group' ? groupPricePreview.unitPrice : price,
+            total_quantity: form.saleType === 'group' ? groupTotalQuantity : Number(form.stock),
             stock: Number(form.stock),
             max_quantity: Number(form.maxQuantity),
             deadline: payload.deadline,
@@ -4218,6 +4510,11 @@ function OwnerForm({
                 type="button"
                 key={item.id}
                 className={form.saleType === item.id ? 'sale-type-card active' : 'sale-type-card'}
+                disabled={Boolean(
+                  initialDeal?.saleType === 'group'
+                  && activeAllocatedQuantity > 0
+                  && item.id !== 'group'
+                )}
                 onClick={() => {
                   setForm({ ...form, saleType: item.id });
                   track('sale_type_selected', { sale_type: item.id });
@@ -4269,7 +4566,7 @@ function OwnerForm({
           />
         </label>
         <div className="calculated-price">
-          <span>자동 계산 할인가</span>
+          <span>{form.saleType === 'group' ? '자동 계산 할인 묶음 총액' : '자동 계산 할인가'}</span>
           <strong>{formatWon(price)}</strong>
         </div>
 
@@ -4282,13 +4579,35 @@ function OwnerForm({
           />
           {form.saleType === 'group' && (
             <FieldCounter
-              label="공구 최대 수량"
+              label="공구 총수량"
               value={form.maxQuantity}
-              onMinus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity - 1, 1, 20) })}
-              onPlus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity + 1, 1, 20) })}
+              onMinus={() => setForm({
+                ...form,
+                maxQuantity: clamp(form.maxQuantity - 1, Math.max(1, activeAllocatedQuantity), 999),
+              })}
+              onPlus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity + 1, 1, 999) })}
             />
           )}
         </div>
+
+        {form.saleType === 'group' && (
+          <div className="group-create-price-preview owner-split-price-preview" aria-live="polite">
+            <span>제품 1개당 예상금액</span>
+            <strong>{groupPricePreview.approximate ? '약 ' : ''}{formatWon(groupPricePreview.unitPrice)}</strong>
+            <div className="allocation-inline-summary">
+              <span>할인 묶음 총액 {formatWon(groupPricePreview.total)}</span>
+              <strong>총 {groupPricePreview.productQuantity}개</strong>
+            </div>
+            <p>묶음 총액을 공구 총수량으로 나누어 참여자의 수량별 금액을 자동 계산합니다.</p>
+            <p>상품 등록을 완료하면 같은 정보로 사용자 공동구매가 한 번만 생성됩니다.</p>
+            {activeAllocatedQuantity > 0 && (
+              <p>현재 주문 {activeAllocatedQuantity}개가 있어 공구 총수량은 이보다 작게 줄일 수 없습니다.</p>
+            )}
+            {groupPricePreview.remainder > 0 && (
+              <p>원 단위로 남는 {formatWon(groupPricePreview.remainder)}은 사장님이 별도로 안내합니다.</p>
+            )}
+          </div>
+        )}
 
         <div className="content-block flush">
           <h2>수령 방식</h2>
@@ -4391,36 +4710,44 @@ function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
         />
       ) : (
         <div className="owner-product-list">
-          {deals.map((deal) => (
-            <article className="owner-product-card" key={deal.id}>
-              <img src={deal.image} alt="" />
-              <div>
-                <strong>{deal.title}</strong>
-                <p>{deal.store} · {formatLocation(deal)}</p>
-                <span>{formatWon(getDealPrice(deal))}</span>
-                {deal.quantityTracking && (
-                  <span className="owner-quantity-state">
-                    주문 {getDealQuantity(deal).ordered}개 · 남은 수량 {getDealQuantity(deal).remaining}개
-                  </span>
-                )}
-              </div>
-              <div className="owner-product-actions">
-                <button className="secondary-button compact-button" onClick={() => onEdit(deal)}>
-                  <Pencil size={14} />
-                  수정
-                </button>
-                <button
-                  className="danger-button compact-button"
-                  onClick={() => {
-                    if (window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) onDelete(deal);
-                  }}
-                >
-                  <Trash2 size={14} />
-                  삭제
-                </button>
-              </div>
-            </article>
-          ))}
+          {deals.map((deal) => {
+            const splitMerchant = isSplitMerchantDeal(deal);
+            return (
+              <article className="owner-product-card" key={deal.id}>
+                <img src={deal.image} alt="" />
+                <div>
+                  <strong>{deal.title}</strong>
+                  <p>{deal.store} · {formatLocation(deal)}</p>
+                  <span>{splitMerchant ? '1개 예상 ' : ''}{formatWon(getDealPrice(deal))}</span>
+                  {splitMerchant && (
+                    <small className="owner-bundle-total">
+                      할인 묶음 총액 {formatWon(discountedPrice(deal.originalPrice, deal.discountRate))}
+                    </small>
+                  )}
+                  {deal.quantityTracking && (
+                    <span className="owner-quantity-state">
+                      주문 {getDealQuantity(deal).ordered}개 · 남은 수량 {getDealQuantity(deal).remaining}개
+                    </span>
+                  )}
+                </div>
+                <div className="owner-product-actions">
+                  <button className="secondary-button compact-button" onClick={() => onEdit(deal)}>
+                    <Pencil size={14} />
+                    수정
+                  </button>
+                  <button
+                    className="danger-button compact-button"
+                    onClick={() => {
+                      if (window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) onDelete(deal);
+                    }}
+                  >
+                    <Trash2 size={14} />
+                    삭제
+                  </button>
+                </div>
+              </article>
+            );
+          })}
         </div>
       )}
     </section>
@@ -4430,21 +4757,30 @@ function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
 function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
   useScreenAnalytics('owner_product_done', { deal_id: deal.id });
   const isInstant = deal.saleType === 'instant';
+  const splitMerchant = isSplitMerchantDeal(deal);
   return (
     <section className="screen complete-screen">
       <div className="success-mark">
         <Check size={34} />
       </div>
       <h1>등록 완료</h1>
-      <p>{deal.title} {isInstant ? '선착순 즉시할인 상품이' : '공동구매가'} 사용자 리스트에 반영되었습니다.</p>
+      <p>{deal.title} {isInstant
+        ? '선착순 즉시할인 상품이 사용자 리스트에 반영되었습니다.'
+        : '상품과 공동구매가 하나의 카드로 사용자 리스트에 반영되었습니다.'}</p>
       <img className="done-image" src={deal.image} alt="" />
       <div className="completion-summary">
         <div>
-          <span>할인가</span>
+          <span>{splitMerchant ? '할인 묶음 총액' : '할인가'}</span>
           <strong>{formatWon(discountedPrice(deal.originalPrice, deal.discountRate))}</strong>
         </div>
+        {splitMerchant && (
+          <div>
+            <span>제품 1개 예상금액</span>
+            <strong>{deal.approximatePrice ? '약 ' : ''}{formatWon(getDealPrice(deal))}</strong>
+          </div>
+        )}
         <div>
-          <span>{isInstant ? '재고 수량' : '목표 수량'}</span>
+          <span>{isInstant ? '재고 수량' : '공구 총수량'}</span>
           <strong>{deal.target}개</strong>
         </div>
       </div>
@@ -4505,40 +4841,54 @@ function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfir
       ) : (
         <div className="owner-order-list">
           {orders.map((order) => {
+            const cancelled = isCancelledOrder(order);
             const stage = getOrderStage(order);
             return (
-              <article className="owner-order-card" key={order.id}>
+              <article className={cancelled ? 'owner-order-card cancelled' : 'owner-order-card'} key={order.id}>
                 <div className="owner-order-heading">
                   <div>
-                    <span>{stage.label}</span>
+                    <span>{cancelled ? '참여 취소' : stage.label}</span>
                     <h2>{order.title}</h2>
                   </div>
                   <strong>{formatWon(order.total)}</strong>
                 </div>
-                <p>{order.method} · {order.time} · 수량 {order.selectedCount || 1}개</p>
+                <p>{order.method} · {order.time} · 수량 {order.selectedCount ?? order.quantity ?? 1}개</p>
                 <p className="owner-customer-contact">
                   <User size={14} />
                   <strong>{order.customerName || '테스트 사용자'}</strong>
                   <a href={`tel:${order.customerPhone || ''}`}>{order.customerPhone || '연락처 미수집'}</a>
                 </p>
-                <div className={order.paymentConfirmedAt ? 'manual-payment-state confirmed' : 'manual-payment-state'}>
-                  <div>
-                    <strong>{order.paymentConfirmedAt ? '수동 결제 확인 완료' : '수동 결제 확인 대기'}</strong>
-                    <span>{order.paymentConfirmedAt ? '사용자 화면에도 결제 확인 상태가 반영됩니다.' : '실제 입금·결제를 확인한 뒤 눌러주세요.'}</span>
+                {cancelled ? (
+                  <div className="manual-payment-state cancelled">
+                    <div>
+                      <strong>사용자 참여 취소 완료</strong>
+                      <span>이 주문의 수량은 공동구매 집계에서 제외되었습니다.</span>
+                    </div>
                   </div>
-                  {!order.paymentConfirmedAt && (
-                    <button className="secondary-button compact-button" onClick={() => onPaymentConfirm(order.id)}>
-                      결제 확인
-                    </button>
-                  )}
-                </div>
-                <div className={order.customerPickupConfirmedAt ? 'owner-customer-confirm active' : 'owner-customer-confirm'}>
-                  <User size={14} />
-                  {order.customerPickupConfirmedAt ? '사용자 픽업 확인 완료' : '사용자 픽업 확인 대기'}
-                </div>
+                ) : (
+                  <>
+                    <div className={order.paymentConfirmedAt ? 'manual-payment-state confirmed' : 'manual-payment-state'}>
+                      <div>
+                        <strong>{order.paymentConfirmedAt ? '수동 결제 확인 완료' : '수동 결제 확인 대기'}</strong>
+                        <span>{order.paymentConfirmedAt ? '사용자 화면에도 결제 확인 상태가 반영됩니다.' : '실제 입금·결제를 확인한 뒤 눌러주세요.'}</span>
+                      </div>
+                      {!order.paymentConfirmedAt && (
+                        <button className="secondary-button compact-button" onClick={() => onPaymentConfirm(order.id)}>
+                          결제 확인
+                        </button>
+                      )}
+                    </div>
+                    <div className={order.customerPickupConfirmedAt ? 'owner-customer-confirm active' : 'owner-customer-confirm'}>
+                      <User size={14} />
+                      {order.customerPickupConfirmedAt ? '사용자 픽업 확인 완료' : '사용자 픽업 확인 대기'}
+                    </div>
+                  </>
+                )}
                 <div className="owner-order-actions">
                   <code>{order.id}</code>
-                  {stage.action ? (
+                  {cancelled ? (
+                    <span className="completed-order-label">취소 처리 완료</span>
+                  ) : stage.action ? (
                     <button className="primary-button compact-button" onClick={() => onStatusChange(order.id)}>
                       {stage.action}
                     </button>
@@ -4664,6 +5014,7 @@ function Dashboard({ analyticsReady, orders }) {
           <p className="evidence-note">결제·정산 증빙이 아닌 MVP 행동 기록입니다. 수동 결제 확인, 사장님 픽업 완료, 사용자 수령 확인이 모두 있을 때만 ‘양측 검증 완료’로 집계합니다.</p>
           <div className="commerce-metric-grid">
             <Metric label="참여 주문" value={commerceStats.orderCount} />
+            <Metric label="참여 취소" value={commerceStats.cancelledCount} />
             <Metric label="수동 결제 확인" value={commerceStats.paymentConfirmedCount} />
             <Metric label="사장님 수락" value={commerceStats.acceptedCount} />
             <Metric label="사장님 픽업 완료" value={commerceStats.ownerCompletedCount} />
@@ -4683,16 +5034,18 @@ function Dashboard({ analyticsReady, orders }) {
             </div>
             {commerceStats.rows.length === 0 && <p className="empty-state">참여 주문이 생기면 여기에 거래 이력이 표시됩니다.</p>}
             {commerceStats.rows.map((row) => (
-              <div key={row.id}>
+              <div className={row.cancelled ? 'cancelled' : ''} key={row.id}>
                 <span>
                   <b>{row.title}</b>
                   <code>{row.id}</code>
                   <small>{row.neighborhood} · {formatWon(row.total)}</small>
                 </span>
-                <strong>{row.paymentConfirmed ? '확인' : '대기'}</strong>
+                <strong>{row.cancelled ? '취소' : row.paymentConfirmed ? '확인' : '대기'}</strong>
                 <strong>{row.ownerStatus}</strong>
-                <strong>{row.customerConfirmed ? '픽업 확인' : '확인 대기'}</strong>
-                <strong className={row.verified ? 'verified' : ''}>{row.verified ? '완료' : '검증 중'}</strong>
+                <strong>{row.cancelled ? '취소' : row.customerConfirmed ? '픽업 확인' : '확인 대기'}</strong>
+                <strong className={row.verified ? 'verified' : ''}>
+                  {row.cancelled ? '집계 제외' : row.verified ? '완료' : '검증 중'}
+                </strong>
               </div>
             ))}
           </div>
@@ -5060,44 +5413,6 @@ function mergeCentralStats(localStats, centralStats) {
       ...row,
       label: eventLabelByName.get(row.name) || row.name,
     })),
-  };
-}
-
-function buildCommerceStats(orders) {
-  const purchaseOrders = orders.filter((order) => order.type === 'purchase');
-  const rows = purchaseOrders
-    .map((order) => {
-      const stage = getOrderStage(order);
-      const ownerCompleted = stage.id === 'completed';
-      const customerConfirmed = Boolean(order.customerPickupConfirmedAt);
-      const paymentConfirmed = Boolean(order.paymentConfirmedAt);
-      return {
-        id: order.id,
-        title: order.title,
-        neighborhood: order.neighborhood || order.deal?.neighborhood || '미설정',
-        total: Number(order.total || 0),
-        ownerStatus: stage.label,
-        ownerCompleted,
-        paymentConfirmed,
-        customerConfirmed,
-        verified: paymentConfirmed && ownerCompleted && customerConfirmed,
-        createdAt: order.createdAt,
-        accepted: ORDER_STAGES.findIndex((item) => item.id === stage.id) >= 1,
-      };
-    })
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
-
-  return {
-    rows,
-    orderCount: rows.length,
-    paymentConfirmedCount: rows.filter((row) => row.paymentConfirmed).length,
-    acceptedCount: rows.filter((row) => row.accepted).length,
-    ownerCompletedCount: rows.filter((row) => row.ownerCompleted).length,
-    customerConfirmedCount: rows.filter((row) => row.customerConfirmed).length,
-    verifiedCount: rows.filter((row) => row.verified).length,
-    candidateAmount: rows.reduce((sum, row) => sum + row.total, 0),
-    paymentConfirmedAmount: rows.filter((row) => row.paymentConfirmed).reduce((sum, row) => sum + row.total, 0),
-    verifiedAmount: rows.filter((row) => row.verified).reduce((sum, row) => sum + row.total, 0),
   };
 }
 

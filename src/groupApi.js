@@ -3,9 +3,16 @@ const GROUP_MEMBERSHIP_MUTATIONS_KEY = 'o2o_mvp_group_membership_mutations_v1';
 const LOCAL_GROUPS_KEY = 'o2o_mvp_group_fallback_v1';
 const GROUP_READ_KEY = 'o2o_mvp_group_last_read_v1';
 const VITE_ENV = import.meta.env || {};
-const LOCAL_FALLBACK_ENABLED = VITE_ENV.DEV
-  || VITE_ENV.VITE_ENABLE_GROUP_LOCAL_FALLBACK === 'true';
 const LOCAL_ADMIN_PIN = String(VITE_ENV.VITE_O2O_LOCAL_ADMIN_PIN || '');
+
+function localFallbackEnabled() {
+  return Boolean(
+    VITE_ENV.DEV
+    || VITE_ENV.VITE_ENABLE_GROUP_LOCAL_FALLBACK === 'true'
+    || (typeof process !== 'undefined'
+      && process.env?.VITE_ENABLE_GROUP_LOCAL_FALLBACK === 'true'),
+  );
+}
 
 function loadJson(key, fallback) {
   try {
@@ -174,7 +181,7 @@ async function requestGroupOperation(payload, signal) {
 }
 
 function isFallbackEligible(error) {
-  return LOCAL_FALLBACK_ENABLED
+  return localFallbackEnabled()
     && (!error?.status || [404, 502, 503, 504].includes(error.status));
 }
 
@@ -560,6 +567,175 @@ function localReserveQuantity(groupId, actorId, quantity, expectedVersion, clien
   return saveLocalGroup(groupId, snapshot);
 }
 
+function cancelledLocalOrder(order, actorId, clientMutationId, timestamp, nextVersion) {
+  const {
+    customerCapabilityToken: _customerCapabilityToken,
+    customerCapabilityHash: _customerCapabilityHash,
+    capabilityToken: _capabilityToken,
+    capabilityHash: _capabilityHash,
+    _customerCapabilityHash: _storedCustomerCapabilityHash,
+    ...safeOrder
+  } = order || {};
+  const previousStatus = String(safeOrder.status || 'new');
+  return {
+    ...safeOrder,
+    status: 'cancelled',
+    paymentStatus: 'cancelled',
+    statusUpdatedAt: timestamp,
+    cancelledAt: timestamp,
+    version: nextVersion,
+    paymentVersion: nextVersion,
+    syncedAt: timestamp,
+    statusHistory: [
+      ...(Array.isArray(safeOrder.statusHistory) ? safeOrder.statusHistory : []),
+      {
+        status: 'cancelled',
+        before: previousStatus,
+        after: 'cancelled',
+        actor: actorId,
+        actorRole: 'member',
+        action: 'cancel_participation',
+        reason: 'participant_cancelled',
+        clientMutationId,
+        version: nextVersion,
+        timestamp,
+      },
+    ].slice(-100),
+  };
+}
+
+function localCancelGroupParticipation({
+  groupId,
+  order,
+  actorId,
+  expectedVersion,
+  expectedOrderVersion,
+  clientMutationId,
+}) {
+  const groups = getLocalGroups();
+  const snapshot = groups[groupId];
+  if (!snapshot) throw new Error('group_not_found');
+
+  const credential = getGroupCredential(groupId, actorId);
+  const participant = snapshot.participants.find((item) => item.actorId === actorId);
+  if (!credential || !participant || participant.role !== 'member') {
+    throw new Error('forbidden');
+  }
+
+  const cancellationHistory = (Array.isArray(snapshot.history) ? snapshot.history : []).filter((item) => (
+    item.action === 'cancel_participation'
+    && item.actorId === actorId
+  ));
+  const previousCancellation = cancellationHistory.find((item) => (
+    item.clientMutationId === clientMutationId
+  ));
+  if (previousCancellation) {
+    const previousOrderId = previousCancellation.orderId || previousCancellation.result?.orderId;
+    if (previousOrderId !== order.id) throw new Error('client_mutation_conflict');
+    const timestamp = previousCancellation.createdAt || new Date().toISOString();
+    const nextOrderVersion = Number(
+      previousCancellation.orderVersion
+      || previousCancellation.result?.orderVersion
+      || expectedOrderVersion + 1,
+    );
+    return {
+      snapshot: normalizeSnapshot(snapshot, groupId),
+      order: cancelledLocalOrder(
+        order,
+        actorId,
+        previousCancellation.clientMutationId || clientMutationId,
+        timestamp,
+        nextOrderVersion,
+      ),
+    };
+  }
+  if (cancellationHistory.some((item) => (
+    (item.orderId || item.result?.orderId) === order.id
+  ))) throw new Error('order_not_cancellable');
+
+  if (participant.counted === false) throw new Error('forbidden');
+  if ((snapshot.group.status || 'recruiting') !== 'recruiting') {
+    throw new Error('participation_cancellation_closed');
+  }
+  if (String(order.status || 'new') !== 'new') throw new Error('order_not_cancellable');
+  if ((participant.paymentStatus || 'pending') !== 'pending'
+    || String(order.paymentStatus || 'pending') !== 'pending'
+    || order.paymentRequestedAt
+    || order.paymentConfirmedAt) throw new Error('payment_already_processed');
+  if (order.type && order.type !== 'purchase') throw new Error('order_not_cancellable');
+  const orderGroupId = order.groupId || order.dealId || order.deal?.id;
+  const orderActorId = order.participantActorId || order.visitorId;
+  if (orderGroupId !== groupId || (orderActorId && orderActorId !== actorId)) {
+    throw new Error('forbidden');
+  }
+  if (Number(participant.version || 1) !== Number(expectedVersion)) {
+    throw new Error('state_conflict');
+  }
+  const orderVersion = Number(order.version ?? order.paymentVersion ?? 1);
+  if (!Number.isInteger(orderVersion) || orderVersion < 1
+    || orderVersion !== Number(expectedOrderVersion)) {
+    throw new Error('state_conflict');
+  }
+  const cancelledQuantity = Number(order.selectedCount ?? order.quantity ?? 0);
+  const previousQuantity = Number(participant.selectedQuantity || 0);
+  if (!Number.isInteger(cancelledQuantity) || cancelledQuantity < 1) {
+    throw new Error('invalid_quantity');
+  }
+  if (cancelledQuantity > previousQuantity) throw new Error('state_conflict');
+
+  const now = new Date().toISOString();
+  const nextQuantity = previousQuantity - cancelledQuantity;
+  participant.selectedQuantity = nextQuantity;
+  participant.counted = nextQuantity > 0;
+  participant.version = Number(participant.version || 1) + 1;
+  participant.updatedAt = now;
+  snapshot.group.orderedQuantity = snapshot.participants
+    .filter((item) => item.counted !== false)
+    .reduce((total, item) => total + Number(item.selectedQuantity || 0), 0);
+  snapshot.group.currentCount = snapshot.participants
+    .filter((item) => item.counted !== false)
+    .length;
+  snapshot.group.version = Number(snapshot.group.version || 0) + 1;
+  snapshot.group.updatedAt = now;
+  const nextOrderVersion = orderVersion + 1;
+  if (!Array.isArray(snapshot.history)) snapshot.history = [];
+  snapshot.history.push({
+    id: createMutationId('history'),
+    entityType: 'participant',
+    entityId: actorId,
+    orderId: order.id,
+    fromStatus: 'joined',
+    toStatus: nextQuantity > 0 ? 'joined' : 'cancelled',
+    fromQuantity: String(previousQuantity),
+    toQuantity: String(nextQuantity),
+    action: 'cancel_participation',
+    actorId,
+    actorRole: participant.role,
+    reason: 'participant_cancelled',
+    clientMutationId,
+    version: participant.version,
+    orderVersion: nextOrderVersion,
+    result: {
+      orderId: order.id,
+      cancelledQuantity,
+      previousQuantity,
+      selectedQuantity: nextQuantity,
+      orderVersion: nextOrderVersion,
+    },
+    createdAt: now,
+  });
+  return {
+    snapshot: saveLocalGroup(groupId, snapshot),
+    order: cancelledLocalOrder(
+      order,
+      actorId,
+      clientMutationId,
+      now,
+      nextOrderVersion,
+    ),
+  };
+}
+
 export async function reserveGroupQuantity(
   groupId,
   quantity,
@@ -588,6 +764,57 @@ export async function reserveGroupQuantity(
     }),
   );
   return { ...result, snapshot: normalizeSnapshot(result, groupId) };
+}
+
+export async function cancelGroupParticipation({
+  groupId,
+  order,
+  actorId,
+  customerCapabilityToken,
+  clientMutationId = createMutationId('cancel_participation'),
+}) {
+  if (!groupId || !actorId || !/^order-\d{10,20}$/.test(String(order?.id || ''))) {
+    throw new Error('invalid_cancellation_request');
+  }
+  if (typeof customerCapabilityToken !== 'string' || customerCapabilityToken.length < 32) {
+    throw new Error('missing_customer_capability_token');
+  }
+  const expectedOrderVersion = Number(order.version ?? order.paymentVersion ?? 1);
+  if (!Number.isInteger(expectedOrderVersion) || expectedOrderVersion < 1) {
+    throw new Error('invalid_order_version');
+  }
+  const snapshot = await fetchGroupSnapshot(groupId, { actorId });
+  const participant = snapshot.participants.find((item) => item.actorId === actorId);
+  if (!participant) throw new Error('participant_not_found');
+  const expectedVersion = Number(participant.version || 0);
+  const payload = commonPayload(groupId, {
+    action: 'cancel_participation',
+    actorId,
+    orderId: order.id,
+    expectedVersion,
+    expectedOrderVersion,
+    customerCapabilityToken,
+    clientMutationId,
+  });
+  const result = await withFallback(
+    () => requestGroupOperation(payload),
+    () => {
+      const localResult = localCancelGroupParticipation({
+        groupId,
+        order,
+        actorId,
+        expectedVersion,
+        expectedOrderVersion,
+        clientMutationId,
+      });
+      return { ok: true, ...localResult, localOnly: true };
+    },
+  );
+  return {
+    ...result,
+    order: result.order || result.cancelledOrder,
+    snapshot: normalizeSnapshot(result, groupId),
+  };
 }
 
 export async function sendGroupMessage(groupId, body, actorId) {

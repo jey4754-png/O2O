@@ -65,7 +65,7 @@ function doPost(e) {
         body.customerCapabilityHash || ''
       );
     }
-    if (/^group_(create|join|snapshot|send_message|mark_read|transition_group|transition_payment|update_target|toggle_lock|claim_host|reserve_quantity)$/.test(String(body.action || ''))) {
+    if (/^group_(create|join|snapshot|send_message|mark_read|transition_group|transition_payment|update_target|toggle_lock|claim_host|reserve_quantity|cancel_participation)$/.test(String(body.action || ''))) {
       return handleGroupOperation_(String(body.action).replace(/^group_/, ''), body.payload || {});
     }
     const event = body.event || {};
@@ -160,7 +160,94 @@ function publicDealValue_(deal) {
 function publicOrderValue_(order) {
   const copy = Object.assign({}, order || {});
   delete copy._customerCapabilityHash;
+  delete copy._reservationMutationId;
+  delete copy._reservationAction;
+  delete copy._reservationQuantity;
+  delete copy.customerCapabilityHash;
+  delete copy.customerCapabilityToken;
+  delete copy.capabilityHash;
+  delete copy.capabilityToken;
   return copy;
+}
+
+function storedCustomerOrders_(sheet) {
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  const orders = [];
+  sheet.getRange(2, 4, sheet.getLastRow() - 1, 1).getValues().forEach(function(row) {
+    try {
+      const order = JSON.parse(row[0] || '{}');
+      if (order && order.id) orders.push(order);
+    } catch (error) {}
+  });
+  return mergeCustomerOrderSnapshots_(orders);
+}
+
+function customerOrderDealId_(order) {
+  return String((order && (order.dealId || (order.deal && order.deal.id))) || '');
+}
+
+function activePurchaseOrder_(order) {
+  return Boolean(
+    order
+    && String(order.type || '') === 'purchase'
+    && String(order.status || '') !== 'cancelled'
+    && String(order.paymentStatus || '') !== 'cancelled'
+  );
+}
+
+function customerOrderQuantity_(order) {
+  const value = Number(order && (order.selectedCount || order.quantity || 0));
+  return Number.isInteger(value) && value > 0 && value <= 999 ? value : 0;
+}
+
+function merchantCapacityError_(totalQuantityValue, allocatedQuantityValue, selectedQuantityValue) {
+  const totalQuantity = Number(totalQuantityValue);
+  const allocatedQuantity = Number(allocatedQuantityValue);
+  const selectedQuantity = Number(selectedQuantityValue);
+  if (!Number.isInteger(totalQuantity) || totalQuantity < 1 || totalQuantity > 999) {
+    return 'invalid_deal_capacity';
+  }
+  if (!Number.isInteger(selectedQuantity) || selectedQuantity < 1 || selectedQuantity > 999) {
+    return 'invalid_order_quantity';
+  }
+  if (!Number.isInteger(allocatedQuantity) || allocatedQuantity < 0) {
+    return 'invalid_deal_capacity';
+  }
+  return allocatedQuantity + selectedQuantity > totalQuantity ? 'quantity_unavailable' : '';
+}
+
+function merchantCapacityFloorError_(totalQuantityValue, allocatedQuantityValue) {
+  const totalQuantity = Number(totalQuantityValue);
+  const allocatedQuantity = Number(allocatedQuantityValue);
+  if (!Number.isInteger(totalQuantity) || totalQuantity < 1 || totalQuantity > 999) {
+    return 'invalid_deal_capacity';
+  }
+  if (!Number.isInteger(allocatedQuantity) || allocatedQuantity < 0) {
+    return 'invalid_deal_capacity';
+  }
+  return totalQuantity < allocatedQuantity ? 'quantity_below_active_allocations' : '';
+}
+
+function activeMerchantAllocation_(sheets, dealId, excludedOrderId) {
+  return storedCustomerOrders_(sheets.customerOrders).reduce(function(total, order) {
+    if (String(order.id || '') === String(excludedOrderId || '')) return total;
+    if (customerOrderDealId_(order) !== String(dealId || '')) return total;
+    if (!activePurchaseOrder_(order)) return total;
+    return total + customerOrderQuantity_(order);
+  }, 0);
+}
+
+function publicDealRecord_(sheet, dealId) {
+  if (!sheet || sheet.getLastRow() < 2) return null;
+  const match = sheet.getRange(2, 2, sheet.getLastRow() - 1, 1)
+    .createTextFinder(String(dealId || '')).matchEntireCell(true).findNext();
+  if (!match) return null;
+  try {
+    const deal = JSON.parse(sheet.getRange(match.getRow(), 7).getValue() || '{}');
+    return deal && typeof deal === 'object' && !Array.isArray(deal) ? deal : null;
+  } catch (error) {
+    return null;
+  }
 }
 
 function publishPublicDeal_(deal, ownerCapabilityHash) {
@@ -180,7 +267,8 @@ function publishPublicDeal_(deal, ownerCapabilityHash) {
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
-    const sheet = ensureSheets_().publicDeals;
+    const sheets = ensureSheets_();
+    const sheet = sheets.publicDeals;
     let targetRow = sheet.getLastRow() + 1;
     let existingDeal = null;
     if (sheet.getLastRow() >= 2) {
@@ -204,6 +292,26 @@ function publishPublicDeal_(deal, ownerCapabilityHash) {
         return json_({ ok: false, error: 'deal_ownership_unclaimable' });
       }
       if (existingHash !== incomingHash) return json_({ ok: false, error: 'forbidden' });
+    }
+    const existingMerchantGroup = existingDeal
+      && String(existingDeal.source || '') === 'merchant'
+      && String(existingDeal.saleType || '') === 'group';
+    const incomingMerchantGroup = String(deal.source || '') === 'merchant'
+      && String(deal.saleType || '') === 'group';
+    const activeAllocation = activeMerchantAllocation_(sheets, deal.id, '');
+    if (existingMerchantGroup && activeAllocation > 0 && !incomingMerchantGroup) {
+      return json_({ ok: false, error: 'active_allocations_require_group_sale' });
+    }
+    if (incomingMerchantGroup) {
+      const totalQuantity = Number(deal.totalQuantity || deal.productQuantity || deal.target || 0);
+      const capacityFloorError = merchantCapacityFloorError_(totalQuantity, activeAllocation);
+      if (capacityFloorError) {
+        return json_({
+          ok: false,
+          error: capacityFloorError,
+          minimumQuantity: activeAllocation
+        });
+      }
     }
     const storedDeal = Object.assign({}, deal, {
       visibility: 'public',
@@ -276,6 +384,7 @@ function getPublicDeals_() {
   const merchantProgressByDeal = Object.create(null);
   mergeCustomerOrderSnapshots_(storedOrders).forEach(function(order) {
     if (String(order.type || '') !== 'purchase') return;
+    if (String(order.status || '') === 'cancelled' || String(order.paymentStatus || '') === 'cancelled') return;
     const dealId = String(order.dealId || (order.deal && order.deal.id) || '');
     const visitorId = String(order.visitorId || '');
     if (!dealId || !visitorId) return;
@@ -300,6 +409,8 @@ function getPublicDeals_() {
         return Object.assign({}, deal, {
           current: current,
           currentCount: current,
+          orderedQuantity: current,
+          allocatedProductQuantity: current,
           participantCount: Object.keys(progress.visitors).length,
           quantityTracking: true
         });
@@ -377,6 +488,261 @@ function validVisitorId_(value) {
   return /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(String(value || ''));
 }
 
+function secureOrderVersion_(order) {
+  const value = Number(order && (order.version !== undefined ? order.version : order.paymentVersion));
+  return Number.isInteger(value) && value >= 1 ? value : 1;
+}
+
+function requireSecureOrderQuantity_(order) {
+  const value = Number(order && (
+    order.selectedCount !== undefined && order.selectedCount !== null
+      ? order.selectedCount
+      : order.quantity
+  ));
+  if (!Number.isInteger(value) || value < 1 || value > 999) {
+    throw groupOperationError_('invalid_order_quantity');
+  }
+  return value;
+}
+
+function customerOrderReservationHistory_(sheets, groupId, actorId) {
+  if (sheets.groupHistory.getLastRow() < 2) return [];
+  return sheets.groupHistory
+    .getRange(2, 1, sheets.groupHistory.getLastRow() - 1, GROUP_HISTORY_HEADERS.length)
+    .getValues()
+    .map(function(row, index) {
+      return {
+        rowNumber: index + 2,
+        groupId: String(row[1] || ''),
+        fromStatus: String(row[4] || ''),
+        toStatus: String(row[5] || ''),
+        action: String(row[6] || ''),
+        actorId: String(row[7] || ''),
+        mutationId: String(row[10] || '')
+      };
+    })
+    .filter(function(item) {
+      return item.groupId === groupId
+        && item.actorId === actorId
+        && ['create', 'join', 'reserve_quantity'].includes(item.action);
+    });
+}
+
+function customerOrderReservationQuantity_(reservation, history, participantQuantity) {
+  if (reservation.action === 'reserve_quantity') {
+    const before = Number(reservation.fromStatus);
+    const after = Number(reservation.toStatus);
+    return Number.isInteger(before) && Number.isInteger(after) && after > before ? after - before : 0;
+  }
+  const nextReservation = history.find(function(item) {
+    return item.rowNumber > reservation.rowNumber && item.action === 'reserve_quantity';
+  });
+  if (nextReservation) {
+    const initialQuantity = Number(nextReservation.fromStatus);
+    return Number.isInteger(initialQuantity) && initialQuantity > 0 ? initialQuantity : 0;
+  }
+  const quantity = Number(participantQuantity);
+  return Number.isInteger(quantity) && quantity > 0 ? quantity : 0;
+}
+
+function selectCustomerOrderReservation_(history, boundMutationIds, order, participant) {
+  const quantity = requireSecureOrderQuantity_(order);
+  const proposedMutationId = String(order.reservationMutationId || order.clientMutationId || '');
+  const exact = proposedMutationId
+    ? history.find(function(item) { return item.mutationId === proposedMutationId; })
+    : null;
+  let reservation = exact && customerOrderReservationQuantity_(exact, history, participant.selectedQuantity) === quantity
+    ? exact
+    : null;
+  if (!reservation) {
+    reservation = history.find(function(item) {
+      return ['create', 'join'].includes(item.action)
+        && customerOrderReservationQuantity_(item, history, participant.selectedQuantity) === quantity;
+    });
+  }
+  if (!reservation || !reservation.mutationId) {
+    throw groupOperationError_('order_reservation_unverified');
+  }
+  if (boundMutationIds[reservation.mutationId]) {
+    throw groupOperationError_('order_reservation_conflict');
+  }
+  return {
+    action: reservation.action,
+    mutationId: reservation.mutationId,
+    quantity: quantity
+  };
+}
+
+function boundCustomerOrderReservations_(sheet, excludedOrderId) {
+  const bound = Object.create(null);
+  if (sheet.getLastRow() < 2) return bound;
+  sheet.getRange(2, 4, sheet.getLastRow() - 1, 1).getValues().forEach(function(row) {
+    try {
+      const stored = JSON.parse(row[0] || '{}');
+      if (String(stored.id || '') === String(excludedOrderId || '')) return;
+      const mutationId = String(stored._reservationMutationId || '');
+      if (mutationId) bound[mutationId] = String(stored.id || '');
+    } catch (error) {}
+  });
+  return bound;
+}
+
+function legacyGroupOrderCanBind_(sheet, order) {
+  const groupId = String(order.groupId || '');
+  const actorId = String(order.participantActorId || order.visitorId || '');
+  const orderId = String(order.id || '');
+  const matching = storedCustomerOrders_(sheet).filter(function(candidate) {
+    return activePurchaseOrder_(candidate)
+      && String(candidate.groupId || '') === groupId
+      && String(candidate.participantActorId || candidate.visitorId || '') === actorId;
+  });
+  if (!matching.some(function(candidate) { return String(candidate.id || '') === orderId; })) {
+    matching.push(order);
+  }
+  return matching.length === 1 && String(matching[0].id || '') === orderId;
+}
+
+function bindInitialGroupOrderReservation_(sheets, order, visitorId) {
+  const groupId = String(order.groupId || '');
+  if (!groupId) return order;
+  const group = getGroupRecord_(sheets, groupId);
+  const dealId = String(order.dealId || (order.deal && order.deal.id) || '');
+  const participantActorId = String(order.participantActorId || order.visitorId || '');
+  if (group.dealId !== dealId || participantActorId !== visitorId
+    || !['purchase', 'group'].includes(String(order.type || ''))) {
+    throw groupOperationError_('invalid_group_order_binding');
+  }
+  const participant = getParticipantRecord_(sheets, groupId, visitorId, true);
+  if (!participant || !participant.counted || participant.selectedQuantity < requireSecureOrderQuantity_(order)) {
+    throw groupOperationError_('order_reservation_unverified');
+  }
+  const reservation = selectCustomerOrderReservation_(
+    customerOrderReservationHistory_(sheets, groupId, visitorId),
+    boundCustomerOrderReservations_(sheets.customerOrders, order.id),
+    order,
+    participant
+  );
+  return Object.assign({}, order, {
+    reservationMutationId: reservation.mutationId,
+    reservationAction: reservation.action,
+    reservationQuantity: reservation.quantity,
+    _reservationMutationId: reservation.mutationId,
+    _reservationAction: reservation.action,
+    _reservationQuantity: reservation.quantity
+  });
+}
+
+function requireSameCustomerOrderIdentity_(existingOrder, incomingOrder) {
+  const fields = ['id', 'visitorId', 'groupId', 'type', 'createdAt'];
+  fields.forEach(function(field) {
+    if (String(existingOrder[field] || '') !== String(incomingOrder[field] || '')) {
+      throw groupOperationError_('order_identity_conflict');
+    }
+  });
+  if (customerOrderDealId_(existingOrder) !== customerOrderDealId_(incomingOrder)
+    || String(existingOrder.participantActorId || existingOrder.visitorId || '')
+      !== String(incomingOrder.participantActorId || incomingOrder.visitorId || '')
+    || normalizePhone_(existingOrder.customerPhone) !== normalizePhone_(incomingOrder.customerPhone)
+    || requireSecureOrderQuantity_(existingOrder) !== requireSecureOrderQuantity_(incomingOrder)
+    || Number(existingOrder.total || 0) !== Number(incomingOrder.total || 0)) {
+    throw groupOperationError_('order_identity_conflict');
+  }
+}
+
+function mergeCustomerOrderUpdate_(existingOrder, incomingOrder, nowValue) {
+  requireSameCustomerOrderIdentity_(existingOrder, incomingOrder);
+  const now = nowValue || new Date().toISOString();
+  const existingVersion = secureOrderVersion_(existingOrder);
+  const incomingVersion = secureOrderVersion_(incomingOrder);
+  if (incomingVersion < existingVersion || incomingVersion > existingVersion + 1) {
+    throw groupOperationError_('state_conflict');
+  }
+
+  const statuses = ['new', 'preparing', 'pickup_waiting', 'completed'];
+  const paymentStatuses = ['pending', 'requested', 'confirmed'];
+  const currentStatus = String(existingOrder.status || 'new');
+  const nextStatus = String(incomingOrder.status || 'new');
+  const currentPayment = String(existingOrder.paymentStatus || 'pending');
+  const nextPayment = String(incomingOrder.paymentStatus || 'pending');
+  const existingCancelled = currentStatus === 'cancelled' || currentPayment === 'cancelled';
+  const incomingCancelled = nextStatus === 'cancelled' || nextPayment === 'cancelled';
+
+  if (existingCancelled) {
+    if (!incomingCancelled) throw groupOperationError_('state_conflict');
+    return existingOrder;
+  }
+
+  if (incomingCancelled) {
+    if (nextStatus !== 'cancelled' || nextPayment !== 'cancelled' || existingOrder.groupId
+      || currentStatus !== 'new' || currentPayment !== 'pending'
+      || existingOrder.paymentRequestedAt || existingOrder.paymentConfirmedAt
+      || existingOrder.customerPickupConfirmedAt) {
+      throw groupOperationError_('order_transition_forbidden');
+    }
+  } else {
+    const currentStatusIndex = statuses.indexOf(currentStatus);
+    const nextStatusIndex = statuses.indexOf(nextStatus);
+    const currentPaymentIndex = paymentStatuses.indexOf(currentPayment);
+    const nextPaymentIndex = paymentStatuses.indexOf(nextPayment);
+    if (currentStatusIndex < 0 || nextStatusIndex < currentStatusIndex || nextStatusIndex > currentStatusIndex + 1
+      || currentPaymentIndex < 0 || nextPaymentIndex < currentPaymentIndex) {
+      throw groupOperationError_('order_transition_forbidden');
+    }
+    if (existingOrder.paymentRequestedAt && incomingOrder.paymentRequestedAt !== existingOrder.paymentRequestedAt) {
+      throw groupOperationError_('order_transition_forbidden');
+    }
+    if (existingOrder.paymentConfirmedAt && incomingOrder.paymentConfirmedAt !== existingOrder.paymentConfirmedAt) {
+      throw groupOperationError_('order_transition_forbidden');
+    }
+    if (existingOrder.customerPickupConfirmedAt
+      && incomingOrder.customerPickupConfirmedAt !== existingOrder.customerPickupConfirmedAt) {
+      throw groupOperationError_('order_transition_forbidden');
+    }
+    if (incomingOrder.paymentRequestedAt && nextPayment === 'pending') {
+      throw groupOperationError_('order_transition_forbidden');
+    }
+    if (incomingOrder.paymentConfirmedAt && nextPayment !== 'confirmed') {
+      throw groupOperationError_('order_transition_forbidden');
+    }
+    if (incomingOrder.customerPickupConfirmedAt && !['pickup_waiting', 'completed'].includes(nextStatus)) {
+      throw groupOperationError_('order_transition_forbidden');
+    }
+  }
+
+  const changed = incomingCancelled
+    || currentStatus !== nextStatus
+    || currentPayment !== nextPayment
+    || (!existingOrder.paymentRequestedAt && Boolean(incomingOrder.paymentRequestedAt))
+    || (!existingOrder.paymentConfirmedAt && Boolean(incomingOrder.paymentConfirmedAt))
+    || (!existingOrder.customerPickupConfirmedAt && Boolean(incomingOrder.customerPickupConfirmedAt));
+  if (!changed) return existingOrder;
+
+  const nextVersion = existingVersion + 1;
+  const merged = Object.assign({}, existingOrder, {
+    status: incomingCancelled ? 'cancelled' : nextStatus,
+    paymentStatus: incomingCancelled ? 'cancelled' : nextPayment,
+    paymentRequestedAt: existingOrder.paymentRequestedAt || (incomingOrder.paymentRequestedAt ? now : ''),
+    paymentConfirmedAt: existingOrder.paymentConfirmedAt || (incomingOrder.paymentConfirmedAt ? now : ''),
+    customerPickupConfirmedAt: existingOrder.customerPickupConfirmedAt || (incomingOrder.customerPickupConfirmedAt ? now : ''),
+    cancelledAt: incomingCancelled ? now : '',
+    statusUpdatedAt: now,
+    syncedAt: now,
+    version: nextVersion,
+    paymentVersion: nextVersion
+  });
+  merged.statusHistory = (Array.isArray(existingOrder.statusHistory) ? existingOrder.statusHistory : []).concat([{
+    status: merged.status,
+    before: currentStatus,
+    after: merged.status,
+    actor: String(existingOrder.visitorId || ''),
+    actorRole: 'customer',
+    action: incomingCancelled ? 'cancel_participation' : 'publish_order_transition',
+    version: nextVersion,
+    timestamp: now
+  }]).slice(-100);
+  return merged;
+}
+
 function publishCustomerOrder_(order, visitorIdValue, customerCapabilityHash) {
   if (!order.id || !/^order-\d{10,20}$/.test(String(order.id))) {
     return json_({ ok: false, error: 'invalid_order_id' });
@@ -442,19 +808,69 @@ function publishCustomerOrder_(order, visitorIdValue, customerCapabilityHash) {
       } else if (String(existingOrder.visitorId || '') !== visitorId) {
         return json_({ ok: false, error: 'order_owner_conflict' });
       }
+      const existingDealId = customerOrderDealId_(existingOrder);
+      if (existingDealId && existingDealId !== orderDealId) {
+        return json_({ ok: false, error: 'order_deal_conflict' });
+      }
     }
-    const storedOrder = Object.assign({}, order, {
-      customerPhone: phone,
-      visitorId: visitorId,
-      syncedAt: new Date().toISOString(),
-      _customerCapabilityHash: incomingHash
-    });
+    const publicDeal = publicDealRecord_(sheets.publicDeals, orderDealId);
+    const merchantGroupOrder = publicDeal
+      && String(publicDeal.source || '') === 'merchant'
+      && String(publicDeal.saleType || '') === 'group'
+      && String(order.type || '') === 'purchase';
+    if (merchantGroupOrder && activePurchaseOrder_(order)) {
+      const selectedQuantity = customerOrderQuantity_(order);
+      const totalQuantity = Number(
+        publicDeal.totalQuantity || publicDeal.productQuantity || publicDeal.target || 0
+      );
+      const allocatedByOtherOrders = activeMerchantAllocation_(sheets, orderDealId, order.id);
+      const capacityError = merchantCapacityError_(
+        totalQuantity,
+        allocatedByOtherOrders,
+        selectedQuantity
+      );
+      if (capacityError) return json_({ ok: false, error: capacityError });
+    }
+    const now = new Date().toISOString();
+    let storedOrder;
+    if (existingOrder) {
+      storedOrder = mergeCustomerOrderUpdate_(existingOrder, order, now);
+      if (storedOrder.groupId && !storedOrder._reservationMutationId) {
+        if (!legacyGroupOrderCanBind_(sheets.customerOrders, storedOrder)) {
+          return json_({ ok: false, error: 'order_reservation_conflict' });
+        }
+        storedOrder = bindInitialGroupOrderReservation_(sheets, storedOrder, visitorId);
+      }
+      storedOrder = Object.assign({}, storedOrder, {
+        customerPhone: phone,
+        visitorId: visitorId,
+        _customerCapabilityHash: incomingHash
+      });
+    } else {
+      if (String(order.status || 'new') !== 'new'
+        || String(order.paymentStatus || 'pending') !== 'pending'
+        || secureOrderVersion_(order) !== 1
+        || order.paymentRequestedAt || order.paymentConfirmedAt
+        || order.customerPickupConfirmedAt || order.cancelledAt) {
+        return json_({ ok: false, error: 'invalid_initial_order_state' });
+      }
+      storedOrder = bindInitialGroupOrderReservation_(sheets, Object.assign({}, order, {
+        customerPhone: phone,
+        visitorId: visitorId,
+        syncedAt: now,
+        version: 1,
+        paymentVersion: 1,
+        _customerCapabilityHash: incomingHash
+      }), visitorId);
+    }
     const serialized = JSON.stringify(storedOrder);
     if (serialized.length > 30000) return json_({ ok: false, error: 'order_too_large' });
     sheet.getRange(targetRow, 1, 1, CUSTOMER_ORDER_HEADERS.length).setValues([[
       new Date(), safeCell_(storedOrder.id), safeCell_(phone), serialized
     ]]);
     return json_({ ok: true, order: publicOrderValue_(storedOrder) });
+  } catch (error) {
+    return json_({ ok: false, error: error.code || 'customer_order_publish_failed' });
   } finally {
     lock.releaseLock();
   }
@@ -903,10 +1319,13 @@ function findMutation_(sheets, mutationId, action) {
   if (!rowNumber) return null;
   const row = sheets.groupHistory.getRange(rowNumber, 1, 1, GROUP_HISTORY_HEADERS.length).getValues()[0];
   if (String(row[6] || '') !== action) throw groupOperationError_('client_mutation_conflict');
+  let result = {};
+  try { result = JSON.parse(row[13] || '{}'); } catch (error) {}
   return {
     groupId: String(row[1] || ''),
     actorId: String(row[7] || ''),
-    rowNumber: rowNumber
+    rowNumber: rowNumber,
+    result: result && typeof result === 'object' && !Array.isArray(result) ? result : {}
   };
 }
 
@@ -948,6 +1367,79 @@ function updateGroupRow_(sheets, group) {
   ]]);
 }
 
+function getCustomerOrderRecord_(sheets, orderIdValue) {
+  const orderId = groupText_(orderIdValue, 40);
+  if (!/^order-\d{10,20}$/.test(orderId)) throw groupOperationError_('invalid_order_id');
+  const rowNumber = findExactRow_(sheets.customerOrders, 2, orderId);
+  if (!rowNumber) throw groupOperationError_('order_not_found');
+  let order;
+  try {
+    order = JSON.parse(sheets.customerOrders.getRange(rowNumber, 4).getValue() || '{}');
+  } catch (error) {
+    throw groupOperationError_('invalid_order_record');
+  }
+  if (!order || typeof order !== 'object' || Array.isArray(order) || String(order.id || '') !== orderId) {
+    throw groupOperationError_('invalid_order_record');
+  }
+  return { rowNumber: rowNumber, order: order };
+}
+
+function authorizeCustomerOrderCancellation_(sheets, record, payload, actorId, group) {
+  const order = record.order;
+  const suppliedHash = privateCapabilityHash_(
+    payload.customerCapabilityHash,
+    'invalid_customer_capability'
+  );
+  const storedHash = String(order._customerCapabilityHash || '').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(storedHash)) {
+    throw groupOperationError_('order_ownership_unclaimable');
+  }
+  if (storedHash !== suppliedHash) throw groupOperationError_('forbidden');
+  if (String(order.visitorId || '') !== actorId) throw groupOperationError_('order_owner_conflict');
+  const orderGroupId = String(order.groupId || '');
+  const orderDealId = String(order.dealId || (order.deal && order.deal.id) || '');
+  const participantActorId = String(order.participantActorId || order.visitorId || '');
+  if (
+    orderGroupId !== group.groupId
+    || orderDealId !== group.dealId
+    || participantActorId !== actorId
+    || String(order.type || '') !== 'purchase'
+  ) {
+    throw groupOperationError_('order_owner_conflict');
+  }
+  const reservationMutationId = String(order._reservationMutationId || '');
+  const reservationAction = String(order._reservationAction || '');
+  const reservationQuantity = Number(order._reservationQuantity || 0);
+  if (!reservationMutationId || !['join', 'reserve_quantity'].includes(reservationAction)
+    || !Number.isInteger(reservationQuantity) || reservationQuantity < 1
+    || String(order.reservationMutationId || '') !== reservationMutationId
+    || Number(order.reservationQuantity || 0) !== reservationQuantity) {
+    throw groupOperationError_('order_reservation_unverified');
+  }
+  const reservationHistory = customerOrderReservationHistory_(sheets, group.groupId, actorId);
+  const reservation = reservationHistory.find(function(item) {
+    return item.mutationId === reservationMutationId && item.action === reservationAction;
+  });
+  if (!reservation
+    || customerOrderReservationQuantity_(reservation, reservationHistory, reservationQuantity) !== reservationQuantity) {
+    throw groupOperationError_('order_reservation_unverified');
+  }
+  const conflictingBindings = boundCustomerOrderReservations_(sheets.customerOrders, order.id);
+  if (conflictingBindings[reservationMutationId]) {
+    throw groupOperationError_('order_reservation_conflict');
+  }
+  return order;
+}
+
+function updateCustomerOrderRecord_(sheets, record) {
+  const order = record.order;
+  const serialized = JSON.stringify(order);
+  if (serialized.length > 30000) throw groupOperationError_('order_too_large');
+  sheets.customerOrders.getRange(record.rowNumber, 1, 1, CUSTOMER_ORDER_HEADERS.length).setValues([[
+    new Date(), safeCell_(order.id), safeCell_(normalizePhone_(order.customerPhone)), serialized
+  ]]);
+}
+
 function ensureAdminParticipant_(sheets, groupId, actor, lastReadSeq, now) {
   if (actor.participant) return actor.participant;
   appendParticipant_(sheets, {
@@ -969,6 +1461,17 @@ function executeGroupMutation_(action, payload, sheets) {
       throw groupOperationError_('client_mutation_conflict');
     }
     const duplicateActor = authorizeGroupActor_(sheets, groupId, payload);
+    if (action === 'cancel_participation') {
+      const duplicateOrderId = groupText_(duplicate.result && duplicate.result.orderId, 40);
+      const requestedOrderId = groupText_(payload.orderId, 40);
+      if (!duplicateOrderId || duplicateOrderId !== requestedOrderId) {
+        throw groupOperationError_('client_mutation_conflict');
+      }
+      const duplicateGroup = getGroupRecord_(sheets, groupId);
+      const duplicateRecord = getCustomerOrderRecord_(sheets, requestedOrderId);
+      authorizeCustomerOrderCancellation_(sheets, duplicateRecord, payload, actorId, duplicateGroup);
+      return { actor: duplicateActor, duplicate: true, order: duplicateRecord.order };
+    }
     return { actor: duplicateActor, duplicate: true };
   }
 
@@ -1133,6 +1636,88 @@ function executeGroupMutation_(action, payload, sheets) {
       clientMutationId: mutationId, version: participant.version, createdAt: now
     });
     actor.participant = participant;
+  } else if (action === 'cancel_participation') {
+    const participant = actor.participant;
+    if (!participant || actor.role !== 'member' || participant.role !== 'member' || !participant.counted) {
+      throw groupOperationError_('forbidden');
+    }
+    if (group.groupStatus !== GROUP_STATUSES[0]) {
+      throw groupOperationError_('participation_cancellation_closed');
+    }
+    const expectedVersion = requireInteger_(payload.expectedVersion, 'expected_version', 1, Number.MAX_SAFE_INTEGER);
+    if (expectedVersion !== participant.version) throw groupOperationError_('state_conflict');
+    const orderRecord = getCustomerOrderRecord_(sheets, payload.orderId);
+    const order = authorizeCustomerOrderCancellation_(sheets, orderRecord, payload, actorId, group);
+    const expectedOrderVersion = requireInteger_(
+      payload.expectedOrderVersion,
+      'expected_order_version',
+      1,
+      Number.MAX_SAFE_INTEGER
+    );
+    const orderVersion = Math.max(1, Number(order.version || 1));
+    if (expectedOrderVersion !== orderVersion) throw groupOperationError_('state_conflict');
+    if (String(order.status || 'new') !== 'new') throw groupOperationError_('order_not_cancellable');
+    if (
+      String(order.paymentStatus || 'pending') !== 'pending'
+      || participant.paymentStatus !== 'pending'
+      || order.paymentRequestedAt
+      || order.paymentConfirmedAt
+      || order.customerPickupConfirmedAt
+    ) {
+      throw groupOperationError_('payment_already_processed');
+    }
+    const orderQuantity = requireInteger_(order._reservationQuantity, 'order_quantity', 1, 999);
+    if (participant.selectedQuantity < orderQuantity) throw groupOperationError_('state_conflict');
+    const previousQuantity = participant.selectedQuantity;
+    const nextQuantity = previousQuantity - orderQuantity;
+    participant.selectedQuantity = nextQuantity;
+    participant.counted = nextQuantity > 0;
+    participant.version += 1;
+    participant.updatedAt = now;
+
+    const nextOrderVersion = orderVersion + 1;
+    order.status = 'cancelled';
+    order.paymentStatus = 'cancelled';
+    order.cancelledAt = now;
+    order.statusUpdatedAt = now;
+    order.version = nextOrderVersion;
+    order.paymentVersion = nextOrderVersion;
+    order.statusHistory = (Array.isArray(order.statusHistory) ? order.statusHistory : []).concat([{
+      status: 'cancelled',
+      before: 'new',
+      after: 'cancelled',
+      actor: actorId,
+      actorRole: 'member',
+      action: action,
+      reason: 'participant_cancelled',
+      clientMutationId: mutationId,
+      version: nextOrderVersion,
+      timestamp: now
+    }]).slice(-100);
+    order.syncedAt = now;
+
+    group.version += 1;
+    group.updatedAt = now;
+    group.updatedBy = actorId;
+    updateParticipantRow_(sheets, participant);
+    updateCustomerOrderRecord_(sheets, orderRecord);
+    updateGroupRow_(sheets, group);
+    appendGroupHistory_(sheets, {
+      groupId: groupId, entityType: 'participant', entityId: actorId,
+      fromStatus: 'joined', toStatus: nextQuantity > 0 ? 'joined' : 'cancelled', action: action,
+      actorId: actorId, actorRole: actor.role, reason: 'participant_cancelled',
+      clientMutationId: mutationId, version: participant.version, createdAt: now,
+      result: {
+        orderId: order.id,
+        cancelledQuantity: orderQuantity,
+        previousQuantity: previousQuantity,
+        selectedQuantity: nextQuantity,
+        orderVersion: nextOrderVersion
+      }
+    });
+    actor.participant = participant;
+    invalidateGroupSnapshot_(groupId);
+    return { actor: actor, duplicate: false, order: order };
   } else if (action === 'send_message') {
     const body = groupText_(payload.body, 500);
     if (!body) throw groupOperationError_('invalid_message_body');
@@ -1279,7 +1864,7 @@ function handleGroupOperation_(action, payload) {
   const supported = [
     'create', 'join', 'snapshot', 'send_message', 'mark_read',
     'transition_group', 'transition_payment', 'update_target', 'toggle_lock',
-    'claim_host', 'reserve_quantity'
+    'claim_host', 'reserve_quantity', 'cancel_participation'
   ];
   if (!supported.includes(action)) return json_({ ok: false, error: 'invalid_action' });
   let lock = null;
@@ -1298,7 +1883,8 @@ function handleGroupOperation_(action, payload) {
       ok: true,
       duplicate: Boolean(result.duplicate),
       unchanged: Boolean(result.unchanged),
-      snapshot: snapshot
+      snapshot: snapshot,
+      order: result.order ? publicOrderValue_(result.order) : undefined
     });
   } catch (error) {
     const code = error.code || 'group_operation_failed';

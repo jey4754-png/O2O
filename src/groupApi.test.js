@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  cancelGroupParticipation,
   createGroupRoom,
   normalizeSnapshot,
   resolveUnreadCount,
@@ -14,6 +15,7 @@ function memoryStorage() {
     getItem(key) { return values.has(key) ? values.get(key) : null; },
     setItem(key, value) { values.set(key, String(value)); },
     removeItem(key) { values.delete(key); },
+    dump() { return JSON.stringify(Object.fromEntries(values)); },
   };
 }
 
@@ -195,5 +197,229 @@ test('target updates preserve the version captured when the edit form opened', a
     globalThis.fetch = previousFetch;
     if (previousStorage === undefined) delete globalThis.localStorage;
     else globalThis.localStorage = previousStorage;
+  }
+});
+
+test('participation cancellation forwards scoped proofs and authoritative versions', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  const storage = memoryStorage();
+  globalThis.localStorage = storage;
+  const groupCapabilityToken = `group-capability-${'g'.repeat(48)}`;
+  const customerCapabilityToken = `customer-capability-${'c'.repeat(48)}`;
+  storage.setItem('o2o_mvp_group_credentials_v1', JSON.stringify({
+    'customer-cancel-remote::visitor-cancel-remote': {
+      groupId: 'customer-cancel-remote',
+      actorId: 'visitor-cancel-remote',
+      role: 'member',
+      capabilityToken: groupCapabilityToken,
+    },
+  }));
+  const payloads = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    payloads.push(payload);
+    const cancelled = payload.action === 'cancel_participation';
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          ok: true,
+          ...(cancelled ? {
+            order: {
+              id: payload.orderId,
+              status: 'cancelled',
+              version: payload.expectedOrderVersion + 1,
+            },
+          } : {}),
+          snapshot: {
+            group: {
+              groupId: payload.groupId,
+              status: 'recruiting',
+              targetCount: 4,
+              currentCount: cancelled ? 1 : 2,
+              totalQuantity: 8,
+              orderedQuantity: cancelled ? 1 : 3,
+              version: cancelled ? 8 : 7,
+            },
+            participants: [
+              {
+                actorId: 'visitor-host-remote',
+                role: 'host',
+                counted: true,
+                paymentStatus: 'pending',
+                selectedQuantity: 1,
+                version: 1,
+              },
+              {
+                actorId: payload.actorId,
+                role: 'member',
+                counted: !cancelled,
+                paymentStatus: 'pending',
+                selectedQuantity: cancelled ? 0 : 2,
+                version: cancelled ? 5 : 4,
+              },
+            ],
+          },
+        };
+      },
+    };
+  };
+
+  const order = {
+    id: 'order-170000000000001',
+    type: 'purchase',
+    groupId: 'customer-cancel-remote',
+    dealId: 'customer-cancel-remote',
+    visitorId: 'visitor-cancel-remote',
+    status: 'new',
+    paymentStatus: 'pending',
+    selectedCount: 2,
+    version: 3,
+  };
+  try {
+    const result = await cancelGroupParticipation({
+      groupId: order.groupId,
+      order,
+      actorId: order.visitorId,
+      customerCapabilityToken,
+      clientMutationId: 'cancel-participation-remote-test',
+    });
+
+    assert.equal(payloads.length, 2);
+    assert.equal(payloads[0].action, 'snapshot');
+    assert.equal(payloads[1].action, 'cancel_participation');
+    assert.equal(payloads[1].capabilityToken, groupCapabilityToken);
+    assert.equal(payloads[1].customerCapabilityToken, customerCapabilityToken);
+    assert.equal(payloads[1].orderId, order.id);
+    assert.equal(payloads[1].expectedVersion, 4);
+    assert.equal(payloads[1].expectedOrderVersion, 3);
+    assert.equal(payloads[1].order, undefined);
+    assert.equal(result.snapshot.group.currentCount, 1);
+    assert.equal(result.snapshot.group.orderedQuantity, 1);
+    assert.equal(result.order.status, 'cancelled');
+    assert.equal(storage.dump().includes(customerCapabilityToken), false);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
+test('local participation cancellation releases quantity once and returns a cancelled order', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  const previousWindow = globalThis.window;
+  const previousCustomEvent = globalThis.CustomEvent;
+  const previousFallback = process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK;
+  const storage = memoryStorage();
+  globalThis.localStorage = storage;
+  globalThis.window = { dispatchEvent() {} };
+  globalThis.CustomEvent = class CustomEvent {
+    constructor(type, options) {
+      this.type = type;
+      this.detail = options?.detail;
+    }
+  };
+  process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK = 'true';
+  globalThis.fetch = async () => { throw new Error('offline'); };
+  const groupId = 'customer-cancel-local';
+  const actorId = 'visitor-cancel-local';
+  const customerCapabilityToken = `customer-capability-${'l'.repeat(48)}`;
+  storage.setItem('o2o_mvp_group_credentials_v1', JSON.stringify({
+    [`${groupId}::${actorId}`]: {
+      groupId,
+      actorId,
+      role: 'member',
+      capabilityToken: `group-capability-${'m'.repeat(48)}`,
+    },
+  }));
+  storage.setItem('o2o_mvp_group_fallback_v1', JSON.stringify({
+    [groupId]: {
+      localOnly: true,
+      group: {
+        groupId,
+        status: 'recruiting',
+        targetCount: 4,
+        currentCount: 2,
+        totalQuantity: 8,
+        orderedQuantity: 3,
+        version: 4,
+      },
+      participants: [
+        {
+          actorId: 'visitor-host-local',
+          role: 'host',
+          counted: true,
+          paymentStatus: 'pending',
+          selectedQuantity: 1,
+          version: 1,
+        },
+        {
+          actorId,
+          role: 'member',
+          counted: true,
+          paymentStatus: 'pending',
+          selectedQuantity: 2,
+          version: 3,
+        },
+      ],
+      messages: [],
+      history: [],
+      lastSeq: 0,
+    },
+  }));
+  const order = {
+    id: 'order-170000000000002',
+    type: 'purchase',
+    groupId,
+    dealId: groupId,
+    visitorId: actorId,
+    status: 'new',
+    paymentStatus: 'pending',
+    selectedCount: 2,
+    version: 1,
+    paymentVersion: 1,
+    statusHistory: [],
+  };
+  const input = {
+    groupId,
+    order,
+    actorId,
+    customerCapabilityToken,
+    clientMutationId: 'cancel-participation-local-test',
+  };
+
+  try {
+    const result = await cancelGroupParticipation(input);
+    const member = result.snapshot.participants.find((item) => item.actorId === actorId);
+    assert.equal(result.localOnly, true);
+    assert.equal(result.snapshot.group.currentCount, 1);
+    assert.equal(result.snapshot.group.orderedQuantity, 1);
+    assert.equal(result.snapshot.group.version, 5);
+    assert.equal(member.selectedQuantity, 0);
+    assert.equal(member.counted, false);
+    assert.equal(member.version, 4);
+    assert.equal(result.order.status, 'cancelled');
+    assert.equal(result.order.version, 2);
+    assert.equal(result.order.statusHistory.at(-1).action, 'cancel_participation');
+    assert.equal(result.snapshot.history.at(-1).orderId, order.id);
+
+    const replay = await cancelGroupParticipation(input);
+    assert.equal(replay.snapshot.group.version, 5);
+    assert.equal(replay.snapshot.group.currentCount, 1);
+    assert.equal(replay.snapshot.history.length, 1);
+    assert.equal(storage.dump().includes(customerCapabilityToken), false);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    if (previousCustomEvent === undefined) delete globalThis.CustomEvent;
+    else globalThis.CustomEvent = previousCustomEvent;
+    if (previousFallback === undefined) delete process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK;
+    else process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK = previousFallback;
   }
 });

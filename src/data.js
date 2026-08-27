@@ -179,6 +179,7 @@ export const eventDefinitions = [
   { name: 'instant_checkout_started', label: '선착순 즉시할인 신청 시작' },
   { name: 'checkout_started', label: '신청 완료 버튼 클릭' },
   { name: 'purchase_completed', label: '공동구매 참여 완료' },
+  { name: 'participation_cancelled', label: '공동구매 참여 취소' },
   { name: 'manual_payment_confirmed', label: '사장님 수동 결제 확인' },
   { name: 'customer_pickup_confirmed', label: '사용자 픽업 완료 확인' },
   { name: 'group_create_started', label: '그룹방 생성 시작' },

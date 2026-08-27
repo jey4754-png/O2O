@@ -18,6 +18,7 @@ const ACTIONS = new Set([
   'toggle_lock',
   'claim_host',
   'reserve_quantity',
+  'cancel_participation',
 ]);
 const MUTATION_ACTIONS = new Set([...ACTIONS].filter((action) => action !== 'snapshot'));
 const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
@@ -64,6 +65,12 @@ function integer(value, fieldName, { min = 0, max = Number.MAX_SAFE_INTEGER, req
     throw requestError(`invalid_${fieldName}`);
   }
   return parsed;
+}
+
+function orderIdentifier(value) {
+  const normalized = text(value, 40);
+  if (!/^order-\d{10,20}$/.test(normalized)) throw requestError('invalid_order_id');
+  return normalized;
 }
 
 function requestError(code, status = 400) {
@@ -245,14 +252,27 @@ function normalizeExternalPayload(body, action) {
     payload.quantity = integer(body.quantity, 'quantity', { min: 1, max: 999 });
     payload.expectedVersion = integer(body.expectedVersion, 'expected_version', { min: 1 });
   }
+  if (action === 'cancel_participation') {
+    payload.orderId = orderIdentifier(body.orderId);
+    payload.expectedVersion = integer(body.expectedVersion, 'expected_version', { min: 1 });
+    payload.expectedOrderVersion = integer(body.expectedOrderVersion, 'expected_order_version', { min: 1 });
+    const customerToken = text(body.customerCapabilityToken, 256);
+    if (customerToken.length < 32) throw requestError('missing_customer_capability_token', 403);
+    payload.customerCapabilityHash = capabilityHash(customerToken);
+  }
 
   return { payload, returnedCapabilityToken };
 }
 
 function normalizeServicePayload(body, action) {
   const clientMutationId = mutationIdFor(body, action);
+  const {
+    capabilityToken: _capabilityToken,
+    customerCapabilityToken: _customerCapabilityToken,
+    ...serviceBody
+  } = body;
   const payload = {
-    ...body,
+    ...serviceBody,
     action,
     actorId: identifier(body.actorId, 'actor_id'),
     groupId: identifier(body.groupId, 'group_id'),
@@ -263,12 +283,31 @@ function normalizeServicePayload(body, action) {
   if (!payload.adminAssertion && !/^[a-f0-9]{64}$/.test(payload.capabilityHash)) {
     throw requestError('invalid_capability_hash', 403);
   }
+  if (action === 'cancel_participation') {
+    payload.orderId = orderIdentifier(body.orderId);
+    payload.expectedVersion = integer(body.expectedVersion, 'expected_version', { min: 1 });
+    payload.expectedOrderVersion = integer(body.expectedOrderVersion, 'expected_order_version', { min: 1 });
+    payload.customerCapabilityHash = text(body.customerCapabilityHash, 64).toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(payload.customerCapabilityHash)) {
+      throw requestError('invalid_customer_capability_hash', 403);
+    }
+  }
   return { payload, returnedCapabilityToken: '' };
 }
 
 function statusForError(code) {
-  if (['unauthorized', 'invalid_capability', 'invalid_capability_hash', 'missing_capability_token', 'invalid_admin_pin', 'forbidden'].includes(code)) return 403;
-  if (['group_not_found', 'participant_not_found', 'feature_not_available'].includes(code)) return 404;
+  if ([
+    'unauthorized',
+    'invalid_capability',
+    'invalid_capability_hash',
+    'invalid_customer_capability',
+    'invalid_customer_capability_hash',
+    'missing_capability_token',
+    'missing_customer_capability_token',
+    'invalid_admin_pin',
+    'forbidden',
+  ].includes(code)) return 403;
+  if (['group_not_found', 'participant_not_found', 'order_not_found', 'feature_not_available'].includes(code)) return 404;
   if ([
     'group_exists',
     'actor_already_joined',
@@ -286,10 +325,28 @@ function statusForError(code) {
     'host_claim_closed',
     'quantity_exceeds_total',
     'quantity_reservation_closed',
+    'participation_cancellation_closed',
+    'order_not_cancellable',
+    'payment_already_processed',
+    'order_owner_conflict',
+    'order_ownership_unclaimable',
   ].includes(code)) return 409;
   if (String(code).includes('not_configured')) return 503;
   if (code === 'group_operation_failed' || /^Exception:/.test(String(code))) return 502;
   return 400;
+}
+
+function publicOrder(order) {
+  if (!order || typeof order !== 'object' || Array.isArray(order)) return undefined;
+  const {
+    _customerCapabilityHash,
+    customerCapabilityHash,
+    customerCapabilityToken,
+    capabilityHash: _capabilityHash,
+    capabilityToken: _capabilityToken,
+    ...safeOrder
+  } = order;
+  return safeOrder;
 }
 
 function publicSnapshot(snapshot) {
@@ -382,11 +439,13 @@ export default async function handler(request, response) {
         ok: false,
         error: result?.error || 'group_operation_failed',
         ...(result?.snapshot ? { snapshot: publicSnapshot(result.snapshot) } : {}),
+        ...(result?.order ? { order: publicOrder(result.order) } : {}),
       });
     }
     return response.status(status >= 400 ? status : 200).json({
       ...result,
       snapshot: publicSnapshot(result.snapshot),
+      ...(result?.order ? { order: publicOrder(result.order) } : {}),
       ...(normalized.returnedCapabilityToken ? { capabilityToken: normalized.returnedCapabilityToken } : {}),
     });
   } catch (error) {

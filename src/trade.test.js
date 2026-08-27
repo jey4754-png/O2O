@@ -219,6 +219,13 @@ test('calculateProductAllocation shows unit, selected, remaining, and host remai
   assert.equal(even.unitPrice, 13000);
   assert.equal(even.hostSelectedAmount, 13000);
   assert.equal(even.remainingQuantity, 2);
+
+  const merchantBundle = calculateProductAllocation(55800, 20, 2);
+  assert.equal(merchantBundle.unitPrice, 2790);
+  assert.equal(merchantBundle.selectedAmount, 5580);
+  assert.equal(merchantBundle.hostSelectedAmount, 5580);
+  assert.equal(merchantBundle.remainingQuantity, 18);
+  assert.equal(merchantBundle.allocated, 55800);
 });
 
 test('calculateProductAllocation rejects invalid quantities', () => {
