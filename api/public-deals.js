@@ -1,4 +1,4 @@
-import { callDataApi } from './_data-upstream.js';
+import { callDataApiJson, fetchUpstreamJson } from './_data-upstream.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
@@ -98,13 +98,23 @@ function sanitizeDeal(input) {
   }
   const id = text(input.id, 120);
   const source = input.source === 'customer' ? 'customer' : 'merchant';
+  const saleType = text(input.saleType, 30);
   const groupId = text(input.groupId, 128);
   if (source === 'customer' && groupId !== id) return null;
+  if (source === 'merchant' && groupId && groupId !== id) return null;
+  const groupBacked = source === 'customer' || (source === 'merchant' && saleType === 'group');
   const totalQuantity = Math.max(1, Math.min(999, Math.floor(number(input.totalQuantity ?? input.target, 1))));
   const orderedQuantity = Math.min(
     totalQuantity,
     Math.max(0, Math.floor(number(input.orderedQuantity ?? input.current, 0))),
   );
+  const participantCount = number(input.participantCount);
+  const currentCount = source === 'merchant' && saleType === 'group'
+    ? number(input.currentPeople ?? input.participantCount ?? input.currentCount)
+    : number(input.currentCount ?? input.currentPeople ?? input.participantCount);
+  const targetCount = source === 'merchant' && saleType === 'group'
+    ? Math.max(1, Math.min(20, Math.floor(number(input.targetCount ?? input.target, 1))))
+    : number(input.targetCount ?? input.target);
   const image = text(input.image, 40000);
   if (
     image
@@ -120,7 +130,7 @@ function sanitizeDeal(input) {
     syncedAt: text(input.syncedAt, 80),
     visibility: 'public',
     source,
-    saleType: text(input.saleType, 30),
+    saleType,
     category: text(input.category, 50),
     region: text(input.region, 50),
     district: text(input.district, 80),
@@ -144,20 +154,23 @@ function sanitizeDeal(input) {
     approximatePrice: Boolean(input.approximatePrice),
     discountRate: number(input.discountRate),
     current: number(input.current),
-    participantCount: number(input.participantCount),
+    participantCount,
+    currentPeople: currentCount,
     quantityTracking: Boolean(input.quantityTracking),
     target: number(input.target),
     minPeople: number(input.minPeople, 1),
     maxPeople: number(input.maxPeople ?? input.target, 20),
-    groupId: source === 'customer' ? groupId : '',
-    targetCount: number(input.targetCount ?? input.target),
-    currentCount: number(input.currentCount ?? input.participantCount),
+    groupId: groupBacked ? id : '',
+    targetCount,
+    currentCount,
     groupStatus: ['recruiting', 'recruited', 'purchased', 'delivered'].includes(input.groupStatus)
       ? input.groupStatus
-      : '',
+      : groupBacked ? 'recruiting' : '',
     chatLocked: Boolean(input.chatLocked),
     creatorActorId: text(input.creatorActorId, 128),
-    hostMode: input.hostMode === 'recruiting' ? 'recruiting' : 'self',
+    hostMode: input.hostMode === 'recruiting' || (source === 'merchant' && saleType === 'group')
+      ? 'recruiting'
+      : 'self',
     hostActorId: text(input.hostActorId, 128),
     hostMatched: Boolean(input.hostActorId),
     totalQuantity,
@@ -205,19 +218,23 @@ function publicResult(result, action) {
 
 function statusForError(code) {
   if (['missing_owner_capability', 'invalid_owner_capability', 'forbidden'].includes(code)) return 403;
+  if (['invalid_deal_capacity', 'invalid_target'].includes(code)) return 400;
   if ([
     'deal_ownership_unclaimable',
     'deal_owner_conflict',
     'quantity_below_active_allocations',
     'active_allocations_require_group_sale',
+    'target_below_current',
   ].includes(code)) return 409;
   if (String(code).includes('not_configured')) return 503;
+  if (code === 'collector_busy') return 503;
+  if (code === 'upstream_timeout') return 504;
   return 502;
 }
 
 async function dataApiRequest(body) {
   const token = serviceSecret();
-  const upstream = await callDataApi('/api/public-deals', {
+  return callDataApiJson('/api/public-deals', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -225,7 +242,6 @@ async function dataApiRequest(body) {
     },
     body: JSON.stringify(body),
   });
-  return upstream;
 }
 
 export default async function handler(request, response) {
@@ -265,14 +281,15 @@ export default async function handler(request, response) {
 
     const proxied = serviceRequest ? null : await dataApiRequest(upstreamBody);
     if (proxied) {
-      const result = await proxied.json();
-      return response.status(proxied.status).json(publicResult(result, action));
+      return response
+        .status(proxied.upstream.status)
+        .json(publicResult(proxied.result, action));
     }
 
     const collectorUrl = process.env.GOOGLE_SHEETS_COLLECTOR_URL;
     const collectorToken = process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN;
     if (!collectorUrl || !collectorToken) throw requestError('collector_not_configured', 503);
-    const upstream = await fetch(collectorUrl, {
+    const { upstream, result } = await fetchUpstreamJson(collectorUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -288,7 +305,6 @@ export default async function handler(request, response) {
       }),
       redirect: 'follow',
     });
-    const result = await upstream.json();
     if (!upstream.ok || !result.ok) {
       const code = result.error || 'collector_failed';
       return response.status(statusForError(code)).json({ ok: false, error: code });

@@ -45,6 +45,7 @@ import {
   fetchGroupSnapshot,
   fetchUnreadCounts,
   getGroupCredential,
+  isGroupBackedDeal,
   joinGroupRoom,
   reserveGroupQuantity,
   updateGroupTarget,
@@ -57,6 +58,18 @@ import {
 } from './participation';
 import { buildCommerceStats } from './commerceStats';
 import { mergeDeals } from './dealMerge';
+import {
+  canOpenOrderGroupRoom,
+  dealHasGroupRoom,
+  hostApplyErrorMessage,
+  isDealHostMatched,
+  joinSubmitErrorMessage,
+} from './customerUi';
+import {
+  beginCheckoutAttempt,
+  checkoutNeedsDurableOrderSync,
+  completeCheckoutAttempt,
+} from './checkoutAttempt';
 import {
   calculateProductAllocation,
   calculateSplit,
@@ -375,6 +388,12 @@ async function fetchCustomerOrders(phone) {
 
 async function publishCustomerOrder(order, options = {}) {
   try {
+    const participantCredential = order.groupId
+      ? getGroupCredential(
+        order.groupId,
+        order.participantActorId || order.visitorId || getVisitorId(),
+      )
+      : null;
     const response = await fetch('/api/customer-orders', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -383,6 +402,9 @@ async function publishCustomerOrder(order, options = {}) {
         order,
         visitorId: order.visitorId || getVisitorId(),
         customerCapabilityToken: getCustomerOrderCapability(),
+        ...(order.groupId && participantCredential?.capabilityToken
+          ? { participantCapabilityToken: participantCredential.capabilityToken }
+          : {}),
       }),
     });
     const result = await response.json();
@@ -395,6 +417,50 @@ async function publishCustomerOrder(order, options = {}) {
     if (options.throwOnError) throw error;
     return null;
   }
+}
+
+async function manageCustomerOrder(order, deal, { kind, direction }) {
+  const managerType = deal?.source === 'customer' ? 'group_manager' : 'merchant_owner';
+  const body = {
+    action: 'manage',
+    orderId: order.id,
+    dealId: order.dealId || deal?.id,
+    managerType,
+    kind,
+    direction,
+    expectedVersion: Number(order.version || order.paymentVersion || 1),
+    clientMutationId: createMutationId(`manage_${kind}`),
+  };
+  if (managerType === 'merchant_owner') {
+    const ownerCapabilityToken = getDealCapability(body.dealId);
+    if (!ownerCapabilityToken) throw new Error('missing_owner_capability');
+    body.ownerCapabilityToken = ownerCapabilityToken;
+  } else {
+    const actorId = getVisitorId();
+    const credential = getGroupCredential(order.groupId || body.dealId, actorId);
+    if (!credential?.capabilityToken || !['host', 'admin'].includes(credential.role)) {
+      throw new Error('manager_capability_required');
+    }
+    body.actorId = actorId;
+    body.capabilityToken = credential.capabilityToken;
+  }
+  const response = await fetch('/api/customer-orders', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  let result = {};
+  try {
+    result = await response.json();
+  } catch {
+    result = {};
+  }
+  if (!response.ok || !result.ok || !result.order) {
+    const error = new Error(result.error || `order_manage_${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return result.order;
 }
 
 async function deletePublicDeal(dealId) {
@@ -672,14 +738,6 @@ function getDealQuantity(deal = {}) {
   };
 }
 
-function isDealHostMatched(deal = {}, hostDealIds = []) {
-  if (deal.source === 'customer') {
-    if (deal.hostMode === 'recruiting') return Boolean(deal.hostMatched || deal.hostActorId);
-    return deal.hostMode === 'self' || Boolean(deal.hostMatched || deal.hostActorId);
-  }
-  return Boolean(deal.hostMatched || hostDealIds.includes(deal.id));
-}
-
 function getOrderStage(order) {
   return ORDER_STAGES.find((stage) => stage.id === order.status) || ORDER_STAGES[0];
 }
@@ -734,12 +792,19 @@ function App() {
       return undefined;
     }
     let cancelled = false;
+    let refreshingUnread = false;
     const refreshUnread = async () => {
-      const next = await fetchUnreadCounts({ adminMode: route === '/admin' });
-      if (!cancelled) setUnreadCounts(next);
+      if (refreshingUnread || document.visibilityState === 'hidden') return;
+      refreshingUnread = true;
+      try {
+        const next = await fetchUnreadCounts({ adminMode: route === '/admin' });
+        if (!cancelled) setUnreadCounts(next);
+      } finally {
+        refreshingUnread = false;
+      }
     };
     refreshUnread();
-    const timer = window.setInterval(refreshUnread, 5000);
+    const timer = window.setInterval(refreshUnread, 10000);
     const handleFocus = () => refreshUnread();
     window.addEventListener('focus', handleFocus);
     window.addEventListener('o2o-group-fallback-updated', handleFocus);
@@ -807,9 +872,16 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
+    let refreshing = false;
     const refresh = async () => {
-      const next = await fetchPublicDeals();
-      if (!cancelled) setRemoteDeals(next);
+      if (refreshing || document.visibilityState === 'hidden') return;
+      refreshing = true;
+      try {
+        const next = await fetchPublicDeals();
+        if (!cancelled) setRemoteDeals(next);
+      } finally {
+        refreshing = false;
+      }
     };
     refresh();
     const timer = window.setInterval(refresh, PUBLIC_DEAL_SYNC_INTERVAL_MS);
@@ -847,7 +919,11 @@ function App() {
       if (!pending.length) return;
       syncing = true;
       try {
-        const published = await Promise.all(pending.map(publishPublicDeal));
+        const published = [];
+        for (const deal of pending) {
+          if (cancelled) break;
+          published.push(await publishPublicDeal(deal));
+        }
         if (cancelled) return;
         const valid = published.filter(Boolean);
         if (!valid.length) return;
@@ -930,7 +1006,11 @@ function App() {
         const pending = matchingLocalOrders.filter(
           (order) => fingerprints[order.id] !== orderSyncFingerprint(order),
         );
-        const published = await Promise.all(pending.map(publishCustomerOrder));
+        const published = [];
+        for (const order of pending) {
+          if (cancelled) break;
+          published.push(await publishCustomerOrder(order));
+        }
         const nextFingerprints = { ...fingerprints };
         pending.forEach((order, index) => {
           if (published[index]) nextFingerprints[order.id] = orderSyncFingerprint(order);
@@ -940,6 +1020,7 @@ function App() {
         if (cancelled) return;
         centralOrders.forEach((order) => {
           nextFingerprints[order.id] = orderSyncFingerprint(order);
+          completeCheckoutAttempt(order.id);
         });
         saveJson(CUSTOMER_ORDER_SYNCED_KEY, nextFingerprints);
         setOrders((current) => {
@@ -1121,8 +1202,9 @@ function App() {
     const discountedTotal = discountedPrice(ownerProduct.originalPrice, ownerProduct.discountRate);
     const splitAllocation = calculateProductAllocation(discountedTotal, totalQuantity, 1);
     const orderedQuantity = editingId ? previousOrderedQuantity : 0;
+    const dealId = editingId || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`;
     const deal = {
-      id: editingId || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`,
+      id: dealId,
       createdAt: previous?.createdAt || new Date().toISOString(),
       visibility: 'public',
       source: 'merchant',
@@ -1151,6 +1233,14 @@ function App() {
         : 0,
       quantityTracking: true,
       target: totalQuantity,
+      groupId: splitPricing ? dealId : '',
+      targetCount: splitPricing ? Math.min(20, totalQuantity) : 0,
+      currentCount: 0,
+      groupStatus: splitPricing ? 'recruiting' : '',
+      chatLocked: false,
+      hostMode: splitPricing ? 'recruiting' : 'self',
+      hostActorId: '',
+      hostMatched: false,
       totalQuantity,
       productQuantity: totalQuantity,
       orderedQuantity: editingId ? orderedQuantity : 0,
@@ -1382,18 +1472,57 @@ function App() {
 
   const saveCustomerOrder = async (order) => {
     const isPurchase = order.type === 'purchase';
-    const isCustomerGroupPurchase = isPurchase && order.deal?.source === 'customer';
+    const isGroupPurchase = isPurchase && isGroupBackedDeal(order.deal);
     const actorId = getVisitorId();
+    const requestedReservationMutationId = order.reservationMutationId
+      || order.clientMutationId
+      || (isPurchase ? createMutationId('checkout_quantity') : '');
+    const reconciledOrder = isPurchase
+      ? orders.find((candidate) => (
+          candidate.dealId === order.dealId
+          && candidate.visitorId === actorId
+          && [candidate.reservationMutationId, candidate.clientMutationId]
+            .includes(requestedReservationMutationId)
+        ))
+      : null;
+    if (reconciledOrder) {
+      completeCheckoutAttempt(reconciledOrder.id);
+      return reconciledOrder;
+    }
+    const checkoutAttempt = isPurchase
+      ? beginCheckoutAttempt({
+          ...order,
+          actorId,
+          groupId: isGroupPurchase ? (order.groupId || order.deal?.groupId || order.deal?.id) : '',
+          reservationMutationId: requestedReservationMutationId,
+        })
+      : null;
+    const reservationMutationId = checkoutAttempt?.reservationMutationId
+      || requestedReservationMutationId;
     let groupSnapshot = null;
-    if (isCustomerGroupPurchase) {
+    if (isGroupPurchase) {
       const selectedQuantity = Math.max(1, Number(order.selectedCount || order.quantity || 1));
       const existingCredential = getGroupCredential(order.deal.id, actorId);
-      if (existingCredential) {
+      if (
+        existingCredential?.reservationAction === 'join'
+        && existingCredential.reservationMutationId === reservationMutationId
+        && Number(existingCredential.reservationQuantity) === selectedQuantity
+      ) {
+        const joined = await joinGroupRoom({
+          deal: order.deal,
+          actorId,
+          nickname: profile?.name || '테스트 참여자',
+          role: 'member',
+          selectedQuantity,
+          clientMutationId: reservationMutationId,
+        });
+        groupSnapshot = joined?.snapshot || null;
+      } else if (existingCredential) {
         const reserved = await reserveGroupQuantity(
           order.deal.id,
           selectedQuantity,
           actorId,
-          order.clientMutationId,
+          reservationMutationId,
         );
         groupSnapshot = reserved?.snapshot || null;
       } else {
@@ -1403,17 +1532,21 @@ function App() {
           nickname: profile?.name || '테스트 참여자',
           role: 'member',
           selectedQuantity,
+          clientMutationId: reservationMutationId,
         });
         groupSnapshot = joined?.snapshot || null;
       }
     }
-    const createdAt = new Date().toISOString();
-    const randomValue = new Uint32Array(1);
-    globalThis.crypto?.getRandomValues?.(randomValue);
-    const orderNonce = String(randomValue[0] || Math.floor(Math.random() * 1_000_000))
-      .slice(-6)
-      .padStart(6, '0');
-    const orderId = `order-${Date.now()}${orderNonce}`;
+    const createdAt = checkoutAttempt?.createdAt || new Date().toISOString();
+    let orderId = checkoutAttempt?.orderId || '';
+    if (!orderId) {
+      const randomValue = new Uint32Array(1);
+      globalThis.crypto?.getRandomValues?.(randomValue);
+      const orderNonce = String(randomValue[0] || Math.floor(Math.random() * 1_000_000))
+        .slice(-6)
+        .padStart(6, '0');
+      orderId = `order-${Date.now()}${orderNonce}`;
+    }
     const participantKey = participationKey({
       visitorId: getVisitorId(),
       dealId: order.dealId,
@@ -1421,6 +1554,7 @@ function App() {
     const countedParticipations = loadJson(COUNTED_PARTICIPATIONS_KEY, {});
     const isNewDealParticipant = isPurchase && !countedParticipations[participantKey];
     const newOrder = {
+      ...order,
       id: orderId,
       createdAt,
       status: 'new',
@@ -1433,10 +1567,16 @@ function App() {
       district: order.deal?.district || profile?.district || DEFAULT_LOCATION.district,
       neighborhood: order.deal?.neighborhood || profile?.neighborhood || '미설정',
       statusHistory: [{ status: 'new', actor: 'customer', timestamp: createdAt }],
-      ...order,
+      ...(checkoutAttempt
+        ? {
+            reservationMutationId,
+            clientMutationId: reservationMutationId,
+          }
+        : {}),
     };
     let storedOrder = newOrder;
-    if (isPurchase && order.deal?.source === 'merchant') {
+    const needsDurableOrderSync = checkoutNeedsDurableOrderSync(newOrder);
+    if (needsDurableOrderSync) {
       const published = await publishCustomerOrder(newOrder, { throwOnError: true });
       if (!published) throw new Error('order_sync_failed');
       storedOrder = {
@@ -1449,11 +1589,12 @@ function App() {
       saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
     }
     setOrders((current) => {
-      const next = [storedOrder, ...current];
+      const next = mergeOrders(current, [storedOrder]);
       saveJson(CUSTOMER_ORDERS_KEY, next);
       return next;
     });
-    if (!(isPurchase && order.deal?.source === 'merchant')) {
+    if (checkoutAttempt) completeCheckoutAttempt(orderId);
+    if (!needsDurableOrderSync) {
       publishCustomerOrder(newOrder).then((published) => {
         if (!published) return;
         const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
@@ -1465,8 +1606,7 @@ function App() {
     if (isPurchase && order.deal?.id) {
       const target = Math.max(1, Number(order.deal.target || 1));
       const orderedQuantityIncrement = Math.max(1, Number(order.selectedCount || order.quantity || 1));
-      const alreadyJoinedRoom = Boolean(getGroupCredential(order.deal.id, getVisitorId()));
-      if (order.deal.source === 'customer') {
+      if (groupSnapshot) {
         const currentCount = Number(groupSnapshot?.group?.currentCount ?? order.deal.current ?? 0);
         const nextOrderedQuantity = Number(
           groupSnapshot?.group?.orderedQuantity
@@ -1474,12 +1614,19 @@ function App() {
         );
         const updatedDeal = {
           ...order.deal,
-          current: currentCount,
+          groupId: order.deal.groupId || order.deal.id,
+          current: order.deal.source === 'customer' ? currentCount : nextOrderedQuantity,
           currentPeople: currentCount,
           currentCount,
           participantCount: currentCount,
           orderedQuantity: nextOrderedQuantity,
           allocatedProductQuantity: nextOrderedQuantity,
+          groupStatus: groupSnapshot.group.status || groupSnapshot.group.groupStatus || order.deal.groupStatus,
+          hostMode: groupSnapshot.group.hostMode || order.deal.hostMode || 'recruiting',
+          hostActorId: groupSnapshot.group.hostActorId || order.deal.hostActorId || '',
+          hostMatched: Boolean(groupSnapshot.group.hostActorId || order.deal.hostActorId),
+          lastMessageSeq: Number(groupSnapshot.group.lastMessageSeq ?? groupSnapshot.lastSeq ?? order.deal.lastMessageSeq ?? 0),
+          version: Number(groupSnapshot.group.version || order.deal.version || 1),
           updatedAt: groupSnapshot?.group?.updatedAt || order.deal.updatedAt,
         };
         countedParticipations[participantKey] = true;
@@ -1495,6 +1642,14 @@ function App() {
             role: 'participant',
             counted: true,
             source: 'checkout',
+          });
+        }
+        if (updatedDeal.source === 'merchant') {
+          setCreatedDeals((current) => {
+            if (!current.some((item) => item.id === updatedDeal.id)) return current;
+            const next = current.map((item) => (item.id === updatedDeal.id ? updatedDeal : item));
+            saveCreatedDeals(next);
+            return next;
           });
         }
         return storedOrder;
@@ -1514,7 +1669,7 @@ function App() {
         orderedQuantity: nextOrderedQuantity,
         allocatedProductQuantity: nextOrderedQuantity,
         participantCount: Math.max(0, Number(order.deal.participantCount || 0))
-          + (isNewDealParticipant && !alreadyJoinedRoom ? 1 : 0),
+          + (isNewDealParticipant ? 1 : 0),
       };
       if (isNewDealParticipant) {
         countedParticipations[participantKey] = true;
@@ -1563,7 +1718,8 @@ function App() {
     let updatedDeal;
     let cancellationSnapshot = null;
 
-    if (deal.source === 'customer') {
+    const isBoundGroupOrder = isGroupBackedDeal(deal) && Boolean(order.groupId);
+    if (isBoundGroupOrder) {
       const result = await cancelGroupParticipation({
         groupId: deal.groupId || deal.id,
         order,
@@ -1574,14 +1730,17 @@ function App() {
       cancelledOrder = result.order;
       cancellationSnapshot = result.snapshot || null;
       const group = cancellationSnapshot?.group || {};
+      const currentCount = Number(group.currentCount ?? deal.currentCount ?? deal.participantCount ?? 0);
+      const orderedQuantity = Number(group.orderedQuantity ?? deal.orderedQuantity ?? 0);
       updatedDeal = {
         ...deal,
-        current: Number(group.currentCount ?? deal.current ?? 0),
-        currentPeople: Number(group.currentCount ?? deal.currentPeople ?? deal.current ?? 0),
-        currentCount: Number(group.currentCount ?? deal.currentCount ?? deal.current ?? 0),
-        participantCount: Number(group.currentCount ?? deal.participantCount ?? deal.current ?? 0),
-        orderedQuantity: Number(group.orderedQuantity ?? deal.orderedQuantity ?? 0),
-        allocatedProductQuantity: Number(group.orderedQuantity ?? deal.orderedQuantity ?? 0),
+        groupId: deal.groupId || deal.id,
+        current: deal.source === 'customer' ? currentCount : orderedQuantity,
+        currentPeople: currentCount,
+        currentCount,
+        participantCount: currentCount,
+        orderedQuantity,
+        allocatedProductQuantity: orderedQuantity,
         version: Number(group.version ?? deal.version ?? 1),
         stateVersion: Number(group.version ?? deal.stateVersion ?? deal.version ?? 1),
         updatedAt: group.updatedAt || cancelledOrder?.cancelledAt || new Date().toISOString(),
@@ -1620,7 +1779,7 @@ function App() {
     const countedParticipations = loadJson(COUNTED_PARTICIPATIONS_KEY, {});
     const groupParticipant = cancellationSnapshot?.participants
       ?.find((item) => item.actorId === actorId);
-    const stillCounted = deal.source === 'customer'
+    const stillCounted = cancellationSnapshot
       ? Boolean(groupParticipant?.counted)
       : orders.some((candidate) => (
         candidate.id !== order.id
@@ -1662,39 +1821,50 @@ function App() {
     return cancelledOrder;
   };
 
-  const updateOrderStatus = (orderId) => {
+  const persistManagedOrder = (managedOrder) => {
+    const existingOrder = orders.find((item) => item.id === managedOrder.id) || {};
+    const mergedManagedOrder = {
+      ...existingOrder,
+      ...managedOrder,
+      deal: { ...existingOrder.deal, ...(managedOrder.deal || {}) },
+    };
+    setOrders((current) => {
+      const next = current.map((item) => (
+        item.id === managedOrder.id
+          ? { ...item, ...mergedManagedOrder }
+          : item
+      ));
+      saveJson(CUSTOMER_ORDERS_KEY, next);
+      return next;
+    });
+    const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+    fingerprints[managedOrder.id] = orderSyncFingerprint(mergedManagedOrder);
+    saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+  };
+
+  const updateOrderStatus = async (orderId, direction = 'next') => {
     const order = orders.find((item) => item.id === orderId);
     if (!order || isCancelledOrder(order)) return;
     const currentStage = getOrderStage(order);
     const currentIndex = ORDER_STAGES.findIndex((stage) => stage.id === currentStage.id);
-    const nextStage = ORDER_STAGES[Math.min(currentIndex + 1, ORDER_STAGES.length - 1)];
-    if (currentStage.id === nextStage.id) return;
-    const statusUpdatedAt = new Date().toISOString();
-
-    const next = orders.map((item) => (
-      item.id === orderId
-        ? {
-          ...item,
-          status: nextStage.id,
-          statusUpdatedAt,
-          statusHistory: [
-            ...(item.statusHistory || []),
-            { status: nextStage.id, actor: 'owner', action: currentStage.action, timestamp: statusUpdatedAt },
-          ],
-        }
-        : item
-    ));
-    setOrders(next);
-    saveJson(CUSTOMER_ORDERS_KEY, next);
+    const nextStage = ORDER_STAGES[currentIndex + (direction === 'previous' ? -1 : 1)];
+    if (!nextStage) return;
+    const deal = deals.find((item) => item.id === order.dealId) || order.deal || {};
+    const managedOrder = await manageCustomerOrder(order, deal, {
+      kind: 'order_status',
+      direction,
+    });
+    persistManagedOrder(managedOrder);
     track('owner_order_status_changed', {
       order_id: orderId,
       deal_id: order.dealId,
       from_status: currentStage.id,
       to_status: nextStage.id,
-      action: currentStage.action,
+      action: direction === 'previous' ? '이전 단계' : currentStage.action,
       total: Number(order.total || 0),
-      status_updated_at: statusUpdatedAt,
+      status_updated_at: managedOrder.statusUpdatedAt,
     });
+    return managedOrder;
   };
 
   const confirmCustomerPickup = (orderId) => {
@@ -1726,32 +1896,25 @@ function App() {
     });
   };
 
-  const confirmManualPayment = (orderId) => {
+  const confirmManualPayment = async (orderId, direction = 'next') => {
     const order = orders.find((item) => item.id === orderId);
-    if (!order || isCancelledOrder(order) || order.type !== 'purchase' || order.paymentConfirmedAt) return;
-    const confirmedAt = new Date().toISOString();
-    const next = orders.map((item) => (
-      item.id === orderId
-        ? {
-          ...item,
-          paymentStatus: 'confirmed',
-          paymentConfirmedAt: confirmedAt,
-          statusHistory: [
-            ...(item.statusHistory || []),
-            { status: 'manual_payment_confirmed', actor: 'owner', timestamp: confirmedAt },
-          ],
-        }
-        : item
-    ));
-    setOrders(next);
-    saveJson(CUSTOMER_ORDERS_KEY, next);
-    track('manual_payment_confirmed', {
+    if (!order || isCancelledOrder(order) || order.type !== 'purchase') return;
+    if (direction === 'next' && order.paymentConfirmedAt) return;
+    if (direction === 'previous' && !order.paymentConfirmedAt) return;
+    const deal = deals.find((item) => item.id === order.dealId) || order.deal || {};
+    const managedOrder = await manageCustomerOrder(order, deal, {
+      kind: 'payment_status',
+      direction,
+    });
+    persistManagedOrder(managedOrder);
+    track(direction === 'previous' ? 'manual_payment_confirmation_reverted' : 'manual_payment_confirmed', {
       order_id: orderId,
       deal_id: order.dealId,
       total: Number(order.total || 0),
-      confirmed_at: confirmedAt,
+      confirmed_at: managedOrder.paymentConfirmedAt || '',
       neighborhood: order.neighborhood || order.deal?.neighborhood,
     });
+    return managedOrder;
   };
 
   const toggleFavorite = (deal) => {
@@ -1767,21 +1930,23 @@ function App() {
   const applyHost = async (deal) => {
     const properties = { deal_id: deal.id, method: deal.methods?.join(', ') };
     track('host_apply_clicked', properties);
-    if (deal.source === 'customer') {
+    if (isGroupBackedDeal(deal)) {
       const actorId = getVisitorId();
       const result = await claimGroupHost({
         deal,
         actorId,
-        nickname: profile?.name || '테스트 참여자',
       });
       const group = result?.snapshot?.group || {};
       const updatedDeal = {
         ...deal,
+        groupId: deal.groupId || deal.id,
         hostMode: group.hostMode || deal.hostMode || 'recruiting',
         hostMatched: Boolean(group.hostMatched ?? group.hostActorId),
         hostActorId: group.hostActorId || actorId,
         creatorActorId: group.creatorActorId || deal.creatorActorId,
-        current: Number(group.currentCount ?? deal.current ?? 0),
+        current: deal.source === 'customer'
+          ? Number(group.currentCount ?? deal.current ?? 0)
+          : Number(group.orderedQuantity ?? deal.orderedQuantity ?? deal.current ?? 0),
         currentPeople: Number(group.currentCount ?? deal.currentPeople ?? deal.current ?? 0),
         currentCount: Number(group.currentCount ?? deal.currentCount ?? deal.current ?? 0),
         participantCount: Number(group.currentCount ?? deal.participantCount ?? deal.current ?? 0),
@@ -1790,11 +1955,13 @@ function App() {
       };
       updateCustomerDeal(updatedDeal, { observed: true, sync: false });
     }
-    setHostDealIds((current) => {
-      const next = current.includes(deal.id) ? current : [deal.id, ...current];
-      saveJson(HOST_DEALS_KEY, next);
-      return next;
-    });
+    if (!isGroupBackedDeal(deal)) {
+      setHostDealIds((current) => {
+        const next = current.includes(deal.id) ? current : [deal.id, ...current];
+        saveJson(HOST_DEALS_KEY, next);
+        return next;
+      });
+    }
     track('host_apply_completed', properties);
   };
 
@@ -2744,10 +2911,15 @@ function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onCancelParti
             const cancelled = isCancelledOrder(order);
             const orderStage = getOrderStage(order);
             const orderStageIndex = ORDER_STAGES.findIndex((stage) => stage.id === orderStage.id);
-            const groupRole = deal?.source === 'customer'
+            const groupRole = dealHasGroupRoom(deal)
               ? getGroupCredential(deal.id, order.visitorId)?.role || ''
               : '';
             const canCancel = canCancelParticipation(order, deal, groupRole);
+            const canOpenRoom = RELEASE_FEATURES.chat && canOpenOrderGroupRoom({
+              order,
+              deal,
+              cancelled,
+            });
             const canConfirmPickup = !cancelled && order.type === 'purchase'
               && ['pickup_waiting', 'completed'].includes(orderStage.id)
               && !order.customerPickupConfirmedAt;
@@ -2804,6 +2976,18 @@ function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onCancelParti
                   <button className="secondary-button compact-button" onClick={() => deal && onSelectDeal(deal)}>
                     상세보기
                   </button>
+                  {canOpenRoom && (
+                    <button
+                      className="secondary-button compact-button room-entry-button"
+                      onClick={() => {
+                        onSelectDeal(deal);
+                        onScreen('room');
+                      }}
+                    >
+                      <MessageCircle size={15} />
+                      그룹 채팅
+                    </button>
+                  )}
                   {canCancel && (
                     <button
                       className="danger-button compact-button"
@@ -2982,6 +3166,8 @@ function DealDetail({
   const isCustomerGroup = deal.source === 'customer';
   const isInstant = deal.saleType === 'instant';
   const isSplitMerchant = isSplitMerchantDeal(deal);
+  const isMerchantGroup = deal.source === 'merchant' && deal.saleType === 'group';
+  const isGroupDeal = isCustomerGroup || isMerchantGroup;
   const dealQuantity = getDealQuantity(deal);
   const split = isCustomerGroup
     ? calculateSplit(
@@ -3013,15 +3199,17 @@ function DealDetail({
     : getDealPrice(deal);
   const customerHostRecruiting = isCustomerGroup && deal.hostMode === 'recruiting';
   const recruitmentOpen = (deal.groupStatus || 'recruiting') === 'recruiting';
-  const existingGroupCredential = isCustomerGroup
+  const existingGroupCredential = isGroupDeal
     ? getGroupCredential(deal.id, getVisitorId())
     : null;
+  const showMerchantRoom = isMerchantGroup && (adminMode || Boolean(existingGroupCredential));
   const newParticipantCapacityReached = isCustomerGroup
     && !existingGroupCredential
     && split.current >= split.people;
   const canHostApply = !hostMatched && (
     (customerHostRecruiting && recruitmentOpen)
-    || (!isInstant && !isCustomerGroup && (deal.methods || []).some((method) => ['그룹배달', '픽업'].includes(method)))
+    || (isMerchantGroup && recruitmentOpen
+      && (deal.methods || []).some((method) => ['그룹배달', '픽업'].includes(method)))
   );
 
   const handleHostApply = async () => {
@@ -3031,11 +3219,7 @@ function DealDetail({
     try {
       await onHostApply(deal);
     } catch (applyError) {
-      setHostApplyError(applyError?.message === 'host_already_claimed'
-        ? '다른 참여자가 먼저 호스트로 확정되었습니다.'
-        : applyError?.message === 'host_claim_closed'
-          ? '현재는 호스트 지원을 받을 수 없는 상태입니다.'
-        : '호스트 지원을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+      setHostApplyError(hostApplyErrorMessage(applyError));
     } finally {
       setHostApplying(false);
     }
@@ -3159,7 +3343,7 @@ function DealDetail({
             <Users size={16} />
             {hostMatched ? '확정됨' : !recruitmentOpen ? '모집 종료' : hostApplying ? '지원 중…' : '호스트 지원하기'}
           </button>
-          {hostApplyError && <p className="form-error host-apply-error">{hostApplyError}</p>}
+          {hostApplyError && <p className="form-error host-apply-error" role="alert" aria-live="assertive">{hostApplyError}</p>}
         </div>
       )}
 
@@ -3329,11 +3513,12 @@ function DealDetail({
           <button
             className={hostMatched ? 'secondary-button compact-button' : 'primary-button compact-button'}
             onClick={handleHostApply}
-            disabled={hostMatched}
+            disabled={hostMatched || hostApplying}
           >
             <Users size={16} />
-            {hostMatched ? '확정됨' : '지원하기'}
+            {hostMatched ? '확정됨' : hostApplying ? '지원 중…' : '지원하기'}
           </button>
+          {hostApplyError && <p className="form-error host-apply-error" role="alert" aria-live="assertive">{hostApplyError}</p>}
         </div>
       )}
 
@@ -3352,7 +3537,7 @@ function DealDetail({
         </p>
       )}
 
-      <div className={isSplitMerchant ? 'sticky-actions single' : 'sticky-actions'}>
+      <div className={isSplitMerchant && !showMerchantRoom ? 'sticky-actions single' : 'sticky-actions'}>
         {isCustomerGroup ? (
           <>
             <button className="secondary-button room-entry-button" onClick={onOpenRoom}>
@@ -3376,6 +3561,12 @@ function DealDetail({
           </>
         ) : (
           <>
+            {showMerchantRoom && (
+              <button className="secondary-button room-entry-button" onClick={onOpenRoom}>
+                {RELEASE_FEATURES.chat ? <MessageCircle size={18} /> : <Check size={18} />}
+                {RELEASE_FEATURES.chat ? `그룹 채팅${unreadCount > 0 ? ` · ${Math.min(99, unreadCount)}` : ''}` : '거래 상태 관리'}
+              </button>
+            )}
             {!isSplitMerchant && (
               <button
                 className="secondary-button"
@@ -3511,12 +3702,13 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
 
   const selectedCount = Object.values(quantities).reduce((sum, value) => sum + value, 0);
   const baseTotal = deal.menu.reduce((sum, item) => sum + item.price * quantities[item.id], 0);
-  const isCurrentHost = isCustomerGroup && deal.hostActorId === getVisitorId();
+  const isCurrentHost = isGroupBackedDeal(deal) && deal.hostActorId === getVisitorId();
   const hostRemainderAlreadyApplied = isCurrentHost && (
     (deal.hostMode !== 'recruiting' && deal.creatorActorId === getVisitorId())
     || orders.some((order) => (
       order.dealId === deal.id
       && order.visitorId === getVisitorId()
+      && !isCancelledOrder(order)
       && Number(order.hostRemainderApplied || 0) > 0
     ))
   );
@@ -3617,10 +3809,14 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
             <small>호스트 나머지 부담액 {formatWon(hostRemainder)} 포함</small>
           )}
         </div>
-        {submitError && <p className="form-error join-submit-error" role="alert">{submitError}</p>}
       </div>
 
-      <div className="sticky-actions single">
+      <div className={submitError ? 'sticky-actions single has-message' : 'sticky-actions single'}>
+        {submitError && (
+          <p className="form-error join-submit-error sticky-action-message" role="alert" aria-live="assertive">
+            {submitError}
+          </p>
+        )}
         <button
           className="primary-button"
           disabled={submitting || selectedCount === 0 || remaining === 0 || (isCustomerGroup && deal.groupStatus !== 'recruiting')}
@@ -3632,7 +3828,7 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
               await onOrderCreate({
                 type: 'purchase',
                 dealId: deal.id,
-                groupId: deal.source === 'customer' ? (deal.groupId || deal.id) : '',
+                groupId: isGroupBackedDeal(deal) ? (deal.groupId || deal.id) : '',
                 deal,
                 title: deal.title,
                 store: deal.store,
@@ -3647,11 +3843,7 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
               track('purchase_completed', { deal_id: deal.id, total, method, time, note, selected_count: selectedCount });
               onScreen('complete');
             } catch (orderError) {
-              setSubmitError(['quantity_unavailable', 'quantity_exceeds_total', 'group_full'].includes(orderError?.message)
-                ? '다른 참여자가 먼저 남은 수량을 선택했습니다. 최신 수량을 확인해 주세요.'
-                : ['quantity_reservation_closed', 'group_not_recruiting'].includes(orderError?.message)
-                  ? '모집이 종료되어 더 이상 수량을 선택할 수 없습니다.'
-                : '참여 신청을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+              setSubmitError(joinSubmitErrorMessage(orderError));
             } finally {
               setSubmitting(false);
             }
@@ -3986,6 +4178,7 @@ function Completion({ deal, onScreen }) {
   useScreenAnalytics('completion', { deal_id: deal.id });
   const isInstant = deal.saleType === 'instant';
   const isCustomerGroup = deal.source === 'customer';
+  const hasGroupRoom = dealHasGroupRoom(deal);
   return (
     <section className="screen complete-screen">
       <div className="success-mark">
@@ -4012,6 +4205,12 @@ function Completion({ deal, onScreen }) {
         </div>
       </div>
 
+      {RELEASE_FEATURES.chat && hasGroupRoom && (
+        <button className="primary-button" onClick={() => onScreen('room')}>
+          <MessageCircle size={18} />
+          그룹 채팅 바로가기
+        </button>
+      )}
       <button className="primary-button" onClick={() => onScreen('survey')}>
         <MessageCircle size={18} />
         설문 작성
@@ -4802,6 +5001,28 @@ function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
 
 function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfirm }) {
   useScreenAnalytics('owner_orders', { order_count: orders.length, ...normalizeLocation(location) });
+  const [busyAction, setBusyAction] = useState('');
+  const [actionError, setActionError] = useState('');
+
+  const runOwnerAction = async (actionKey, operation) => {
+    if (busyAction) return;
+    setBusyAction(actionKey);
+    setActionError('');
+    try {
+      await operation();
+    } catch (error) {
+      const code = String(error?.message || '');
+      setActionError(
+        ['missing_owner_capability', 'manager_capability_required', 'forbidden', 'order_manager_mismatch'].includes(code)
+          ? '이 주문을 관리할 권한을 확인할 수 없습니다. 상품을 등록한 사장님 계정이나 그룹 호스트·관리자로 접속해 주세요.'
+          : code === 'state_conflict'
+            ? '다른 변경이 먼저 반영되었습니다. 잠시 후 최신 주문을 확인하고 다시 시도해 주세요.'
+            : '주문 상태를 변경하지 못했습니다. 잠시 후 다시 시도해 주세요.',
+      );
+    } finally {
+      setBusyAction('');
+    }
+  };
 
   return (
     <section className="screen">
@@ -4820,6 +5041,7 @@ function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfir
           <span>같은 동네 사용자의 가상 주문과 수동 결제 상태가 표시됩니다.</span>
         </div>
       </div>
+      {actionError && <p className="form-error" role="alert" aria-live="assertive">{actionError}</p>}
 
       <div className="owner-order-flow">
         {ORDER_STAGES.map((stage, index) => (
@@ -4872,11 +5094,18 @@ function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfir
                         <strong>{order.paymentConfirmedAt ? '수동 결제 확인 완료' : '수동 결제 확인 대기'}</strong>
                         <span>{order.paymentConfirmedAt ? '사용자 화면에도 결제 확인 상태가 반영됩니다.' : '실제 입금·결제를 확인한 뒤 눌러주세요.'}</span>
                       </div>
-                      {!order.paymentConfirmedAt && (
-                        <button className="secondary-button compact-button" onClick={() => onPaymentConfirm(order.id)}>
-                          결제 확인
-                        </button>
-                      )}
+                      <button
+                        className="secondary-button compact-button"
+                        disabled={Boolean(busyAction)}
+                        onClick={() => runOwnerAction(
+                          `payment-${order.id}`,
+                          () => onPaymentConfirm(order.id, order.paymentConfirmedAt ? 'previous' : 'next'),
+                        )}
+                      >
+                        {busyAction === `payment-${order.id}`
+                          ? '반영 중…'
+                          : order.paymentConfirmedAt ? '결제 확인 취소' : '결제 확인'}
+                      </button>
                     </div>
                     <div className={order.customerPickupConfirmedAt ? 'owner-customer-confirm active' : 'owner-customer-confirm'}>
                       <User size={14} />
@@ -4888,14 +5117,37 @@ function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfir
                   <code>{order.id}</code>
                   {cancelled ? (
                     <span className="completed-order-label">취소 처리 완료</span>
-                  ) : stage.action ? (
-                    <button className="primary-button compact-button" onClick={() => onStatusChange(order.id)}>
-                      {stage.action}
-                    </button>
                   ) : (
-                    <span className="completed-order-label">
-                      {order.customerPickupConfirmedAt && order.paymentConfirmedAt ? '거래 검증 완료' : '사장님 처리 완료'}
-                    </span>
+                    <>
+                      {ORDER_STAGES.findIndex((item) => item.id === stage.id) > 0 && (
+                        <button
+                          className="secondary-button compact-button"
+                          disabled={Boolean(busyAction)}
+                          onClick={() => runOwnerAction(
+                            `status-previous-${order.id}`,
+                            () => onStatusChange(order.id, 'previous'),
+                          )}
+                        >
+                          {busyAction === `status-previous-${order.id}` ? '반영 중…' : '이전 단계'}
+                        </button>
+                      )}
+                      {stage.action ? (
+                        <button
+                          className="primary-button compact-button"
+                          disabled={Boolean(busyAction)}
+                          onClick={() => runOwnerAction(
+                            `status-next-${order.id}`,
+                            () => onStatusChange(order.id, 'next'),
+                          )}
+                        >
+                          {busyAction === `status-next-${order.id}` ? '반영 중…' : stage.action}
+                        </button>
+                      ) : (
+                        <span className="completed-order-label">
+                          {order.customerPickupConfirmedAt && order.paymentConfirmedAt ? '거래 검증 완료' : '사장님 처리 완료'}
+                        </span>
+                      )}
+                    </>
                   )}
                 </div>
               </article>

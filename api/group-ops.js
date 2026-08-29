@@ -3,7 +3,7 @@ import {
   createHmac,
   timingSafeEqual,
 } from 'node:crypto';
-import { callDataApi } from './_data-upstream.js';
+import { callDataApiJson, fetchUpstreamJson } from './_data-upstream.js';
 
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
 const ACTIONS = new Set([
@@ -323,6 +323,7 @@ function statusForError(code) {
     'target_locked',
     'host_already_claimed',
     'host_claim_closed',
+    'host_order_required',
     'quantity_exceeds_total',
     'quantity_reservation_closed',
     'participation_cancellation_closed',
@@ -332,6 +333,8 @@ function statusForError(code) {
     'order_ownership_unclaimable',
   ].includes(code)) return 409;
   if (String(code).includes('not_configured')) return 503;
+  if (code === 'collector_busy') return 503;
+  if (code === 'upstream_timeout') return 504;
   if (code === 'group_operation_failed' || /^Exception:/.test(String(code))) return 502;
   return 400;
 }
@@ -375,7 +378,7 @@ function publicSnapshot(snapshot) {
 
 async function callUpstream(payload, allowProxy = true) {
   const token = serviceSecret();
-  const proxied = allowProxy ? await callDataApi('/api/group-ops', {
+  const proxied = allowProxy ? await callDataApiJson('/api/group-ops', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -384,8 +387,7 @@ async function callUpstream(payload, allowProxy = true) {
     body: JSON.stringify(payload),
   }) : null;
   if (proxied) {
-    const result = await proxied.json();
-    return { status: proxied.status, result };
+    return { status: proxied.upstream.status, result: proxied.result };
   }
 
   const collectorUrl = process.env.GOOGLE_SHEETS_COLLECTOR_URL;
@@ -393,7 +395,7 @@ async function callUpstream(payload, allowProxy = true) {
   if (!collectorUrl || !collectorToken) {
     throw requestError('collector_not_configured', 503);
   }
-  const upstream = await fetch(collectorUrl, {
+  const { result } = await fetchUpstreamJson(collectorUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -403,7 +405,6 @@ async function callUpstream(payload, allowProxy = true) {
     }),
     redirect: 'follow',
   });
-  const result = await upstream.json();
   return { status: result.ok ? 200 : statusForError(result.error), result };
 }
 

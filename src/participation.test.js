@@ -23,6 +23,8 @@ test('participation cancellation is limited to recruiting, unpaid member orders'
   assert.equal(canCancelParticipation(order, { source: 'customer', groupStatus: 'recruiting' }, 'member'), true);
   assert.equal(canCancelParticipation(order, { source: 'customer', groupStatus: 'recruited' }, 'member'), false);
   assert.equal(canCancelParticipation(order, { source: 'customer', groupStatus: 'recruiting' }, 'host'), false);
+  assert.equal(canCancelParticipation({ ...order, groupId: 'owner-bound-group' }, { source: 'merchant', saleType: 'group' }, 'host'), false);
+  assert.equal(canCancelParticipation({ ...order, groupId: 'owner-bound-group' }, { source: 'merchant', saleType: 'group' }, 'member'), true);
   assert.equal(canCancelParticipation({ ...order, paymentStatus: 'requested' }, { source: 'merchant', saleType: 'group' }), false);
   assert.equal(canCancelParticipation(order, { source: 'merchant', saleType: 'instant' }), false);
 });

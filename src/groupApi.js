@@ -35,6 +35,11 @@ export function createMutationId(prefix = 'mutation') {
   return `${prefix}-${Date.now()}-${random}`;
 }
 
+export function isGroupBackedDeal(deal = {}) {
+  return deal.source === 'customer'
+    || (deal.source === 'merchant' && deal.saleType === 'group');
+}
+
 function membershipMutationKey(action, groupId, actorId, role = '') {
   return `${action}::${groupId}::${actorId}::${role}`;
 }
@@ -282,9 +287,57 @@ function localCreate(input) {
   return { ok: true, capabilityToken: credential.capabilityToken, snapshot: normalizeSnapshot(snapshot, input.groupId), localOnly: true };
 }
 
-function localJoin(input) {
+function initialLocalMerchantSnapshot(deal, groupId) {
+  const now = new Date().toISOString();
+  const totalQuantity = Math.max(1, Math.min(999, Number(
+    deal.totalQuantity || deal.productQuantity || deal.target || 1,
+  )));
+  const targetCount = Math.max(1, Math.min(20, Number(
+    deal.targetCount || deal.maxPeople || Math.min(totalQuantity, 20),
+  )));
+  return {
+    localOnly: true,
+    group: {
+      id: groupId,
+      groupId,
+      dealId: groupId,
+      title: deal.title || '',
+      status: 'recruiting',
+      targetCount,
+      currentCount: 0,
+      chatLocked: false,
+      creatorActorId: deal.creatorActorId || `merchant-${groupId}`,
+      hostMode: 'recruiting',
+      hostActorId: '',
+      hostMatched: false,
+      totalQuantity,
+      orderedQuantity: 0,
+      version: 1,
+      updatedAt: now,
+    },
+    participants: [],
+    messages: [],
+    history: [{
+      id: createMutationId('history'),
+      entityType: 'group',
+      entityId: groupId,
+      fromStatus: '',
+      toStatus: 'recruiting',
+      action: 'merchant_group_provisioned',
+      actorId: deal.creatorActorId || `merchant-${groupId}`,
+      actorRole: 'creator',
+      createdAt: now,
+    }],
+    lastSeq: 0,
+  };
+}
+
+function localJoin(input, deal = {}) {
   const groups = getLocalGroups();
-  const snapshot = groups[input.groupId];
+  const snapshot = groups[input.groupId]
+    || (isGroupBackedDeal(deal) && deal.source === 'merchant'
+      ? initialLocalMerchantSnapshot(deal, input.groupId)
+      : null);
   if (!snapshot) throw new Error('group_not_found');
   const role = input.role === 'admin' ? 'admin' : 'member';
   const counted = role !== 'admin' && input.counted !== false;
@@ -394,7 +447,10 @@ export async function joinGroupRoom({
   role = 'member',
   adminPin = '',
   selectedQuantity = role === 'admin' ? 0 : 1,
+  clientMutationId = '',
 }) {
+  const membershipMutationId = clientMutationId
+    || getMembershipMutationId('join', deal.id, actorId, role);
   const input = {
     action: 'join',
     groupId: deal.id,
@@ -404,14 +460,25 @@ export async function joinGroupRoom({
     counted: role !== 'admin',
     selectedQuantity: Number(selectedQuantity),
     adminPin,
-    clientMutationId: getMembershipMutationId('join', deal.id, actorId, role),
+    clientMutationId: membershipMutationId,
   };
   const result = await withFallback(
     () => requestGroupOperation(input),
-    () => localJoin(input),
+    () => localJoin(input, deal),
   );
   if (result.capabilityToken) {
-    saveGroupCredential(deal.id, { actorId, role, capabilityToken: result.capabilityToken });
+    saveGroupCredential(deal.id, {
+      actorId,
+      role,
+      capabilityToken: result.capabilityToken,
+      ...(clientMutationId && Number(selectedQuantity) > 0
+        ? {
+            reservationMutationId: clientMutationId,
+            reservationAction: 'join',
+            reservationQuantity: Number(selectedQuantity),
+          }
+        : {}),
+    });
     clearMembershipMutationId('join', deal.id, actorId, role);
   }
   return { ...result, snapshot: normalizeSnapshot(result, deal.id) };
@@ -435,6 +502,9 @@ function localClaimHost(groupId, actorId) {
     throw new Error('host_claim_closed');
   }
   if (!['creator', 'member'].includes(participant.role)) throw new Error('forbidden');
+  if (participant.role === 'member' && Number(participant.selectedQuantity || 0) <= 0) {
+    throw new Error('host_order_required');
+  }
   const now = new Date().toISOString();
   const previousRole = participant.role;
   participant.role = 'host';
@@ -460,18 +530,9 @@ function localClaimHost(groupId, actorId) {
   return saveLocalGroup(groupId, snapshot);
 }
 
-export async function claimGroupHost({ deal, actorId, nickname }) {
-  let credential = getGroupCredential(deal.id, actorId);
-  if (!credential) {
-    await joinGroupRoom({
-      deal,
-      actorId,
-      nickname,
-      role: 'member',
-      selectedQuantity: 0,
-    });
-    credential = getGroupCredential(deal.id, actorId);
-  }
+export async function claimGroupHost({ deal, actorId }) {
+  const credential = getGroupCredential(deal.id, actorId);
+  if (!credential) throw new Error('host_order_required');
   const payload = commonPayload(deal.id, {
     action: 'claim_host',
     actorId,
@@ -971,13 +1032,14 @@ export async function fetchUnreadCounts({ adminMode = false } = {}) {
     }))
     .filter(({ credential }) => Boolean(credential?.actorId && credential?.capabilityToken))
     .filter(({ credential }) => (adminMode ? credential.role === 'admin' : credential.role !== 'admin'));
-  const snapshots = await Promise.all(entries.map(async ({ groupId, credential }) => {
+  const snapshots = [];
+  for (const { groupId, credential } of entries) {
     try {
-      return [groupId, await fetchGroupSnapshot(groupId, { actorId: credential.actorId })];
+      snapshots.push([groupId, await fetchGroupSnapshot(groupId, { actorId: credential.actorId })]);
     } catch {
-      return [groupId, null];
+      snapshots.push([groupId, null]);
     }
-  }));
+  }
   return Object.fromEntries(snapshots.map(([groupId, snapshot]) => [
     groupId,
     snapshot ? resolveUnreadCount(snapshot, getLastReadSeq(groupId)) : 0,

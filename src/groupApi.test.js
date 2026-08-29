@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 
 import {
   cancelGroupParticipation,
+  claimGroupHost,
   createGroupRoom,
+  isGroupBackedDeal,
+  joinGroupRoom,
   normalizeSnapshot,
   resolveUnreadCount,
   updateGroupTarget,
@@ -79,6 +82,106 @@ test('legacy group snapshots default creator, host mode, and selected quantity s
   assert.equal(snapshot.group.orderedQuantity, 1);
   assert.equal(snapshot.participants[0].selectedQuantity, 1);
   assert.equal(snapshot.participants[1].selectedQuantity, 0);
+});
+
+test('merchant group deals share the public deal id with their group room', () => {
+  assert.equal(isGroupBackedDeal({ source: 'merchant', saleType: 'group' }), true);
+  assert.equal(isGroupBackedDeal({ source: 'merchant', saleType: 'instant' }), false);
+  assert.equal(isGroupBackedDeal({ source: 'customer', saleType: 'community' }), true);
+});
+
+test('host claim without an existing paid participant credential does not create a zero-quantity member', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  const storage = memoryStorage();
+  let fetchCalls = 0;
+  globalThis.localStorage = storage;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('unexpected_network_call');
+  };
+
+  try {
+    await assert.rejects(() => claimGroupHost({
+      deal: {
+        id: 'merchant-host-without-order',
+        source: 'merchant',
+        saleType: 'group',
+      },
+      actorId: 'visitor-without-order',
+    }), /host_order_required/);
+    assert.equal(fetchCalls, 0);
+    assert.equal(storage.dump().includes('visitor-without-order'), false);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
+test('merchant group join can provision a matching local room fallback', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  const previousWindow = globalThis.window;
+  const previousCustomEvent = globalThis.CustomEvent;
+  const previousFallback = process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK;
+  globalThis.localStorage = memoryStorage();
+  globalThis.window = { dispatchEvent() {} };
+  globalThis.CustomEvent = class CustomEvent {
+    constructor(type, options) {
+      this.type = type;
+      this.detail = options?.detail;
+    }
+  };
+  process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK = 'true';
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 404,
+    async json() { return { ok: false, error: 'group_not_found' }; },
+  });
+
+  const deal = {
+    id: 'owner-merchant-room-fallback',
+    source: 'merchant',
+    saleType: 'group',
+    title: '사과 공동구매',
+    target: 50,
+    totalQuantity: 50,
+  };
+  try {
+    const result = await joinGroupRoom({
+      deal,
+      actorId: 'visitor-merchant-room',
+      nickname: '참여자',
+      selectedQuantity: 4,
+      clientMutationId: 'checkout-merchant-room-fallback',
+    });
+    assert.equal(result.snapshot.group.groupId, deal.id);
+    assert.equal(result.snapshot.group.targetCount, 20);
+    assert.equal(result.snapshot.group.currentCount, 1);
+    assert.equal(result.snapshot.group.orderedQuantity, 4);
+    assert.equal(result.snapshot.group.hostMode, 'recruiting');
+    assert.equal(result.snapshot.participants[0].role, 'member');
+    const replay = await joinGroupRoom({
+      deal,
+      actorId: 'visitor-merchant-room',
+      nickname: '참여자',
+      selectedQuantity: 4,
+      clientMutationId: 'checkout-merchant-room-fallback',
+    });
+    assert.equal(replay.snapshot.group.orderedQuantity, 4);
+    assert.equal(replay.snapshot.participants.length, 1);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    if (previousCustomEvent === undefined) delete globalThis.CustomEvent;
+    else globalThis.CustomEvent = previousCustomEvent;
+    if (previousFallback === undefined) delete process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK;
+    else process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK = previousFallback;
+  }
 });
 
 test('group creation retries reuse the same membership mutation id after a lost response', async () => {

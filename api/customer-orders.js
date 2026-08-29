@@ -1,4 +1,4 @@
-import { callDataApi } from './_data-upstream.js';
+import { callDataApiJson, fetchUpstreamJson } from './_data-upstream.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
@@ -61,6 +61,100 @@ function customerProof(body, serviceRequest) {
   const token = text(body.customerCapabilityToken, 256);
   if (token.length < 32) throw requestError('missing_customer_capability', 403);
   return { visitorId, customerCapabilityHash: sha256(token) };
+}
+
+function capabilityProof(body, serviceRequest, {
+  hashField,
+  tokenField,
+  missingCode,
+  invalidCode,
+  required = true,
+} = {}) {
+  if (serviceRequest) {
+    const hash = text(body[hashField], 64).toLowerCase();
+    if (!hash && !required) return '';
+    if (!CAPABILITY_HASH_PATTERN.test(hash)) throw requestError(invalidCode, 403);
+    return hash;
+  }
+  const token = text(body[tokenField], 256);
+  if (!token && !required) return '';
+  if (token.length < 32) throw requestError(missingCode, 403);
+  return sha256(token);
+}
+
+function participantProof(body, serviceRequest, order) {
+  if (!order?.groupId) return '';
+  return capabilityProof(body, serviceRequest, {
+    hashField: 'participantCapabilityHash',
+    tokenField: 'participantCapabilityToken',
+    missingCode: 'missing_participant_capability',
+    invalidCode: 'invalid_participant_capability',
+  });
+}
+
+function manageRequest(body, serviceRequest) {
+  const managerType = text(body.managerType, 30);
+  const orderId = text(body.orderId, 40);
+  const dealId = text(body.dealId, 128);
+  const kind = text(body.kind, 40);
+  const direction = text(body.direction, 20);
+  const expectedVersion = number(body.expectedVersion);
+  const clientMutationId = text(body.clientMutationId, 128);
+  if (!['merchant_owner', 'group_manager'].includes(managerType)) {
+    throw requestError('invalid_manager_type');
+  }
+  if (!/^order-\d{10,20}$/.test(orderId)) throw requestError('invalid_order_id');
+  if (!ID_PATTERN.test(dealId)) throw requestError('invalid_deal_id');
+  if (!['order_status', 'payment_status'].includes(kind)) throw requestError('invalid_manage_kind');
+  if (!['next', 'previous'].includes(direction)) throw requestError('invalid_direction');
+  if (!Number.isInteger(expectedVersion) || expectedVersion < 1) throw requestError('invalid_expected_version');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/.test(clientMutationId)) {
+    throw requestError('invalid_client_mutation_id');
+  }
+
+  const payload = {
+    orderId,
+    dealId,
+    managerType,
+    kind,
+    direction,
+    expectedVersion,
+    clientMutationId,
+  };
+  if (managerType === 'merchant_owner') {
+    payload.ownerCapabilityHash = capabilityProof(body, serviceRequest, {
+      hashField: 'ownerCapabilityHash',
+      tokenField: 'ownerCapabilityToken',
+      missingCode: 'missing_owner_capability',
+      invalidCode: 'invalid_owner_capability',
+    });
+    return payload;
+  }
+
+  payload.actorId = text(body.actorId, 128);
+  if (!ID_PATTERN.test(payload.actorId)) throw requestError('invalid_actor_id');
+  if (serviceRequest) {
+    payload.adminAssertion = body.adminAssertion === true;
+    if (!payload.adminAssertion) {
+      payload.capabilityHash = capabilityProof(body, true, {
+        hashField: 'capabilityHash',
+        tokenField: 'capabilityToken',
+        missingCode: 'missing_capability_token',
+        invalidCode: 'invalid_capability',
+      });
+    }
+  } else if (body.adminPin) {
+    verifyAdminPin(body.adminPin);
+    payload.adminAssertion = true;
+  } else {
+    payload.capabilityHash = capabilityProof(body, false, {
+      hashField: 'capabilityHash',
+      tokenField: 'capabilityToken',
+      missingCode: 'missing_capability_token',
+      invalidCode: 'invalid_capability',
+    });
+  }
+  return payload;
 }
 
 function isAllowedOrigin(originValue, request) {
@@ -177,20 +271,19 @@ async function directCollector(body) {
   const collectorUrl = process.env.GOOGLE_SHEETS_COLLECTOR_URL;
   const collectorToken = process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN;
   if (!collectorUrl || !collectorToken) throw new Error('collector_not_configured');
-  const upstream = await fetch(collectorUrl, {
+  const { upstream, result } = await fetchUpstreamJson(collectorUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ token: collectorToken, ...body }),
     redirect: 'follow',
   });
-  const result = await upstream.json();
   if (!upstream.ok || !result.ok) throw new Error(result.error || 'collector_failed');
   return result;
 }
 
 async function dataApiRequest(body) {
   const token = serviceSecret();
-  const upstream = await callDataApi('/api/customer-orders', {
+  const proxied = await callDataApiJson('/api/customer-orders', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -198,10 +291,11 @@ async function dataApiRequest(body) {
     },
     body: JSON.stringify(body),
   });
-  if (!upstream) return null;
-  const result = await upstream.json();
-  if (!upstream.ok || !result.ok) throw new Error(result.error || 'data_api_failed');
-  return result;
+  if (!proxied) return null;
+  if (!proxied.upstream.ok || !proxied.result.ok) {
+    throw new Error(proxied.result.error || 'data_api_failed');
+  }
+  return proxied.result;
 }
 
 async function listOrders(customerPhone, proof, allowProxy = true) {
@@ -221,12 +315,13 @@ async function listOrders(customerPhone, proof, allowProxy = true) {
   return normalizedOrders(result.orders);
 }
 
-async function publishOrder(order, proof, allowProxy = true) {
+async function publishOrder(order, proof, participantCapabilityHash = '', allowProxy = true) {
   const request = {
     action: 'publish',
     order,
     visitorId: proof.visitorId,
     customerCapabilityHash: proof.customerCapabilityHash,
+    ...(participantCapabilityHash ? { participantCapabilityHash } : {}),
   };
   const proxied = allowProxy ? await dataApiRequest(request) : null;
   if (proxied) {
@@ -239,11 +334,27 @@ async function publishOrder(order, proof, allowProxy = true) {
     order,
     visitorId: proof.visitorId,
     customerCapabilityHash: proof.customerCapabilityHash,
+    ...(participantCapabilityHash ? { participantCapabilityHash } : {}),
   });
   const published = sanitizeOrder(result.order || order);
   if (!published) throw new Error('invalid_published_order');
-  await publishLegacyOrderEvent(published, proof.customerCapabilityHash);
+  if (result.legacyEventStored !== true) {
+    try {
+      await publishLegacyOrderEvent(published, proof.customerCapabilityHash);
+    } catch {
+      // The canonical order is already durable; legacy analytics must not turn it into a failed checkout.
+    }
+  }
   return published;
+}
+
+async function manageOrder(payload, allowProxy = true) {
+  const request = { action: 'manage', ...payload };
+  const proxied = allowProxy ? await dataApiRequest(request) : null;
+  const result = proxied || await directCollector({ action: 'manage_order', payload });
+  const managed = sanitizeOrder(result.order);
+  if (!managed) throw new Error('invalid_managed_order');
+  return managed;
 }
 
 function legacyOrderEvent(order, customerCapabilityHash) {
@@ -336,6 +447,10 @@ function statusForOrderError(code) {
     'invalid_capability',
     'missing_customer_capability',
     'invalid_customer_capability',
+    'missing_participant_capability',
+    'invalid_participant_capability',
+    'missing_owner_capability',
+    'invalid_owner_capability',
     'forbidden',
   ].includes(code)) return 403;
   if ([
@@ -346,11 +461,19 @@ function statusForOrderError(code) {
     'order_reservation_conflict',
     'order_reservation_unverified',
     'order_transition_forbidden',
+    'order_manager_mismatch',
+    'deal_ownership_unclaimable',
+    'client_mutation_conflict',
+    'invalid_state_transition',
     'quantity_unavailable',
     'state_conflict',
   ].includes(code)) return 409;
-  if (code === 'group_not_found' || code === 'participant_not_found') return 404;
+  if (['group_not_found', 'participant_not_found', 'deal_not_found', 'order_not_found'].includes(code)) {
+    return 404;
+  }
   if (String(code).includes('not_configured')) return 503;
+  if (code === 'collector_busy') return 503;
+  if (code === 'upstream_timeout') return 504;
   if (String(code).startsWith('invalid_')) return 400;
   return 502;
 }
@@ -372,7 +495,7 @@ export default async function handler(request, response) {
     return response.status(400).json({ ok: false, error: 'invalid_request_body' });
   }
   const action = request.body?.action;
-  if (!['list', 'publish', 'list_group'].includes(action)) {
+  if (!['list', 'publish', 'list_group', 'manage'].includes(action)) {
     return response.status(400).json({ ok: false, error: 'invalid_action' });
   }
   if (action === 'list_group') {
@@ -381,6 +504,16 @@ export default async function handler(request, response) {
       return response.status(200).json({ ok: true, orders });
     } catch (error) {
       const code = error.code || error.message || 'group_order_sync_failed';
+      return response.status(error.status || statusForOrderError(code)).json({ ok: false, error: code });
+    }
+  }
+  if (action === 'manage') {
+    try {
+      const payload = manageRequest(request.body || {}, serviceRequest);
+      const order = await manageOrder(payload, !serviceRequest);
+      return response.status(200).json({ ok: true, order });
+    } catch (error) {
+      const code = error.code || error.message || 'order_manage_failed';
       return response.status(error.status || statusForOrderError(code)).json({ ok: false, error: code });
     }
   }
@@ -393,7 +526,8 @@ export default async function handler(request, response) {
     const proof = customerProof(request.body || {}, serviceRequest);
     if (order && order.visitorId !== proof.visitorId) throw requestError('invalid_order_owner');
     if (action === 'publish') {
-      const published = await publishOrder(order, proof, !serviceRequest);
+      const participantCapabilityHash = participantProof(request.body || {}, serviceRequest, order);
+      const published = await publishOrder(order, proof, participantCapabilityHash, !serviceRequest);
       return response.status(202).json({ ok: true, order: published });
     }
     const orders = await listOrders(customerPhone, proof, !serviceRequest);

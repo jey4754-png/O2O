@@ -1,3 +1,5 @@
+import { discountedPrice } from './utils.js';
+
 export const PRODUCT_CATEGORIES = Object.freeze([
   '음식·간편식',
   '카페·음료',
@@ -345,6 +347,59 @@ export function calculateProductAllocation(total, productQuantity, selectedQuant
     selectedAmount,
     hostSelectedAmount: selectedAmount + remainder,
     remainingQuantity: normalizedProductQuantity - normalizedSelectedQuantity,
+  };
+}
+
+export function calculateGroupDealAllocation(deal, productQuantity, selectedQuantity = 1) {
+  const total = deal?.source === 'merchant' && deal?.saleType === 'group'
+    ? discountedPrice(deal.originalPrice, deal.discountRate)
+    : Math.max(0, Math.floor(Number(deal?.originalPrice || 0)));
+  return calculateProductAllocation(total, productQuantity, selectedQuantity);
+}
+
+export function resolveGroupDealProgress(deal = {}, group = {}) {
+  const isMerchantGroup = deal.source === 'merchant' && deal.saleType === 'group';
+  const totalQuantity = Math.max(1, Math.floor(Number(
+    group.totalQuantity
+    ?? deal.totalQuantity
+    ?? deal.productQuantity
+    ?? deal.target
+    ?? 1,
+  )));
+  const targetCount = Math.max(1, Math.floor(Number(
+    group.targetCount
+    ?? deal.targetCount
+    ?? deal.targetPeople
+    ?? (isMerchantGroup ? Math.min(MAX_GROUP_PARTICIPANTS, totalQuantity) : deal.target)
+    ?? 1,
+  )));
+  const currentCount = Math.max(0, Math.floor(Number(
+    group.currentCount
+    ?? deal.currentCount
+    ?? deal.currentPeople
+    ?? deal.participantCount
+    ?? (isMerchantGroup ? 0 : deal.current)
+    ?? 0,
+  )));
+  const orderedQuantity = Math.max(0, Math.floor(Number(
+    group.orderedQuantity
+    ?? deal.orderedQuantity
+    ?? deal.allocatedProductQuantity
+    ?? deal.creatorQuantity
+    ?? (isMerchantGroup ? deal.current : currentCount)
+    ?? 0,
+  )));
+
+  return {
+    isMerchantGroup,
+    target: isMerchantGroup
+      ? Math.max(1, Math.floor(Number(deal.target ?? totalQuantity)))
+      : targetCount,
+    targetCount,
+    current: isMerchantGroup ? orderedQuantity : currentCount,
+    currentCount,
+    totalQuantity,
+    orderedQuantity,
   };
 }
 

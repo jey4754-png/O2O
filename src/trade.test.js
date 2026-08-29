@@ -9,6 +9,7 @@ import {
   PAYMENT_STATUS_LABELS,
   PRODUCT_CATEGORIES,
   appendTransitionHistory,
+  calculateGroupDealAllocation,
   calculateProductAllocation,
   calculateSplit,
   canTransitionGroupStatus,
@@ -18,6 +19,7 @@ import {
   getNextGroupStatus,
   getPreviousGroupStatus,
   normalizeCategory,
+  resolveGroupDealProgress,
   transitionGroupStatus,
   transitionPaymentStatus,
   validateTargetPeople,
@@ -234,6 +236,71 @@ test('calculateProductAllocation rejects invalid quantities', () => {
   assert.throws(() => calculateProductAllocation(41500, MAX_PRODUCT_QUANTITY + 1, 1), /between 1/);
   assert.throws(() => calculateProductAllocation(41500, 7, 8), /within the total/);
   assert.throws(() => calculateProductAllocation(41500, 7, 1.5), /within the total/);
+});
+
+test('merchant group allocation uses the discounted bundle total', () => {
+  const allocation = calculateGroupDealAllocation({
+    source: 'merchant',
+    saleType: 'group',
+    originalPrice: 10000,
+    discountRate: 10,
+  }, 4, 2);
+
+  assert.equal(allocation.total, 9000);
+  assert.equal(allocation.unitPrice, 2250);
+  assert.equal(allocation.selectedAmount, 4500);
+  assert.equal(calculateGroupDealAllocation({
+    source: 'customer',
+    originalPrice: 10000,
+    discountRate: 10,
+  }, 4).total, 10000);
+});
+
+test('merchant group progress keeps product quantities separate from participant counts', () => {
+  assert.deepEqual(resolveGroupDealProgress({
+    source: 'merchant',
+    saleType: 'group',
+    target: 80,
+    targetCount: 20,
+    current: 12,
+    currentCount: 12,
+    participantCount: 3,
+    totalQuantity: 80,
+    orderedQuantity: 12,
+  }, {
+    targetCount: 20,
+    currentCount: 3,
+    totalQuantity: 80,
+    orderedQuantity: 12,
+  }), {
+    isMerchantGroup: true,
+    target: 80,
+    targetCount: 20,
+    current: 12,
+    currentCount: 3,
+    totalQuantity: 80,
+    orderedQuantity: 12,
+  });
+
+  assert.deepEqual(resolveGroupDealProgress({
+    source: 'customer',
+    target: 3,
+    current: 1,
+    originalPrice: 39000,
+  }, {
+    targetCount: 4,
+    currentCount: 2,
+    totalQuantity: 7,
+    orderedQuantity: 5,
+  }), {
+    isMerchantGroup: false,
+    target: 4,
+    targetCount: 4,
+    current: 2,
+    currentCount: 2,
+    totalQuantity: 7,
+    orderedQuantity: 5,
+  });
 });
 
 test('target validation enforces max 20, current count, and post-purchase lock', () => {

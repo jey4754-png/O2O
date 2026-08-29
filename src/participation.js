@@ -11,7 +11,9 @@ export function canCancelParticipation(order = {}, deal = {}, groupRole = '') {
     return (deal.groupStatus || deal.status || 'recruiting') === 'recruiting'
       && groupRole === 'member';
   }
-  return deal.saleType === 'group';
+  if (deal.saleType !== 'group') return false;
+  if (order.groupId && ['creator', 'host', 'admin'].includes(groupRole)) return false;
+  return true;
 }
 
 export function cancelledOrderSnapshot(order = {}, {

@@ -33,7 +33,8 @@ import {
   GROUP_STATUS_LABELS,
   MAX_GROUP_PARTICIPANTS,
   PAYMENT_STATUS_LABELS,
-  calculateProductAllocation,
+  calculateGroupDealAllocation,
+  resolveGroupDealProgress,
 } from './trade';
 import { RELEASE_FEATURES } from './releasePhase';
 
@@ -48,6 +49,7 @@ const ERROR_MESSAGES = {
   quantity_reservation_closed: '모집이 종료되어 상품 수량을 추가할 수 없습니다.',
   host_already_claimed: '다른 참여자가 먼저 호스트로 확정되었습니다.',
   host_claim_closed: '현재는 호스트 지원을 받을 수 없는 상태입니다.',
+  host_order_required: '먼저 이 공동구매에 참여한 뒤 그룹 채팅에 입장해 주세요.',
   group_not_found: '그룹 데이터를 아직 찾을 수 없습니다. 잠시 후 다시 시도해 주세요.',
   chat_locked: '관리자가 채팅을 잠가 메시지를 보낼 수 없습니다.',
   state_conflict: '다른 사용자의 변경이 먼저 반영되었습니다. 최신 상태를 다시 불러왔습니다.',
@@ -153,11 +155,11 @@ export default function GroupRoom({
   );
   const totalQuantity = Math.max(1, Number(group?.totalQuantity || deal.totalQuantity || deal.productQuantity || deal.target || 1));
   const orderedQuantity = Math.max(0, Number(group?.orderedQuantity ?? deal.orderedQuantity ?? deal.creatorQuantity ?? deal.current ?? 0));
-  const paymentAllocation = useMemo(() => calculateProductAllocation(
-    Math.max(0, Math.floor(Number(deal.originalPrice || 0))),
+  const paymentAllocation = useMemo(() => calculateGroupDealAllocation(
+    deal,
     totalQuantity,
     Math.min(1, totalQuantity),
-  ), [deal.originalPrice, totalQuantity]);
+  ), [deal, totalQuantity]);
   useEffect(() => {
     setCredential(getGroupCredential(deal.id, actorId));
     setSnapshot(null);
@@ -205,6 +207,7 @@ export default function GroupRoom({
     let timer;
     let controller;
     let inFlight = false;
+    let retryDelay = 5000;
 
     const schedule = (delay = 5000) => {
       window.clearTimeout(timer);
@@ -223,16 +226,22 @@ export default function GroupRoom({
       controller = new AbortController();
       try {
         const next = await fetchGroupSnapshot(deal.id, { signal: controller.signal, actorId });
-        if (!cancelled) applySnapshot(next);
+        if (!cancelled) {
+          applySnapshot(next);
+          retryDelay = 5000;
+        }
       } catch (pollError) {
         if (!cancelled && pollError.name !== 'AbortError' && pollError.message !== 'group_not_found') {
           setError(errorMessage(pollError));
+          if ([502, 503, 504].includes(pollError.status)) {
+            retryDelay = Math.min(30000, retryDelay * 2);
+          }
         }
       } finally {
         inFlight = false;
         if (!cancelled) {
           setLoading(false);
-          schedule();
+          schedule(retryDelay);
         }
       }
     };
@@ -272,16 +281,20 @@ export default function GroupRoom({
 
   useEffect(() => {
     if (!group || !onDealUpdate) return;
-    const nextTarget = Number(group.targetCount || deal.target || 1);
-    const nextCurrent = Number(group.currentCount ?? deal.current ?? 0);
-    const nextTotalQuantity = Math.max(1, Number(group.totalQuantity || deal.totalQuantity || deal.productQuantity || nextTarget));
-    const nextOrderedQuantity = Math.max(0, Number(group.orderedQuantity ?? deal.orderedQuantity ?? deal.creatorQuantity ?? nextCurrent));
-    const nextAllocation = calculateProductAllocation(Number(deal.originalPrice || 0), nextTotalQuantity, Math.min(1, nextTotalQuantity));
+    const progress = resolveGroupDealProgress(deal, group);
+    const nextAllocation = calculateGroupDealAllocation(
+      deal,
+      progress.totalQuantity,
+      Math.min(1, progress.totalQuantity),
+    );
+    const previousProgress = resolveGroupDealProgress(deal);
     if (
-      nextTarget === Number(deal.target || 1)
-      && nextCurrent === Number(deal.current || 0)
-      && nextTotalQuantity === Number(deal.totalQuantity || deal.productQuantity || deal.target || 1)
-      && nextOrderedQuantity === Number(deal.orderedQuantity ?? deal.creatorQuantity ?? deal.current ?? 0)
+      progress.target === previousProgress.target
+      && progress.targetCount === previousProgress.targetCount
+      && progress.current === previousProgress.current
+      && progress.currentCount === previousProgress.currentCount
+      && progress.totalQuantity === previousProgress.totalQuantity
+      && progress.orderedQuantity === previousProgress.orderedQuantity
       && groupStatus === (deal.groupStatus || 'recruiting')
       && String(group.hostActorId || '') === String(deal.hostActorId || '')
       && String(group.hostMode || 'self') === String(deal.hostMode || 'self')
@@ -290,17 +303,17 @@ export default function GroupRoom({
     onDealUpdate({
       ...deal,
       groupId: group.groupId || group.id || deal.id,
-      target: nextTarget,
-      targetPeople: nextTarget,
-      targetCount: nextTarget,
-      current: nextCurrent,
-      currentPeople: nextCurrent,
-      currentCount: nextCurrent,
-      participantCount: nextCurrent,
-      totalQuantity: nextTotalQuantity,
-      productQuantity: nextTotalQuantity,
-      orderedQuantity: nextOrderedQuantity,
-      allocatedProductQuantity: nextOrderedQuantity,
+      target: progress.target,
+      targetPeople: progress.targetCount,
+      targetCount: progress.targetCount,
+      current: progress.current,
+      currentPeople: progress.currentCount,
+      currentCount: progress.currentCount,
+      participantCount: progress.currentCount,
+      totalQuantity: progress.totalQuantity,
+      productQuantity: progress.totalQuantity,
+      orderedQuantity: progress.orderedQuantity,
+      allocatedProductQuantity: progress.orderedQuantity,
       expectedPerPerson: nextAllocation.unitPrice,
       unitPrice: nextAllocation.unitPrice,
       unitRemainder: nextAllocation.remainder,
