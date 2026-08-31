@@ -164,8 +164,8 @@ export function normalizeSnapshot(result, groupId) {
 export function groupOperationRetryCount(error = {}) {
   const status = Number(error.status || 0);
   const code = String(error.code || error.message || '');
-  if (status === 503 || code === 'collector_busy') return 2;
-  if ([502, 504].includes(status) || code === 'upstream_timeout') return 1;
+  if (status === 503 || code === 'collector_busy') return 3;
+  if ([502, 504].includes(status) || code === 'upstream_timeout') return 2;
   return 0;
 }
 
@@ -214,7 +214,7 @@ async function requestGroupOperation(payload, signal) {
     } catch (error) {
       const retryCount = groupOperationRetryCount(error);
       if (signal?.aborted || attempt >= retryCount) throw error;
-      const delay = attempt === 0 ? 350 : 900;
+      const delay = Math.min(2400, 350 * (2 ** attempt)) + Math.floor(Math.random() * 180);
       attempt += 1;
       await waitForRetry(delay, signal);
     }

@@ -1,5 +1,10 @@
 import posthog from 'posthog-js';
 import { useEffect, useMemo, useRef } from 'react';
+import {
+  pendingCentralBackoffDelay,
+  pendingCentralBatch,
+  processPendingCentralBatch,
+} from './analyticsRetry';
 
 const VISITOR_KEY = 'o2o_mvp_visitor_id';
 const PROFILE_KEY = 'o2o_mvp_profile';
@@ -83,6 +88,9 @@ let volatileSessionId = null;
 let volatileProfile = null;
 const centralRequests = new Map();
 let centralQueue = Promise.resolve();
+let pendingFlushPromise = null;
+let pendingCentralFailureCount = 0;
+let pendingCentralRetryAt = 0;
 
 function sanitizeAnalyticsProperties(input, {
   maxString = 2000,
@@ -238,6 +246,8 @@ export function saveProfile(profile) {
 
 export function flushPendingEvents(profile = getProfile()) {
   if (!profile) return Promise.resolve([]);
+  if (pendingFlushPromise) return pendingFlushPromise;
+  if (Date.now() < pendingCentralRetryAt) return Promise.resolve([]);
   const events = getEvents();
   const pending = events.filter((event) => event.pendingCentral);
   if (pending.length === 0) return Promise.resolve([]);
@@ -266,7 +276,22 @@ export function flushPendingEvents(profile = getProfile()) {
 
   persistEvents(normalized);
   const pendingIds = new Set(pending.map((event) => event.id));
-  return Promise.all(normalized.filter((event) => pendingIds.has(event.id)).map(collectEvent));
+  const batch = pendingCentralBatch(normalized, pendingIds);
+  pendingFlushPromise = processPendingCentralBatch(batch, collectEvent)
+    .then((results) => {
+      if (results.some((stored) => !stored)) {
+        pendingCentralFailureCount += 1;
+        pendingCentralRetryAt = Date.now() + pendingCentralBackoffDelay(pendingCentralFailureCount);
+      } else {
+        pendingCentralFailureCount = 0;
+        pendingCentralRetryAt = 0;
+      }
+      return results;
+    })
+    .finally(() => {
+      pendingFlushPromise = null;
+    });
+  return pendingFlushPromise;
 }
 
 export function clearProfile() {

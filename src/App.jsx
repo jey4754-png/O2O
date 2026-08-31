@@ -72,6 +72,7 @@ import {
   checkoutNeedsDurableOrderSync,
   completeCheckoutAttempt,
   isTerminalOrderSyncError,
+  publishCustomerOrderRequest,
 } from './checkoutAttempt';
 import {
   calculateProductAllocation,
@@ -80,7 +81,17 @@ import {
   GROUP_STATUS_LABELS,
   normalizeCategory,
   PRODUCT_CATEGORIES,
+  resolveOwnerProductQuantity,
 } from './trade';
+import {
+  adoptLegacyOwnerScopes,
+  assignOwnerDealScope,
+  chunkOwnerCapabilities,
+  isOwnerDealId,
+  isOwnerDealInScope,
+  ownerScopeKey,
+  scopedOwnerCapabilityEntries,
+} from './ownerCapabilities';
 import {
   clearProfile,
   clearEvents,
@@ -112,6 +123,8 @@ const PUBLIC_DEAL_SYNCED_KEY = 'o2o_mvp_public_deal_sync_fingerprints';
 const CUSTOMER_ORDER_SYNCED_KEY = 'o2o_mvp_customer_order_sync_fingerprints';
 const CUSTOMER_ORDER_SYNC_ISSUES_KEY = 'o2o_mvp_customer_order_sync_issues_v1';
 const PUBLIC_DEAL_CAPABILITIES_KEY = 'o2o_mvp_public_deal_capabilities_v1';
+const OWNER_DEAL_SCOPES_KEY = 'o2o_mvp_owner_deal_scopes_v1';
+const OWNER_SCOPE_MIGRATION_KEY = 'o2o_mvp_owner_scope_migration_v1';
 const CUSTOMER_ORDER_CAPABILITY_KEY = 'o2o_mvp_customer_order_capability_v1';
 const GROUP_STATUS_SEEN_KEY = 'o2o_mvp_group_status_seen_v1';
 const COUNTED_PARTICIPATIONS_KEY = 'o2o_mvp_counted_participations';
@@ -226,13 +239,27 @@ function createClientCapability(prefix) {
   return `${prefix}-${random()}-${random()}-${random()}`;
 }
 
-function getDealCapability(dealId, { create = false } = {}) {
+function getDealCapability(dealId, { create = false, ownerScope = ownerScopeKey(getProfile()) } = {}) {
   const capabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
+  if (isOwnerDealId(dealId)) {
+    const scopeByDeal = loadJson(OWNER_DEAL_SCOPES_KEY, {});
+    if (!isOwnerDealInScope(dealId, scopeByDeal, ownerScope)) {
+      if (!create) return '';
+      const assignment = assignOwnerDealScope(scopeByDeal, dealId, ownerScope);
+      if (!assignment.allowed) return '';
+      if (assignment.changed && !saveJson(OWNER_DEAL_SCOPES_KEY, assignment.scopeByDeal)) return '';
+    }
+  }
   if (!capabilities[dealId] && create) {
     capabilities[dealId] = createClientCapability('deal');
-    saveJson(PUBLIC_DEAL_CAPABILITIES_KEY, capabilities);
+    if (!saveJson(PUBLIC_DEAL_CAPABILITIES_KEY, capabilities)) return '';
   }
   return capabilities[dealId] || '';
+}
+
+function getOwnerCapabilityEntries(ownerScope, scopeByDeal) {
+  const capabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
+  return scopedOwnerCapabilityEntries(capabilities, scopeByDeal, ownerScope);
 }
 
 function getCustomerOrderCapability() {
@@ -348,6 +375,41 @@ async function fetchPublicDeals() {
   }
 }
 
+async function fetchOwnedRecords(endpoint, resultKey, capabilities) {
+  const batches = chunkOwnerCapabilities(capabilities);
+  if (!batches.length) return [];
+  try {
+    const records = [];
+    for (const batch of batches) {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'list_owner', capabilities: batch }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result.ok || !Array.isArray(result[resultKey])) return null;
+      records.push(...result[resultKey]);
+    }
+    return records;
+  } catch {
+    return null;
+  }
+}
+
+async function fetchOwnedPublicDeals(capabilities) {
+  const records = await fetchOwnedRecords('/api/public-deals', 'deals', capabilities);
+  if (!records) return null;
+  return records.map((deal) => migrateMerchantSplitDeal({
+      ...migrateLocationFields(deal),
+      category: normalizeCategory(deal.category),
+    }));
+}
+
+async function fetchOwnedCustomerOrders(capabilities) {
+  const records = await fetchOwnedRecords('/api/customer-orders', 'orders', capabilities);
+  return records ? records.map((order) => migrateLocationFields(order)) : null;
+}
+
 async function publishPublicDeal(deal) {
   try {
     const capabilityToken = getDealCapability(deal.id, { create: true });
@@ -399,33 +461,15 @@ async function publishCustomerOrder(order, options = {}) {
         order.participantActorId || order.visitorId || getVisitorId(),
       )
       : null;
-    const response = await fetch('/api/customer-orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'publish',
-        order,
-        visitorId: order.visitorId || getVisitorId(),
-        customerCapabilityToken: getCustomerOrderCapability(),
-        ...(order.groupId && participantCredential?.capabilityToken
-          ? { participantCapabilityToken: participantCredential.capabilityToken }
-          : {}),
-      }),
+    return await publishCustomerOrderRequest({
+      action: 'publish',
+      order,
+      visitorId: order.visitorId || getVisitorId(),
+      customerCapabilityToken: getCustomerOrderCapability(),
+      ...(order.groupId && participantCredential?.capabilityToken
+        ? { participantCapabilityToken: participantCredential.capabilityToken }
+        : {}),
     });
-    let result = {};
-    try {
-      result = await response.json();
-    } catch {
-      result = {};
-    }
-    if (!response.ok || !result.ok) {
-      const error = new Error(result.error || 'order_sync_failed');
-      error.code = result.error || 'order_sync_failed';
-      error.status = response.status;
-      if (options.throwOnError) throw error;
-      return null;
-    }
-    return result.order;
   } catch (error) {
     if (options.throwOnError) throw error;
     return null;
@@ -771,9 +815,13 @@ function App() {
   const [customerScreen, setCustomerScreen] = useState(profile ? 'list' : 'onboarding');
   const [ownerScreen, setOwnerScreen] = useState('form');
   const [createdDeals, setCreatedDeals] = useState(() => loadCreatedDeals());
+  const [ownerScopeByDeal, setOwnerScopeByDeal] = useState(() => loadJson(OWNER_DEAL_SCOPES_KEY, {}));
+  const [ownedDeals, setOwnedDeals] = useState([]);
+  const [ownerWorkspaceScope, setOwnerWorkspaceScope] = useState('');
   const [customerGroups, setCustomerGroups] = useState(() => loadCustomerGroups());
   const [remoteDeals, setRemoteDeals] = useState([]);
   const [orders, setOrders] = useState(() => loadOrders());
+  const [ownerOrders, setOwnerOrders] = useState([]);
   const [orderSyncIssues, setOrderSyncIssues] = useState(() => loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {}));
   const [favoriteIds, setFavoriteIds] = useState(() => loadJson(FAVORITES_KEY, []));
   const [hostDealIds, setHostDealIds] = useState(() => loadJson(HOST_DEALS_KEY, []));
@@ -781,6 +829,13 @@ function App() {
   const [unreadCounts, setUnreadCounts] = useState({});
   const [statusNotices, setStatusNotices] = useState({});
   const [handledDeepLink, setHandledDeepLink] = useState('');
+  const activeOwnerScope = useMemo(() => ownerScopeKey(profile), [profile]);
+  const scopedCreatedDeals = useMemo(() => createdDeals.filter((deal) => (
+    deal?.source === 'merchant'
+    && isOwnerDealInScope(deal.id, ownerScopeByDeal, activeOwnerScope)
+  )), [activeOwnerScope, createdDeals, ownerScopeByDeal]);
+  const scopedOwnedDeals = ownerWorkspaceScope === activeOwnerScope ? ownedDeals : [];
+  const scopedOwnerOrders = ownerWorkspaceScope === activeOwnerScope ? ownerOrders : [];
 
   const updateOrderSyncIssue = useCallback((orderId, issue = null) => {
     if (!orderId) return;
@@ -804,6 +859,33 @@ function App() {
     ),
     [createdDeals, customerGroups, remoteDeals],
   );
+
+  useEffect(() => {
+    if (route !== '/owner' || !activeOwnerScope) return;
+    const migrationState = loadJson(OWNER_SCOPE_MIGRATION_KEY, {});
+    const result = adoptLegacyOwnerScopes({
+      capabilities: loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {}),
+      scopeByDeal: loadJson(OWNER_DEAL_SCOPES_KEY, {}),
+      ownerScope: activeOwnerScope,
+      createdDeals,
+      migrationCompleted: migrationState.completed === true,
+    });
+    if (migrationState.completed === true) return;
+    if (result.changed && !saveJson(OWNER_DEAL_SCOPES_KEY, result.scopeByDeal)) return;
+    setOwnerScopeByDeal(result.scopeByDeal);
+    saveJson(OWNER_SCOPE_MIGRATION_KEY, {
+      completed: result.migrationCompleted,
+      ownerScope: activeOwnerScope,
+      migratedAt: new Date().toISOString(),
+    });
+  }, [activeOwnerScope, createdDeals, route]);
+
+  useEffect(() => {
+    setOwnedDeals([]);
+    setOwnerOrders([]);
+    setOwnerWorkspaceScope(activeOwnerScope);
+    setOwnerScreen('form');
+  }, [activeOwnerScope]);
 
   useEffect(() => {
     setSelectedDeal((current) => {
@@ -896,6 +978,46 @@ function App() {
   }, []);
 
   useEffect(() => {
+    if (route !== '/owner' || !activeOwnerScope) {
+      return undefined;
+    }
+    let cancelled = false;
+    let refreshing = false;
+    const refreshOwnerWorkspace = async () => {
+      if (refreshing || document.visibilityState === 'hidden') return;
+      const capabilities = getOwnerCapabilityEntries(activeOwnerScope, ownerScopeByDeal);
+      refreshing = true;
+      try {
+        const [nextDeals, nextOrders] = await Promise.all([
+          fetchOwnedPublicDeals(capabilities),
+          fetchOwnedCustomerOrders(capabilities),
+        ]);
+        if (cancelled) return;
+        if (nextDeals) setOwnedDeals(nextDeals);
+        if (nextOrders) setOwnerOrders(nextOrders);
+        setOwnerWorkspaceScope(activeOwnerScope);
+      } finally {
+        refreshing = false;
+      }
+    };
+    const handleVisible = () => {
+      if (document.visibilityState === 'visible') refreshOwnerWorkspace();
+    };
+    refreshOwnerWorkspace();
+    const timer = window.setInterval(refreshOwnerWorkspace, CUSTOMER_ORDER_SYNC_INTERVAL_MS);
+    window.addEventListener('focus', refreshOwnerWorkspace);
+    window.addEventListener('online', refreshOwnerWorkspace);
+    document.addEventListener('visibilitychange', handleVisible);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshOwnerWorkspace);
+      window.removeEventListener('online', refreshOwnerWorkspace);
+      document.removeEventListener('visibilitychange', handleVisible);
+    };
+  }, [activeOwnerScope, ownerScopeByDeal, route]);
+
+  useEffect(() => {
     if (!RELEASE_FEATURES.deepLinks || !profile || !['/customer', '/admin'].includes(route)) return;
     const groupId = new URLSearchParams(window.location.search).get('group');
     if (!groupId) return;
@@ -954,7 +1076,7 @@ function App() {
     let syncing = false;
     const syncPendingDeals = async () => {
       if (syncing) return;
-      const localPublicDeals = [...createdDeals, ...customerGroups]
+      const localPublicDeals = [...scopedCreatedDeals, ...customerGroups]
         .filter((deal) => deal.visibility === 'public');
       if (!localPublicDeals.length) return;
       const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
@@ -998,7 +1120,7 @@ function App() {
       window.removeEventListener('pageshow', syncPendingDeals);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [createdDeals, customerGroups]);
+  }, [customerGroups, scopedCreatedDeals]);
 
   useEffect(() => {
     const handlePopState = () => {
@@ -1007,6 +1129,9 @@ function App() {
     };
     const handleStorage = (event) => {
       if (event.key === CREATED_DEALS_KEY) setCreatedDeals(loadCreatedDeals());
+      if (event.key === OWNER_DEAL_SCOPES_KEY) {
+        setOwnerScopeByDeal(loadJson(OWNER_DEAL_SCOPES_KEY, {}));
+      }
       if (event.key === CUSTOMER_GROUPS_KEY) setCustomerGroups(loadCustomerGroups());
       if (event.key === CUSTOMER_ORDERS_KEY) setOrders(loadOrders());
       if ([OWNER_LOCATION_KEY, OWNER_NEIGHBORHOOD_KEY].includes(event.key)) {
@@ -1255,8 +1380,16 @@ function App() {
   };
 
   const addOwnerDeal = (ownerProduct, editingId = null) => {
+    if (!activeOwnerScope || (editingId && !isOwnerDealInScope(
+      editingId,
+      ownerScopeByDeal,
+      activeOwnerScope,
+    ))) {
+      return false;
+    }
     const previous = editingId
-      ? createdDeals.find((deal) => deal.id === editingId)
+      ? scopedCreatedDeals.find((deal) => deal.id === editingId)
+        || scopedOwnedDeals.find((deal) => deal.id === editingId)
       : null;
     const centralVersion = editingId
       ? remoteDeals.find((deal) => deal.id === editingId)
@@ -1269,9 +1402,12 @@ function App() {
       );
     const hasActiveGroupOrders = previous?.saleType === 'group' && previousOrderedQuantity > 0;
     const splitPricing = ownerProduct.saleType === 'group' || hasActiveGroupOrders;
-    const requestedTotalQuantity = Math.min(999, Math.max(1, Math.floor(Number(
-      splitPricing ? ownerProduct.maxQuantity : ownerProduct.stock,
-    ) || 1)));
+    const requestedTotalQuantity = resolveOwnerProductQuantity({
+      saleType: splitPricing ? 'group' : ownerProduct.saleType,
+      stock: ownerProduct.stock,
+      maxQuantity: ownerProduct.maxQuantity,
+      minimumGroupQuantity: splitPricing ? previousOrderedQuantity : 1,
+    }).quantity;
     const totalQuantity = splitPricing
       ? Math.max(requestedTotalQuantity, Math.ceil(previousOrderedQuantity))
       : requestedTotalQuantity;
@@ -1279,6 +1415,12 @@ function App() {
     const splitAllocation = calculateProductAllocation(discountedTotal, totalQuantity, 1);
     const orderedQuantity = editingId ? previousOrderedQuantity : 0;
     const dealId = editingId || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`;
+    const capabilityToken = getDealCapability(dealId, {
+      create: true,
+      ownerScope: activeOwnerScope,
+    });
+    if (!capabilityToken) return false;
+    setOwnerScopeByDeal(loadJson(OWNER_DEAL_SCOPES_KEY, {}));
     const deal = {
       id: dealId,
       createdAt: previous?.createdAt || new Date().toISOString(),
@@ -1296,7 +1438,7 @@ function App() {
       distance: '테스트 매장',
       deadline: ownerProduct.deadline,
       methods: ownerProduct.methods,
-      stock: Number(ownerProduct.stock),
+      stock: totalQuantity,
       eventStart: ownerProduct.eventStart,
       eventEnd: ownerProduct.eventEnd,
       originalPrice: Number(ownerProduct.originalPrice),
@@ -1346,8 +1488,11 @@ function App() {
       saveCreatedDeals(next);
       return next;
     });
+    setOwnerWorkspaceScope(activeOwnerScope);
+    setOwnedDeals((current) => mergeDeals([deal], current.filter((item) => item.id !== deal.id)));
     setSelectedDeal(deal);
     setOwnerScreen('done');
+    return true;
   };
 
   const updateCustomerDeal = async (deal, options = {}) => {
@@ -1424,6 +1569,7 @@ function App() {
         saveCreatedDeals(next);
         return next;
       });
+      setOwnedDeals((current) => current.filter((item) => item.id !== deal.id));
     }
     setRemoteDeals((current) => current.filter((item) => item.id !== deal.id));
     const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
@@ -1915,8 +2061,17 @@ function App() {
     return cancelledOrder;
   };
 
-  const persistManagedOrder = (managedOrder) => {
-    const existingOrder = orders.find((item) => item.id === managedOrder.id) || {};
+  const persistManagedOrder = (managedOrder, expectedOwnerScope) => {
+    if (
+      !expectedOwnerScope
+      || ownerScopeKey(getProfile()) !== expectedOwnerScope
+      || !isOwnerDealInScope(managedOrder?.dealId, ownerScopeByDeal, expectedOwnerScope)
+    ) {
+      return false;
+    }
+    const existingOrder = orders.find((item) => item.id === managedOrder.id)
+      || scopedOwnerOrders.find((item) => item.id === managedOrder.id)
+      || {};
     const mergedManagedOrder = {
       ...existingOrder,
       ...managedOrder,
@@ -1931,24 +2086,30 @@ function App() {
       saveJson(CUSTOMER_ORDERS_KEY, next);
       return next;
     });
+    setOwnerWorkspaceScope(expectedOwnerScope);
+    setOwnerOrders((current) => mergeOrders(current, [mergedManagedOrder]));
     const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
     fingerprints[managedOrder.id] = orderSyncFingerprint(mergedManagedOrder);
     saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+    return true;
   };
 
   const updateOrderStatus = async (orderId, direction = 'next') => {
-    const order = orders.find((item) => item.id === orderId);
+    const requestOwnerScope = activeOwnerScope;
+    const order = orders.find((item) => item.id === orderId)
+      || scopedOwnerOrders.find((item) => item.id === orderId);
     if (!order || isCancelledOrder(order)) return;
     const currentStage = getOrderStage(order);
     const currentIndex = ORDER_STAGES.findIndex((stage) => stage.id === currentStage.id);
     const nextStage = ORDER_STAGES[currentIndex + (direction === 'previous' ? -1 : 1)];
     if (!nextStage) return;
     const deal = deals.find((item) => item.id === order.dealId) || order.deal || {};
+    if (!isOwnerDealInScope(deal.id, ownerScopeByDeal, requestOwnerScope)) return;
     const managedOrder = await manageCustomerOrder(order, deal, {
       kind: 'order_status',
       direction,
     });
-    persistManagedOrder(managedOrder);
+    if (!persistManagedOrder(managedOrder, requestOwnerScope)) return;
     track('owner_order_status_changed', {
       order_id: orderId,
       deal_id: order.dealId,
@@ -1991,16 +2152,19 @@ function App() {
   };
 
   const confirmManualPayment = async (orderId, direction = 'next') => {
-    const order = orders.find((item) => item.id === orderId);
+    const requestOwnerScope = activeOwnerScope;
+    const order = orders.find((item) => item.id === orderId)
+      || scopedOwnerOrders.find((item) => item.id === orderId);
     if (!order || isCancelledOrder(order) || order.type !== 'purchase') return;
     if (direction === 'next' && order.paymentConfirmedAt) return;
     if (direction === 'previous' && !order.paymentConfirmedAt) return;
     const deal = deals.find((item) => item.id === order.dealId) || order.deal || {};
+    if (!isOwnerDealInScope(deal.id, ownerScopeByDeal, requestOwnerScope)) return;
     const managedOrder = await manageCustomerOrder(order, deal, {
       kind: 'payment_status',
       direction,
     });
-    persistManagedOrder(managedOrder);
+    if (!persistManagedOrder(managedOrder, requestOwnerScope)) return;
     track(direction === 'previous' ? 'manual_payment_confirmation_reverted' : 'manual_payment_confirmed', {
       order_id: orderId,
       deal_id: order.dealId,
@@ -2159,14 +2323,17 @@ function App() {
             <Onboarding onSubmit={handleProfileSubmit} defaultTesterType="사장님" lockTesterType />
           ) : (
             <OwnerApp
-              screen={ownerScreen}
+              key={activeOwnerScope}
+              screen={ownerWorkspaceScope === activeOwnerScope ? ownerScreen : 'form'}
               selectedDeal={selectedDeal}
               deals={deals}
               onScreen={setOwnerScreen}
               onCreate={addOwnerDeal}
-              createdDeals={createdDeals}
+              createdDeals={scopedCreatedDeals}
+              ownedDeals={scopedOwnedDeals}
               onDeleteDeal={removeDeal}
               orders={orders}
+              ownerOrders={scopedOwnerOrders}
               onOrderStatusChange={updateOrderStatus}
               onPaymentConfirm={confirmManualPayment}
               onPreviewCustomer={openOwnerCustomerPreview}
@@ -4529,7 +4696,9 @@ function OwnerApp({
   selectedDeal,
   deals,
   createdDeals,
+  ownedDeals,
   orders,
+  ownerOrders,
   location,
   onScreen,
   onCreate,
@@ -4541,31 +4710,49 @@ function OwnerApp({
 }) {
   const [formVersion, setFormVersion] = useState(0);
   const [editingDeal, setEditingDeal] = useState(null);
-  const neighborhoodOrders = orders.filter(
-    (order) => ['purchase', 'group'].includes(order.type)
-      && (!order.neighborhood || sameLocation(order, location)),
+  const managedOwnerDeals = useMemo(() => {
+    const centralById = new Map(deals.map((deal) => [deal.id, deal]));
+    return mergeDeals(createdDeals, ownedDeals).map((ownedDeal) => {
+      const centralDeal = centralById.get(ownedDeal.id);
+      if (!centralDeal) return ownedDeal;
+      const orderedQuantity = Number(centralDeal.orderedQuantity ?? centralDeal.current ?? 0);
+      return {
+        ...ownedDeal,
+        orderedQuantity,
+        allocatedProductQuantity: orderedQuantity,
+        current: orderedQuantity,
+        currentCount: Number(centralDeal.currentCount ?? orderedQuantity),
+        participantCount: Number(centralDeal.participantCount || 0),
+      };
+    });
+  }, [createdDeals, deals, ownedDeals]);
+  const ownerDealIds = useMemo(
+    () => new Set(managedOwnerDeals.map((deal) => deal.id)),
+    [managedOwnerDeals],
   );
+  const neighborhoodOrders = useMemo(() => mergeOrders(ownerOrders, orders).filter(
+    (order) => ['purchase', 'group'].includes(order.type)
+      && ownerDealIds.has(order.dealId)
+      && (!order.neighborhood || sameLocation(order, location)),
+  ), [location, orders, ownerDealIds, ownerOrders]);
+  const orderSummaries = useMemo(() => managedOwnerDeals.flatMap((deal) => {
+    if (!sameLocation(deal, location)) return [];
+    const detailedQuantity = neighborhoodOrders
+      .filter((order) => order.dealId === deal.id && !isCancelledOrder(order))
+      .reduce((total, order) => total + Math.max(1, Number(order.selectedCount ?? order.quantity ?? 1)), 0);
+    const centralQuantity = Math.max(0, Number(deal.orderedQuantity ?? deal.current ?? 0));
+    const pendingQuantity = Math.max(0, centralQuantity - detailedQuantity);
+    return pendingQuantity > 0 ? [{ deal, pendingQuantity, centralQuantity }] : [];
+  }), [location, managedOwnerDeals, neighborhoodOrders]);
   const neighborhoodGroups = deals.filter(
     (deal) => deal.source === 'customer' && sameLocation(deal, location),
   );
-  const managedOwnerDeals = createdDeals.map((localDeal) => {
-    const centralDeal = deals.find((deal) => deal.id === localDeal.id);
-    if (!centralDeal) return localDeal;
-    const orderedQuantity = Number(centralDeal.orderedQuantity ?? centralDeal.current ?? 0);
-    return {
-      ...localDeal,
-      orderedQuantity,
-      allocatedProductQuantity: orderedQuantity,
-      current: orderedQuantity,
-      currentCount: Number(centralDeal.currentCount ?? orderedQuantity),
-      participantCount: Number(centralDeal.participantCount || 0),
-    };
-  });
 
   if (screen === 'orders') {
     return (
       <OwnerOrders
         orders={neighborhoodOrders}
+        summaries={orderSummaries}
         location={location}
         onBack={() => onScreen('form')}
         onStatusChange={onOrderStatusChange}
@@ -4611,7 +4798,7 @@ function OwnerApp({
       }}
       onOpenOrders={() => onScreen('orders')}
       onOpenProducts={() => onScreen('products')}
-      orderCount={neighborhoodOrders.length}
+      orderCount={neighborhoodOrders.length + orderSummaries.length}
       communityGroups={neighborhoodGroups}
       location={location}
       onNeighborhoodChange={onNeighborhoodChange}
@@ -4648,7 +4835,7 @@ function OwnerForm({
     description: '',
     originalPrice: '',
     discountRate: 15,
-    stock: 0,
+    stock: 1,
     maxQuantity: 1,
     deadlineDate: new Date().toISOString().slice(0, 10),
     deadlineTime: '20:00',
@@ -4666,7 +4853,13 @@ function OwnerForm({
       description: initialDeal.description || '',
       originalPrice: String(initialDeal.originalPrice || ''),
       discountRate: Number(initialDeal.discountRate || 0),
-      stock: Number(initialDeal.stock || 0),
+      stock: Math.max(1, Number(
+        initialDeal.stock
+        || initialDeal.totalQuantity
+        || initialDeal.productQuantity
+        || initialDeal.target
+        || 1,
+      )),
       maxQuantity: Math.max(
         activeAllocatedQuantity,
         Number(initialDeal.totalQuantity || initialDeal.productQuantity || initialDeal.target || 1),
@@ -4687,7 +4880,13 @@ function OwnerForm({
   const selectedDistrict = getDistrict(selectedRegion, form.district);
 
   const price = discountedPrice(form.originalPrice, form.discountRate);
-  const groupTotalQuantity = Math.min(999, Math.max(1, Math.floor(Number(form.maxQuantity || 1))));
+  const canonicalQuantity = resolveOwnerProductQuantity({
+    saleType: form.saleType,
+    stock: form.stock,
+    maxQuantity: form.maxQuantity,
+    minimumGroupQuantity: activeAllocatedQuantity,
+  });
+  const groupTotalQuantity = canonicalQuantity.quantity;
   const groupPricePreview = calculateProductAllocation(price, groupTotalQuantity, 1);
 
   const toggleMethod = (method) => {
@@ -4861,9 +5060,9 @@ function OwnerForm({
             discount_rate: Number(form.discountRate),
             calculated_price: price,
             expected_per_item: form.saleType === 'group' ? groupPricePreview.unitPrice : price,
-            total_quantity: form.saleType === 'group' ? groupTotalQuantity : Number(form.stock),
-            stock: Number(form.stock),
-            max_quantity: Number(form.maxQuantity),
+            total_quantity: canonicalQuantity.quantity,
+            stock: canonicalQuantity.stock,
+            max_quantity: canonicalQuantity.maxQuantity,
             deadline: payload.deadline,
             pickup_place: form.pickupPlace,
             methods: form.methods,
@@ -4944,13 +5143,7 @@ function OwnerForm({
         </div>
 
         <div className="creator-grid">
-          <FieldCounter
-            label={form.saleType === 'instant' ? '재고 수량' : '재고'}
-            value={form.stock}
-            onMinus={() => setForm({ ...form, stock: clamp(form.stock - 1, 0, 999) })}
-            onPlus={() => setForm({ ...form, stock: clamp(form.stock + 1, 0, 999) })}
-          />
-          {form.saleType === 'group' && (
+          {form.saleType === 'group' ? (
             <FieldCounter
               label="공구 총수량"
               value={form.maxQuantity}
@@ -4959,6 +5152,13 @@ function OwnerForm({
                 maxQuantity: clamp(form.maxQuantity - 1, Math.max(1, activeAllocatedQuantity), 999),
               })}
               onPlus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity + 1, 1, 999) })}
+            />
+          ) : (
+            <FieldCounter
+              label="재고 수량"
+              value={form.stock}
+              onMinus={() => setForm({ ...form, stock: clamp(form.stock - 1, 1, 999) })}
+              onPlus={() => setForm({ ...form, stock: clamp(form.stock + 1, 1, 999) })}
             />
           )}
         </div>
@@ -4971,7 +5171,7 @@ function OwnerForm({
               <span>할인 묶음 총액 {formatWon(groupPricePreview.total)}</span>
               <strong>총 {groupPricePreview.productQuantity}개</strong>
             </div>
-            <p>묶음 총액을 공구 총수량으로 나누어 참여자의 수량별 금액을 자동 계산합니다.</p>
+            <p>공구 총수량은 주문 가능한 전체 수량과 제품 1개 예상금액 계산에 사용됩니다.</p>
             <p>상품 등록을 완료하면 같은 정보로 사용자 공동구매가 한 번만 생성됩니다.</p>
             {activeAllocatedQuantity > 0 && (
               <p>현재 주문 {activeAllocatedQuantity}개가 있어 공구 총수량은 이보다 작게 줄일 수 없습니다.</p>
@@ -5196,8 +5396,12 @@ function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
   );
 }
 
-function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfirm }) {
-  useScreenAnalytics('owner_orders', { order_count: orders.length, ...normalizeLocation(location) });
+function OwnerOrders({ orders, summaries = [], location, onBack, onStatusChange, onPaymentConfirm }) {
+  useScreenAnalytics('owner_orders', {
+    order_count: orders.length,
+    aggregate_order_count: summaries.length,
+    ...normalizeLocation(location),
+  });
   const [busyAction, setBusyAction] = useState('');
   const [actionError, setActionError] = useState('');
 
@@ -5228,7 +5432,7 @@ function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfir
           <ArrowLeft size={22} />
         </button>
         <h1>주문 관리</h1>
-        <span className="order-count-badge">{location.neighborhood} · {orders.length}건</span>
+        <span className="order-count-badge">{location.neighborhood} · {orders.length + summaries.length}건</span>
       </header>
 
       <div className="neighborhood-sync-banner owner-sync-banner">
@@ -5249,7 +5453,7 @@ function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfir
         ))}
       </div>
 
-      {orders.length === 0 ? (
+      {orders.length === 0 && summaries.length === 0 ? (
         <EmptyCustomerState
           icon={ShoppingBag}
           title="신규 주문이 없습니다"
@@ -5259,6 +5463,24 @@ function OwnerOrders({ orders, location, onBack, onStatusChange, onPaymentConfir
         />
       ) : (
         <div className="owner-order-list">
+          {summaries.map(({ deal, pendingQuantity, centralQuantity }) => (
+            <article className="owner-order-card" key={`summary-${deal.id}`}>
+              <div className="owner-order-heading">
+                <div>
+                  <span>서버 주문 집계</span>
+                  <h2>{deal.title}</h2>
+                </div>
+                <strong>주문 {centralQuantity}개</strong>
+              </div>
+              <p>{deal.store} · 상세 주문 {pendingQuantity}개 동기화 중</p>
+              <div className="manual-payment-state">
+                <div>
+                  <strong>주문 수량은 정상 반영됨</strong>
+                  <span>사용자별 연락처와 상태는 서버에서 다시 불러오고 있습니다.</span>
+                </div>
+              </div>
+            </article>
+          ))}
           {orders.map((order) => {
             const cancelled = isCancelledOrder(order);
             const stage = getOrderStage(order);

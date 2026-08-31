@@ -14,8 +14,8 @@ import {
 } from './groupApi.js';
 
 test('only transient group API failures receive a bounded retry budget', () => {
-  assert.equal(groupOperationRetryCount({ status: 503, code: 'collector_busy' }), 2);
-  assert.equal(groupOperationRetryCount({ status: 504, code: 'upstream_timeout' }), 1);
+  assert.equal(groupOperationRetryCount({ status: 503, code: 'collector_busy' }), 3);
+  assert.equal(groupOperationRetryCount({ status: 504, code: 'upstream_timeout' }), 2);
   assert.equal(groupOperationRetryCount({ status: 409, code: 'state_conflict' }), 0);
   assert.equal(groupOperationRetryCount({ status: 403, code: 'forbidden' }), 0);
 });

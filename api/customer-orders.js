@@ -5,6 +5,8 @@ const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
 const ORDER_EVENT = 'customer_order_snapshot';
 const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
 const CAPABILITY_HASH_PATTERN = /^[a-f0-9]{64}$/;
+const OWNER_DEAL_ID_PATTERN = /^owner-[a-zA-Z0-9-]{1,100}$/;
+const OWNER_CLAIM_LIMIT = 50;
 
 export const config = { maxDuration: 60 };
 
@@ -80,6 +82,35 @@ function capabilityProof(body, serviceRequest, {
   if (!token && !required) return '';
   if (token.length < 32) throw requestError(missingCode, 403);
   return sha256(token);
+}
+
+function ownerClaims(body, serviceRequest) {
+  const input = body?.ownerClaims ?? body?.capabilities;
+  if (!Array.isArray(input) || input.length < 1 || input.length > OWNER_CLAIM_LIMIT) {
+    throw requestError('invalid_owner_claims');
+  }
+  const seen = new Set();
+  return input.map((claim) => {
+    const dealId = String(claim?.dealId ?? '');
+    if (!OWNER_DEAL_ID_PATTERN.test(dealId) || seen.has(dealId)) {
+      throw requestError('invalid_owner_claims');
+    }
+    seen.add(dealId);
+    let ownerCapabilityHash = '';
+    if (serviceRequest) {
+      const hash = String(claim?.ownerCapabilityHash ?? '').toLowerCase();
+      if (!CAPABILITY_HASH_PATTERN.test(hash)) {
+        throw requestError('invalid_owner_capability', 403);
+      }
+      ownerCapabilityHash = hash;
+    } else {
+      const token = String(claim?.capabilityToken ?? '');
+      if (token.length < 32) throw requestError('missing_owner_capability', 403);
+      if (token.length > 256) throw requestError('invalid_owner_capability', 403);
+      ownerCapabilityHash = sha256(token);
+    }
+    return { dealId, ownerCapabilityHash };
+  });
 }
 
 function participantProof(body, serviceRequest, order) {
@@ -315,6 +346,18 @@ async function listOrders(customerPhone, proof, allowProxy = true) {
   return normalizedOrders(result.orders);
 }
 
+async function listOwnerOrders(body, serviceRequest) {
+  const claims = ownerClaims(body, serviceRequest);
+  const proxied = serviceRequest
+    ? null
+    : await dataApiRequest({ action: 'list_owner', ownerClaims: claims });
+  const result = proxied || await directCollector({
+    action: 'customer_orders_owner',
+    ownerClaims: claims,
+  });
+  return normalizedOrders(result.orders);
+}
+
 async function publishOrder(order, proof, participantCapabilityHash = '', allowProxy = true) {
   const request = {
     action: 'publish',
@@ -495,8 +538,17 @@ export default async function handler(request, response) {
     return response.status(400).json({ ok: false, error: 'invalid_request_body' });
   }
   const action = request.body?.action;
-  if (!['list', 'publish', 'list_group', 'manage'].includes(action)) {
+  if (!['list', 'list_owner', 'publish', 'list_group', 'manage'].includes(action)) {
     return response.status(400).json({ ok: false, error: 'invalid_action' });
+  }
+  if (action === 'list_owner') {
+    try {
+      const orders = await listOwnerOrders(request.body || {}, serviceRequest);
+      return response.status(200).json({ ok: true, orders });
+    } catch (error) {
+      const code = error.code || error.message || 'owner_order_sync_failed';
+      return response.status(error.status || statusForOrderError(code)).json({ ok: false, error: code });
+    }
   }
   if (action === 'list_group') {
     try {

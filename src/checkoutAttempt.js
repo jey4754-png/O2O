@@ -10,6 +10,7 @@ const TRANSIENT_ORDER_SYNC_CODES = new Set([
   'upstream_timeout',
 ]);
 const TRANSIENT_ORDER_SYNC_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
+const TRANSIENT_ORDER_PUBLISH_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
 
 let memoryAttempts = {};
 const storageMemoryAttempts = new WeakMap();
@@ -150,6 +151,55 @@ export function isTransientOrderSyncError(error = {}) {
   return TRANSIENT_ORDER_SYNC_STATUSES.has(status)
     || TRANSIENT_ORDER_SYNC_CODES.has(code)
     || (!status && error?.name === 'TypeError');
+}
+
+export function orderPublishRetryCount(error = {}) {
+  const status = Number(error.status || 0);
+  if (TRANSIENT_ORDER_PUBLISH_STATUSES.has(status) || status >= 500) return 3;
+  if (!status && error?.name === 'TypeError') return 3;
+  return 0;
+}
+
+function waitForOrderPublishRetry(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+export async function publishCustomerOrderRequest(payload, options = {}) {
+  const fetchImpl = options.fetchImpl || globalThis.fetch;
+  const wait = options.wait || waitForOrderPublishRetry;
+  if (typeof fetchImpl !== 'function') throw new TypeError('fetch_unavailable');
+
+  // Snapshot the complete request once so every retry has the exact same order identity and payload.
+  const body = JSON.stringify(payload);
+  let failedAttempts = 0;
+  while (true) {
+    try {
+      const response = await fetchImpl('/api/customer-orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body,
+      });
+      let result = {};
+      try {
+        result = await response.json();
+      } catch {
+        result = {};
+      }
+      if (!response.ok || !result.ok) {
+        const error = new Error(result.error || 'order_sync_failed');
+        error.code = result.error || 'order_sync_failed';
+        error.status = response.status;
+        throw error;
+      }
+      return result.order;
+    } catch (error) {
+      const retryCount = orderPublishRetryCount(error);
+      if (failedAttempts >= retryCount) throw error;
+      const delay = Math.min(2400, 350 * (2 ** failedAttempts)) + Math.floor(Math.random() * 180);
+      failedAttempts += 1;
+      await wait(delay);
+    }
+  }
 }
 
 export function canQueueReservedGroupOrder(order = {}, error = {}) {

@@ -20,10 +20,48 @@ import {
   getPreviousGroupStatus,
   normalizeCategory,
   resolveGroupDealProgress,
+  resolveOwnerProductQuantity,
   transitionGroupStatus,
   transitionPaymentStatus,
   validateTargetPeople,
 } from './trade.js';
+
+test('owner quantity uses one canonical field for each sale type', () => {
+  assert.deepEqual(resolveOwnerProductQuantity({
+    saleType: 'group',
+    stock: 6,
+    maxQuantity: 10,
+  }), {
+    quantity: 10,
+    stock: 10,
+    maxQuantity: 10,
+  });
+  assert.deepEqual(resolveOwnerProductQuantity({
+    saleType: 'instant',
+    stock: 6,
+    maxQuantity: 10,
+  }), {
+    quantity: 6,
+    stock: 6,
+    maxQuantity: 6,
+  });
+});
+
+test('owner quantity preserves active group allocations and a minimum instant stock', () => {
+  assert.equal(resolveOwnerProductQuantity({
+    saleType: 'group',
+    maxQuantity: 4,
+    minimumGroupQuantity: 7,
+  }).quantity, 7);
+  assert.equal(resolveOwnerProductQuantity({
+    saleType: 'instant',
+    stock: 0,
+  }).quantity, 1);
+  assert.equal(resolveOwnerProductQuantity({
+    saleType: 'instant',
+    stock: 2000,
+  }).quantity, MAX_PRODUCT_QUANTITY);
+});
 
 test('PRODUCT_CATEGORIES contains the exact agreed 11 categories', () => {
   assert.deepEqual(PRODUCT_CATEGORIES, [

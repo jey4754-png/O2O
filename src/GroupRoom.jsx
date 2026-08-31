@@ -41,6 +41,7 @@ import { RELEASE_FEATURES } from './releasePhase';
 const ERROR_MESSAGES = {
   admin_pin_required: '관리자 PIN을 입력해 주세요.',
   invalid_admin_pin: '관리자 PIN이 올바르지 않습니다.',
+  admin_not_configured: '운영 관리자 PIN 설정을 확인할 수 없습니다. 운영 담당자에게 문의해 주세요.',
   admin_backend_required: '로컬 관리자 테스트 PIN이 설정되지 않았습니다. 중앙 API 연결을 확인해 주세요.',
   forbidden: '이 작업을 수행할 권한이 없습니다.',
   group_full: '이 그룹은 최대 인원 또는 목표 인원에 도달했습니다.',
@@ -457,11 +458,17 @@ export default function GroupRoom({
         <div className="room-join-card">
           {adminMode && RELEASE_FEATURES.admin ? <ShieldCheck size={36} /> : RELEASE_FEATURES.chat ? <MessageCircle size={36} /> : <Users size={36} />}
           <h2>{adminMode ? '관리자 권한 확인' : deal.title}</h2>
-          <p>{adminMode ? '지정된 테스트 관리자 PIN으로 입장하면 참여 인원에는 포함되지 않습니다.' : RELEASE_FEATURES.chat ? '입장하면 닉네임이 참여자 목록에 표시되고 그룹 대화에 참여할 수 있습니다.' : '입장하면 닉네임과 입금 상태가 참여자 목록에 표시됩니다.'}</p>
+          <p>{adminMode ? '테스트 안내 메시지로 전달받은 관리자 PIN을 입력해 주세요. PIN이 없다면 운영 담당자에게 문의해 주세요. 관리자는 참여 인원에 포함되지 않습니다.' : RELEASE_FEATURES.chat ? '입장하면 닉네임이 참여자 목록에 표시되고 그룹 대화에 참여할 수 있습니다.' : '입장하면 닉네임과 입금 상태가 참여자 목록에 표시됩니다.'}</p>
           {adminMode && (
             <label>
               관리자 PIN
-              <input type="password" value={adminPin} onChange={(event) => setAdminPin(event.target.value)} autoComplete="current-password" />
+              <input
+                type="password"
+                value={adminPin}
+                onChange={(event) => setAdminPin(event.target.value)}
+                placeholder="전달받은 관리자 PIN 입력"
+                autoComplete="off"
+              />
             </label>
           )}
           {error && <p className="form-error" role="alert">{error}</p>}

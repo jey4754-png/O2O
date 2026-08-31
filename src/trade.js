@@ -106,6 +106,25 @@ export const TRADE_ACTOR_ROLES = Object.freeze([
 export const MAX_GROUP_PARTICIPANTS = 20;
 export const MAX_PRODUCT_QUANTITY = 999;
 
+export function resolveOwnerProductQuantity({
+  saleType = 'group',
+  stock = 1,
+  maxQuantity = 1,
+  minimumGroupQuantity = 1,
+} = {}) {
+  const isGroup = saleType === 'group';
+  const minimum = isGroup
+    ? Math.max(1, Math.floor(Number(minimumGroupQuantity) || 1))
+    : 1;
+  const requested = Math.floor(Number(isGroup ? maxQuantity : stock) || 1);
+  const quantity = Math.min(MAX_PRODUCT_QUANTITY, Math.max(minimum, requested));
+  return {
+    quantity,
+    stock: quantity,
+    maxQuantity: quantity,
+  };
+}
+
 function hasValue(collection, value) {
   return collection.includes(value);
 }

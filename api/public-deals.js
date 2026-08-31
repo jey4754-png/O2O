@@ -3,6 +3,9 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
 const CAPABILITY_HASH_PATTERN = /^[a-f0-9]{64}$/;
+const DEAL_ID_PATTERN = /^(owner|customer)-[a-zA-Z0-9-]{1,100}$/;
+const OWNER_DEAL_ID_PATTERN = /^owner-[a-zA-Z0-9-]{1,100}$/;
+const OWNER_CLAIM_LIMIT = 50;
 
 export const config = {
   maxDuration: 60,
@@ -50,6 +53,36 @@ function ownerCapabilityHash(body, serviceRequest) {
   return sha256(token);
 }
 
+function ownerClaims(body, serviceRequest) {
+  const input = body?.ownerClaims ?? body?.capabilities;
+  if (!Array.isArray(input) || input.length < 1 || input.length > OWNER_CLAIM_LIMIT) {
+    throw requestError('invalid_owner_claims');
+  }
+  const seen = new Set();
+  return input.map((claim) => {
+    const dealId = String(claim?.dealId ?? '');
+    if (!OWNER_DEAL_ID_PATTERN.test(dealId) || seen.has(dealId)) {
+      throw requestError('invalid_owner_claims');
+    }
+    seen.add(dealId);
+    let ownerCapabilityHashValue = '';
+    if (serviceRequest) {
+      const hash = String(claim?.ownerCapabilityHash ?? '').toLowerCase();
+      if (hash.length !== 64) throw requestError('invalid_owner_capability', 403);
+      ownerCapabilityHashValue = hash;
+    } else {
+      const token = String(claim?.capabilityToken ?? '');
+      if (token.length < 32) throw requestError('missing_owner_capability', 403);
+      if (token.length > 256) throw requestError('invalid_owner_capability', 403);
+      ownerCapabilityHashValue = sha256(token);
+    }
+    if (!CAPABILITY_HASH_PATTERN.test(ownerCapabilityHashValue)) {
+      throw requestError('invalid_owner_capability', 403);
+    }
+    return { dealId, ownerCapabilityHash: ownerCapabilityHashValue };
+  });
+}
+
 function number(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -93,7 +126,7 @@ function stateHistory(input) {
 }
 
 function sanitizeDeal(input) {
-  if (!input || !/^(owner|customer)-[a-zA-Z0-9-]{1,100}$/.test(String(input.id || ''))) {
+  if (!input || !DEAL_ID_PATTERN.test(String(input.id || ''))) {
     return null;
   }
   const id = text(input.id, 120);
@@ -202,7 +235,7 @@ function publicResult(result, action) {
     _ownerCapabilityHash: _storedOwnerCapabilityHash,
     ...safeResult
   } = result;
-  if (action === 'list') {
+  if (['list', 'list_owner'].includes(action)) {
     return {
       ...safeResult,
       deals: (Array.isArray(result.deals) ? result.deals : [])
@@ -264,18 +297,22 @@ export default async function handler(request, response) {
       throw requestError('invalid_request_body');
     }
     const action = request.body?.action;
-    if (!['list', 'publish', 'delete'].includes(action)) throw requestError('invalid_action');
+    if (!['list', 'list_owner', 'publish', 'delete'].includes(action)) throw requestError('invalid_action');
     const deal = action === 'publish' ? sanitizeDeal(request.body?.deal) : null;
     if (action === 'publish' && !deal) throw requestError('invalid_deal');
     const dealId = action === 'delete' ? text(request.body?.dealId, 120) : '';
-    if (action === 'delete' && !/^(owner|customer)-[a-zA-Z0-9-]{1,100}$/.test(dealId)) {
+    if (action === 'delete' && !DEAL_ID_PATTERN.test(dealId)) {
       throw requestError('invalid_deal_id');
     }
-    const capabilityHash = action === 'list' ? '' : ownerCapabilityHash(request.body, serviceRequest);
+    const claims = action === 'list_owner' ? ownerClaims(request.body, serviceRequest) : [];
+    const capabilityHash = ['list', 'list_owner'].includes(action)
+      ? ''
+      : ownerCapabilityHash(request.body, serviceRequest);
     const upstreamBody = {
       action,
       ...(deal ? { deal } : {}),
       ...(dealId ? { dealId } : {}),
+      ...(claims.length ? { ownerClaims: claims } : {}),
       ...(capabilityHash ? { ownerCapabilityHash: capabilityHash } : {}),
     };
 
@@ -296,11 +333,14 @@ export default async function handler(request, response) {
         token: collectorToken,
         action: action === 'list'
           ? 'public_deals'
+          : action === 'list_owner'
+            ? 'owner_deals'
           : action === 'delete'
             ? 'delete_deal'
             : 'publish_deal',
         ...(deal ? { deal } : {}),
         ...(dealId ? { dealId } : {}),
+        ...(claims.length ? { ownerClaims: claims } : {}),
         ...(capabilityHash ? { ownerCapabilityHash: capabilityHash } : {}),
       }),
       redirect: 'follow',

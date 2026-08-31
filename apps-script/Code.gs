@@ -37,6 +37,7 @@ const GROUP_STATUSES = ['recruiting', 'recruited', 'purchased', 'delivered'];
 const PAYMENT_STATUSES = ['pending', 'requested', 'confirmed'];
 const GROUP_MAX_PARTICIPANTS = 20;
 const GROUP_MESSAGE_LIMIT = 100;
+const OWNER_CLAIM_LIMIT = 50;
 const SCRIPT_LOCK_TIMEOUT_MS = 3000;
 const PUBLIC_DEALS_CACHE_KEY = 'public_deals_v4';
 const PUBLIC_DEALS_CACHE_CHUNK_PREFIX = 'public_deals_v4_chunk_';
@@ -114,6 +115,7 @@ function doPost(e) {
     if (body.token !== INGEST_TOKEN) return json_({ ok: false, error: 'unauthorized' });
     if (body.action === 'stats') return json_({ ok: true, stats: getCentralStats_() });
     if (body.action === 'public_deals') return json_({ ok: true, deals: getPublicDeals_() });
+    if (body.action === 'owner_deals') return getOwnerPublicDealsResponse_(body.ownerClaims || []);
     if (body.action === 'publish_deal') return publishPublicDeal_(body.deal || {}, body.ownerCapabilityHash || '');
     if (body.action === 'delete_deal') return deletePublicDeal_(body.dealId || '', body.ownerCapabilityHash || '');
     if (body.action === 'customer_orders') {
@@ -124,6 +126,9 @@ function doPost(e) {
       );
     }
     if (body.action === 'customer_orders_group') return getCustomerOrdersByGroup_(body.payload || {});
+    if (body.action === 'customer_orders_owner') {
+      return getOwnerCustomerOrdersResponse_(body.ownerClaims || []);
+    }
     if (body.action === 'publish_order') {
       return publishCustomerOrder_(
         body.order || {},
@@ -272,6 +277,81 @@ function privateCapabilityHash_(value, errorCode) {
   const normalized = String(value || '').toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(normalized)) throw groupOperationError_(errorCode || 'invalid_capability');
   return normalized;
+}
+
+function normalizeOwnerClaims_(claimsValue) {
+  if (!Array.isArray(claimsValue)
+    || claimsValue.length < 1
+    || claimsValue.length > OWNER_CLAIM_LIMIT) {
+    throw groupOperationError_('invalid_owner_claims');
+  }
+  const seen = Object.create(null);
+  return claimsValue.map(function(claim) {
+    const dealId = String(claim && claim.dealId || '');
+    if (!/^owner-[a-zA-Z0-9-]{1,100}$/.test(dealId) || seen[dealId]) {
+      throw groupOperationError_('invalid_owner_claims');
+    }
+    seen[dealId] = true;
+    return {
+      dealId: dealId,
+      ownerCapabilityHash: privateCapabilityHash_(
+        claim && claim.ownerCapabilityHash,
+        'invalid_owner_capability'
+      )
+    };
+  });
+}
+
+function ownerClaimMatchesDeal_(claim, deal) {
+  return Boolean(
+    claim
+    && deal
+    && String(deal.id || '') === String(claim.dealId || '')
+    && String(deal.source || '') === 'merchant'
+    && /^[a-f0-9]{64}$/.test(String(deal._ownerCapabilityHash || '').toLowerCase())
+    && String(deal._ownerCapabilityHash || '').toLowerCase()
+      === String(claim.ownerCapabilityHash || '').toLowerCase()
+  );
+}
+
+function authorizedOwnerDealIds_(sheets, claimsValue) {
+  const claims = normalizeOwnerClaims_(claimsValue);
+  const authorized = Object.create(null);
+  claims.forEach(function(claim) {
+    const deal = publicDealRecord_(sheets.publicDeals, claim.dealId);
+    if (ownerClaimMatchesDeal_(claim, deal)) authorized[claim.dealId] = true;
+  });
+  return authorized;
+}
+
+function getOwnerPublicDealsResponse_(claimsValue) {
+  try {
+    const sheets = ensureSheets_();
+    const authorized = authorizedOwnerDealIds_(sheets, claimsValue);
+    const deals = getPublicDeals_().filter(function(deal) {
+      return Boolean(authorized[String(deal && deal.id || '')]);
+    });
+    return json_({ ok: true, deals: deals });
+  } catch (error) {
+    return json_({ ok: false, error: error.code || 'owner_deals_failed' });
+  }
+}
+
+function ownerScopedOrders_(orders, authorizedDealIds) {
+  return mergeCustomerOrderSnapshots_(orders || []).filter(function(order) {
+    return Boolean(authorizedDealIds[customerOrderDealId_(order)]);
+  }).map(publicOrderValue_);
+}
+
+function getOwnerCustomerOrdersResponse_(claimsValue) {
+  try {
+    const sheets = ensureSheets_();
+    const authorized = authorizedOwnerDealIds_(sheets, claimsValue);
+    const orders = ownerScopedOrders_(storedCustomerOrders_(sheets.customerOrders), authorized);
+    return json_({ ok: true, orders: orders });
+  } catch (error) {
+    return json_({ ok: false, error: error.code || 'owner_orders_failed' });
+  }
 }
 
 function publicDealValue_(deal) {

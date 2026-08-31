@@ -1,7 +1,19 @@
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
 const SERVER_ONLY_EVENTS = new Set(['customer_order_snapshot']);
 
-import { callDataApi } from './_data-upstream.js';
+import { callDataApi, fetchUpstreamJson } from './_data-upstream.js';
+
+function collectorErrorStatus(code, fallbackStatus = 502) {
+  if (code === 'collector_busy') return 503;
+  if (code === 'upstream_timeout') return 504;
+  return fallbackStatus >= 400 ? fallbackStatus : 502;
+}
+
+function sendCollectorError(response, code, fallbackStatus = 502) {
+  const status = collectorErrorStatus(code, fallbackStatus);
+  if ([503, 504].includes(status)) response.setHeader('Retry-After', '3');
+  return response.status(status).json({ ok: false, error: code });
+}
 
 function isAllowedOrigin(originValue, request) {
   if (!originValue) return false;
@@ -71,24 +83,37 @@ export default async function handler(request, response) {
     });
     if (proxied) {
       const result = await proxied.json();
+      if (!proxied.ok || !result?.ok) {
+        return sendCollectorError(
+          response,
+          result?.error || 'collector_failed',
+          proxied.status,
+        );
+      }
       return response.status(proxied.status).json(result);
     }
 
-    const upstream = await fetch(collectorUrl, {
+    const { upstream, result } = await fetchUpstreamJson(collectorUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: collectorToken, event }),
       redirect: 'follow',
     });
-    const result = await upstream.json();
     if (!upstream.ok || !result.ok) {
-      return response.status(502).json({ ok: false, error: 'collector_failed' });
+      return sendCollectorError(
+        response,
+        result?.error || 'collector_failed',
+        502,
+      );
     }
     return response.status(result.duplicate ? 200 : 202).json({
       ok: true,
       duplicate: Boolean(result.duplicate),
     });
-  } catch {
+  } catch (error) {
+    if (error?.code === 'upstream_timeout') {
+      return sendCollectorError(response, 'upstream_timeout', 504);
+    }
     return response.status(502).json({ ok: false, error: 'collector_unreachable' });
   }
 }

@@ -8,6 +8,8 @@ import {
   completeCheckoutAttempt,
   isTerminalOrderSyncError,
   isTransientOrderSyncError,
+  orderPublishRetryCount,
+  publishCustomerOrderRequest,
 } from './checkoutAttempt.js';
 
 function memoryStorage() {
@@ -156,4 +158,97 @@ test('reserved group orders can continue locally after only transient sync failu
   assert.equal(canQueueReservedGroupOrder(order, invalid), false);
   assert.equal(isTerminalOrderSyncError(invalid), true);
   assert.equal(isTerminalOrderSyncError(timeout), false);
+});
+
+test('instant-order publish retries transient responses with the identical serialized order', async () => {
+  const order = {
+    id: 'order-1700000000000123',
+    createdAt: '2023-11-14T22:13:20.000Z',
+    dealId: 'owner-instant-retry',
+    type: 'purchase',
+    selectedCount: 4,
+  };
+  const requestBodies = [];
+  const delays = [];
+  let attempts = 0;
+  const published = await publishCustomerOrderRequest({
+    action: 'publish',
+    order,
+    visitorId: 'visitor-instant-retry',
+    customerCapabilityToken: 'customer-capability-retry-test-1234567890',
+  }, {
+    fetchImpl: async (_url, options) => {
+      requestBodies.push(options.body);
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          ok: false,
+          status: 503,
+          async json() { return { ok: false, error: 'collector_busy' }; },
+        };
+      }
+      return {
+        ok: true,
+        status: 202,
+        async json() { return { ok: true, order }; },
+      };
+    },
+    wait: async (delay) => { delays.push(delay); },
+  });
+
+  assert.equal(attempts, 2);
+  assert.equal(delays.length, 1);
+  assert.equal(requestBodies[0], requestBodies[1]);
+  assert.equal(JSON.parse(requestBodies[1]).order.id, order.id);
+  assert.equal(JSON.parse(requestBodies[1]).order.createdAt, order.createdAt);
+  assert.deepEqual(published, order);
+});
+
+test('instant-order publish retries a network failure but never a semantic client error', async () => {
+  const payload = {
+    action: 'publish',
+    order: {
+      id: 'order-1700000000000456',
+      createdAt: '2023-11-14T22:13:21.000Z',
+    },
+  };
+  let networkAttempts = 0;
+  await publishCustomerOrderRequest(payload, {
+    fetchImpl: async () => {
+      networkAttempts += 1;
+      if (networkAttempts === 1) throw new TypeError('Failed to fetch');
+      return {
+        ok: true,
+        status: 202,
+        async json() { return { ok: true, order: payload.order }; },
+      };
+    },
+    wait: async () => {},
+  });
+  assert.equal(networkAttempts, 2);
+
+  let semanticAttempts = 0;
+  await assert.rejects(() => publishCustomerOrderRequest(payload, {
+    fetchImpl: async () => {
+      semanticAttempts += 1;
+      return {
+        ok: false,
+        status: 400,
+        async json() { return { ok: false, error: 'invalid_order_request' }; },
+      };
+    },
+    wait: async () => {},
+  }), (error) => error.status === 400 && error.code === 'invalid_order_request');
+  assert.equal(semanticAttempts, 1);
+});
+
+test('order publish retry budget is bounded to transient network and HTTP failures', () => {
+  assert.equal(orderPublishRetryCount({ status: 408 }), 3);
+  assert.equal(orderPublishRetryCount({ status: 425 }), 3);
+  assert.equal(orderPublishRetryCount({ status: 429 }), 3);
+  assert.equal(orderPublishRetryCount({ status: 503 }), 3);
+  assert.equal(orderPublishRetryCount({ status: 500 }), 3);
+  assert.equal(orderPublishRetryCount({ name: 'TypeError' }), 3);
+  assert.equal(orderPublishRetryCount({ status: 409 }), 0);
+  assert.equal(orderPublishRetryCount({ status: 400 }), 0);
 });
