@@ -10,6 +10,31 @@ export function ownerScopeKey(profile = {}) {
   return phone.length >= 8 ? `phone:${phone}` : '';
 }
 
+export function completedOwnerMigrationScopes(state = {}) {
+  const scopes = Array.isArray(state?.completedScopes) ? state.completedScopes : [];
+  const legacyScope = state?.completed === true ? String(state?.ownerScope || '') : '';
+  return [...new Set([...scopes, legacyScope])]
+    .filter((scope) => /^phone:\d{8,}$/.test(String(scope || '')));
+}
+
+export function hasCompletedOwnerScopeMigration(state = {}, ownerScope = '') {
+  return Boolean(ownerScope && completedOwnerMigrationScopes(state).includes(ownerScope));
+}
+
+export function completeOwnerScopeMigration(state = {}, ownerScope = '', migratedAt = '') {
+  const completedScopes = completedOwnerMigrationScopes(state);
+  if (!ownerScope || !/^phone:\d{8,}$/.test(ownerScope)) {
+    return { ...state, completedScopes };
+  }
+  return {
+    completedScopes: [...new Set([...completedScopes, ownerScope])],
+    migratedAtByScope: {
+      ...(state?.migratedAtByScope || {}),
+      ...(migratedAt ? { [ownerScope]: migratedAt } : {}),
+    },
+  };
+}
+
 export function isOwnerDealId(dealId) {
   return OWNER_DEAL_ID_PATTERN.test(String(dealId || ''));
 }

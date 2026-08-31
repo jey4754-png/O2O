@@ -5,6 +5,9 @@ import {
   adoptLegacyOwnerScopes,
   assignOwnerDealScope,
   chunkOwnerCapabilities,
+  completeOwnerScopeMigration,
+  completedOwnerMigrationScopes,
+  hasCompletedOwnerScopeMigration,
   isOwnerDealInScope,
   legacyOwnerEventMatchesDeal,
   ownerScopeKey,
@@ -52,6 +55,30 @@ test('merchant scope is stable for formatted versions of the same phone number',
   );
   assert.equal(ownerScopeKey({ testerType: '사용자', phone: '010-1234-5678' }), '');
   assert.equal(ownerScopeKey({ testerType: '사장님', phone: '1234' }), '');
+});
+
+test('legacy migration completion is tracked independently for each merchant scope', () => {
+  const firstScope = 'phone:01011112222';
+  const secondScope = 'phone:01033334444';
+  const first = completeOwnerScopeMigration({}, firstScope, '2026-08-31T10:00:00.000Z');
+  assert.equal(hasCompletedOwnerScopeMigration(first, firstScope), true);
+  assert.equal(hasCompletedOwnerScopeMigration(first, secondScope), false);
+
+  const second = completeOwnerScopeMigration(first, secondScope, '2026-08-31T10:05:00.000Z');
+  assert.deepEqual(completedOwnerMigrationScopes(second), [firstScope, secondScope]);
+  assert.equal(hasCompletedOwnerScopeMigration(second, firstScope), true);
+  assert.equal(hasCompletedOwnerScopeMigration(second, secondScope), true);
+});
+
+test('legacy global completion markers migrate only their recorded merchant scope', () => {
+  const legacy = {
+    completed: true,
+    ownerScope: 'phone:01011112222',
+    migratedAt: '2026-08-31T09:00:00.000Z',
+  };
+  assert.deepEqual(completedOwnerMigrationScopes(legacy), ['phone:01011112222']);
+  assert.equal(hasCompletedOwnerScopeMigration(legacy, 'phone:01011112222'), true);
+  assert.equal(hasCompletedOwnerScopeMigration(legacy, 'phone:01033334444'), false);
 });
 
 test('a merchant deal cannot be reassigned to a switched merchant profile', () => {

@@ -87,6 +87,8 @@ import {
   adoptLegacyOwnerScopes,
   assignOwnerDealScope,
   chunkOwnerCapabilities,
+  completeOwnerScopeMigration,
+  hasCompletedOwnerScopeMigration,
   isOwnerDealId,
   isOwnerDealInScope,
   ownerScopeKey,
@@ -863,22 +865,24 @@ function App() {
   useEffect(() => {
     if (route !== '/owner' || !activeOwnerScope) return;
     const migrationState = loadJson(OWNER_SCOPE_MIGRATION_KEY, {});
+    const migrationCompleted = hasCompletedOwnerScopeMigration(migrationState, activeOwnerScope);
     const result = adoptLegacyOwnerScopes({
       capabilities: loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {}),
       scopeByDeal: loadJson(OWNER_DEAL_SCOPES_KEY, {}),
       ownerScope: activeOwnerScope,
       createdDeals,
       events: getEvents(),
-      migrationCompleted: migrationState.completed === true,
+      migrationCompleted,
     });
-    if (migrationState.completed === true) return;
+    if (migrationCompleted) return;
     if (result.changed && !saveJson(OWNER_DEAL_SCOPES_KEY, result.scopeByDeal)) return;
     setOwnerScopeByDeal(result.scopeByDeal);
-    saveJson(OWNER_SCOPE_MIGRATION_KEY, {
-      completed: result.migrationCompleted,
-      ownerScope: activeOwnerScope,
-      migratedAt: new Date().toISOString(),
-    });
+    if (result.migrationCompleted) {
+      saveJson(
+        OWNER_SCOPE_MIGRATION_KEY,
+        completeOwnerScopeMigration(migrationState, activeOwnerScope, new Date().toISOString()),
+      );
+    }
   }, [activeOwnerScope, createdDeals, route]);
 
   useEffect(() => {
