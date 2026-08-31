@@ -123,6 +123,7 @@ export default function GroupRoom({
   isCreator = false,
   onBack,
   onDealUpdate,
+  onRead,
 }) {
   useScreenAnalytics('group_room', { group_id: deal.id, deal_id: deal.id, admin_mode: adminMode });
   const visitorId = getVisitorId();
@@ -180,9 +181,10 @@ export default function GroupRoom({
       && document.visibilityState === 'visible'
       && getGroupCredential(deal.id, actorId)
     ) {
+      onRead?.(deal.id, lastSeq);
       markGroupRead(deal.id, lastSeq, actorId).catch(() => {});
     }
-  }, [actorId, deal.id, deal.target]);
+  }, [actorId, deal.id, deal.target, onRead]);
 
   const loadSnapshot = useCallback(async ({ quiet = false } = {}) => {
     if (!quiet) setLoading(true);

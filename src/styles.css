@@ -842,6 +842,26 @@ button:disabled {
   color: #1c5682;
 }
 
+.customer-payment-state.sync-pending {
+  border: 1px solid #f1d8a8;
+  background: #fff8e8;
+  color: #805f1c;
+}
+
+.customer-payment-state.sync-pending strong {
+  color: #805f1c;
+}
+
+.customer-payment-state.sync-failed {
+  border: 1px solid #efb0aa;
+  background: #fff1ef;
+  color: var(--accent-strong);
+}
+
+.customer-payment-state.sync-failed strong {
+  color: var(--accent-strong);
+}
+
 .empty-customer-state {
   min-height: 430px;
   display: flex;
@@ -2592,6 +2612,57 @@ code {
   color: #fff;
   font-size: 9px;
   font-weight: 900;
+}
+
+.notification-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.notification-list-item {
+  width: 100%;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #fff;
+  color: var(--ink);
+  text-align: left;
+}
+
+.notification-list-item > div:nth-child(2) {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.notification-list-item strong {
+  overflow: hidden;
+  font-size: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.notification-list-item span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.notification-list-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
 }
 
 .calculator-entry-card {

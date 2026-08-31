@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildGroupNotifications,
   canOpenOrderGroupRoom,
   dealHasGroupRoom,
   hostApplyErrorMessage,
@@ -8,10 +9,31 @@ import {
   joinSubmitErrorMessage,
 } from './customerUi.js';
 
+test('group notifications open unread rooms first and fall back to status details', () => {
+  const deals = [
+    { id: 'status-only', source: 'customer', saleType: 'community' },
+    { id: 'unread-small', source: 'merchant', saleType: 'group' },
+    { id: 'unread-large', source: 'customer', saleType: 'community' },
+    { id: 'instant', source: 'merchant', saleType: 'instant' },
+  ];
+  const notifications = buildGroupNotifications(
+    deals,
+    { 'unread-small': 1, 'unread-large': 4, instant: 9, missing: 7 },
+    { 'status-only': 'recruited' },
+  );
+
+  assert.deepEqual(notifications.map((item) => [item.deal.id, item.destination]), [
+    ['unread-large', 'room'],
+    ['unread-small', 'room'],
+    ['status-only', 'detail'],
+  ]);
+});
+
 test('join errors explain quantity conflicts and incomplete merchant room setup', () => {
   assert.match(joinSubmitErrorMessage(new Error('quantity_unavailable')), /최신 수량/);
   assert.match(joinSubmitErrorMessage(new Error('group_not_found')), /그룹 채팅방/);
   assert.match(joinSubmitErrorMessage(new Error('order_sync_failed')), /주문 저장 서버/);
+  assert.match(joinSubmitErrorMessage(new Error('collector_busy')), /자동 재시도/);
 });
 
 test('host claim errors tell non-participants how to recover', () => {

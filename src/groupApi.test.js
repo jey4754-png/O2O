@@ -5,12 +5,20 @@ import {
   cancelGroupParticipation,
   claimGroupHost,
   createGroupRoom,
+  groupOperationRetryCount,
   isGroupBackedDeal,
   joinGroupRoom,
   normalizeSnapshot,
   resolveUnreadCount,
   updateGroupTarget,
 } from './groupApi.js';
+
+test('only transient group API failures receive a bounded retry budget', () => {
+  assert.equal(groupOperationRetryCount({ status: 503, code: 'collector_busy' }), 2);
+  assert.equal(groupOperationRetryCount({ status: 504, code: 'upstream_timeout' }), 1);
+  assert.equal(groupOperationRetryCount({ status: 409, code: 'state_conflict' }), 0);
+  assert.equal(groupOperationRetryCount({ status: 403, code: 'forbidden' }), 0);
+});
 
 function memoryStorage() {
   const values = new Map();
@@ -236,6 +244,69 @@ test('group creation retries reuse the same membership mutation id after a lost 
     assert.equal(result.snapshot.group.hostActorId, input.actorId);
     assert.equal(payloads.length, 2);
     assert.equal(payloads[0].clientMutationId, payloads[1].clientMutationId);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
+test('group join automatically retries collector contention with the identical mutation and quantity', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  globalThis.localStorage = memoryStorage();
+  const payloads = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    payloads.push(payload);
+    if (payloads.length === 1) {
+      return {
+        ok: false,
+        status: 503,
+        async json() { return { ok: false, error: 'collector_busy' }; },
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return {
+          ok: true,
+          capabilityToken: `capability-${'r'.repeat(64)}`,
+          snapshot: {
+            group: {
+              groupId: payload.groupId,
+              status: 'recruiting',
+              targetCount: 5,
+              totalQuantity: 10,
+              orderedQuantity: payload.selectedQuantity,
+              version: 2,
+            },
+            participants: [{
+              actorId: payload.actorId,
+              role: 'member',
+              counted: true,
+              selectedQuantity: payload.selectedQuantity,
+              version: 1,
+            }],
+          },
+        };
+      },
+    };
+  };
+
+  try {
+    const result = await joinGroupRoom({
+      deal: { id: 'customer-collector-retry', source: 'customer' },
+      actorId: 'visitor-collector-retry',
+      nickname: '재시도 참여자',
+      selectedQuantity: 3,
+      clientMutationId: 'checkout-collector-retry-1234',
+    });
+    assert.equal(result.snapshot.group.orderedQuantity, 3);
+    assert.equal(payloads.length, 2);
+    assert.equal(payloads[0].clientMutationId, payloads[1].clientMutationId);
+    assert.equal(payloads[0].selectedQuantity, payloads[1].selectedQuantity);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousStorage === undefined) delete globalThis.localStorage;

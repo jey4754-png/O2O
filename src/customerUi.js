@@ -28,6 +28,9 @@ export function joinSubmitErrorMessage(error) {
   if (['order_sync_failed', 'collector_failed', 'collector_unreachable'].includes(code)) {
     return '주문 저장 서버와 연결하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.';
   }
+  if (['collector_busy', 'upstream_timeout'].includes(code)) {
+    return '일시적으로 요청이 몰려 자동 재시도 중입니다. 잠시 후에도 계속되면 다시 눌러 주세요.';
+  }
   return '참여 신청을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.';
 }
 
@@ -52,6 +55,27 @@ export function dealHasGroupRoom(deal) {
     || deal.source === 'customer'
     || (deal.source === 'merchant' && (deal.saleType === 'group' || deal.splitPricing === true)),
   );
+}
+
+export function buildGroupNotifications(deals = [], unreadCounts = {}, statusNotices = {}) {
+  return deals
+    .filter((deal) => deal?.id && dealHasGroupRoom(deal))
+    .map((deal) => {
+      const unreadCount = Math.max(0, Number(unreadCounts[deal.id] || 0));
+      const status = String(statusNotices[deal.id] || '');
+      if (!unreadCount && !status) return null;
+      return {
+        deal,
+        unreadCount,
+        status,
+        destination: unreadCount > 0 ? 'room' : 'detail',
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => (
+      Number(right.unreadCount > 0) - Number(left.unreadCount > 0)
+      || right.unreadCount - left.unreadCount
+    ));
 }
 
 export function canOpenOrderGroupRoom({ order, deal, cancelled = false }) {

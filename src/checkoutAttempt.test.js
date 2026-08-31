@@ -2,9 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   beginCheckoutAttempt,
+  canQueueReservedGroupOrder,
   checkoutNeedsDurableOrderSync,
   checkoutAttemptStorageKey,
   completeCheckoutAttempt,
+  isTerminalOrderSyncError,
+  isTransientOrderSyncError,
 } from './checkoutAttempt.js';
 
 function memoryStorage() {
@@ -138,4 +141,19 @@ test('group reservations are completed only after their durable order sync path'
     type: 'group',
     deal: { source: 'customer' },
   }), false);
+});
+
+test('reserved group orders can continue locally after only transient sync failures', () => {
+  const order = { groupId: 'customer-timeout-group', type: 'purchase' };
+  const timeout = Object.assign(new Error('upstream_timeout'), { status: 504, code: 'upstream_timeout' });
+  const invalidGatewayBody = Object.assign(new SyntaxError('Unexpected token'), { status: 503, code: 'order_sync_failed' });
+  const invalid = Object.assign(new Error('invalid_order_request'), { status: 400, code: 'invalid_order_request' });
+
+  assert.equal(isTransientOrderSyncError(timeout), true);
+  assert.equal(isTransientOrderSyncError(invalidGatewayBody), true);
+  assert.equal(canQueueReservedGroupOrder(order, timeout), true);
+  assert.equal(canQueueReservedGroupOrder({}, timeout), false);
+  assert.equal(canQueueReservedGroupOrder(order, invalid), false);
+  assert.equal(isTerminalOrderSyncError(invalid), true);
+  assert.equal(isTerminalOrderSyncError(timeout), false);
 });

@@ -2,6 +2,14 @@ const CHECKOUT_ATTEMPTS_KEY = 'o2o_mvp_checkout_attempts_v1';
 const CHECKOUT_ATTEMPT_TTL_MS = 24 * 60 * 60 * 1000;
 const ORDER_ID_PATTERN = /^order-\d{10,20}$/;
 const MUTATION_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/;
+const TRANSIENT_ORDER_SYNC_CODES = new Set([
+  'collector_busy',
+  'collector_failed',
+  'collector_unreachable',
+  'order_sync_failed',
+  'upstream_timeout',
+]);
+const TRANSIENT_ORDER_SYNC_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
 
 let memoryAttempts = {};
 const storageMemoryAttempts = new WeakMap();
@@ -134,6 +142,23 @@ export function checkoutNeedsDurableOrderSync(order = {}) {
   return deal.source === 'merchant'
     || deal.source === 'customer'
     || Boolean(order.groupId || deal.groupId);
+}
+
+export function isTransientOrderSyncError(error = {}) {
+  const status = Number(error.status || 0);
+  const code = String(error.code || error.message || '');
+  return TRANSIENT_ORDER_SYNC_STATUSES.has(status)
+    || TRANSIENT_ORDER_SYNC_CODES.has(code)
+    || (!status && error?.name === 'TypeError');
+}
+
+export function canQueueReservedGroupOrder(order = {}, error = {}) {
+  return Boolean(order.groupId) && isTransientOrderSyncError(error);
+}
+
+export function isTerminalOrderSyncError(error = {}) {
+  const status = Number(error.status || 0);
+  return status >= 400 && status < 500 && !TRANSIENT_ORDER_SYNC_STATUSES.has(status);
 }
 
 export const checkoutAttemptStorageKey = CHECKOUT_ATTEMPTS_KEY;

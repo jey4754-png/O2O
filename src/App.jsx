@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import {
   ArrowLeft,
@@ -59,6 +59,7 @@ import {
 import { buildCommerceStats } from './commerceStats';
 import { mergeDeals } from './dealMerge';
 import {
+  buildGroupNotifications,
   canOpenOrderGroupRoom,
   dealHasGroupRoom,
   hostApplyErrorMessage,
@@ -67,8 +68,10 @@ import {
 } from './customerUi';
 import {
   beginCheckoutAttempt,
+  canQueueReservedGroupOrder,
   checkoutNeedsDurableOrderSync,
   completeCheckoutAttempt,
+  isTerminalOrderSyncError,
 } from './checkoutAttempt';
 import {
   calculateProductAllocation,
@@ -107,11 +110,13 @@ const OWNER_NEIGHBORHOOD_KEY = 'o2o_mvp_owner_neighborhood';
 const OWNER_LOCATION_KEY = 'o2o_mvp_owner_location';
 const PUBLIC_DEAL_SYNCED_KEY = 'o2o_mvp_public_deal_sync_fingerprints';
 const CUSTOMER_ORDER_SYNCED_KEY = 'o2o_mvp_customer_order_sync_fingerprints';
+const CUSTOMER_ORDER_SYNC_ISSUES_KEY = 'o2o_mvp_customer_order_sync_issues_v1';
 const PUBLIC_DEAL_CAPABILITIES_KEY = 'o2o_mvp_public_deal_capabilities_v1';
 const CUSTOMER_ORDER_CAPABILITY_KEY = 'o2o_mvp_customer_order_capability_v1';
 const GROUP_STATUS_SEEN_KEY = 'o2o_mvp_group_status_seen_v1';
 const COUNTED_PARTICIPATIONS_KEY = 'o2o_mvp_counted_participations';
 const PUBLIC_DEAL_SYNC_INTERVAL_MS = 10000;
+const CUSTOMER_ORDER_SYNC_INTERVAL_MS = 30000;
 const EVENT_MIN_RELEASE_PHASE = Object.freeze({
   chat_message_sent: 8,
   chat_lock_changed: 8,
@@ -407,9 +412,17 @@ async function publishCustomerOrder(order, options = {}) {
           : {}),
       }),
     });
-    const result = await response.json();
+    let result = {};
+    try {
+      result = await response.json();
+    } catch {
+      result = {};
+    }
     if (!response.ok || !result.ok) {
-      if (options.throwOnError) throw new Error(result.error || 'order_sync_failed');
+      const error = new Error(result.error || 'order_sync_failed');
+      error.code = result.error || 'order_sync_failed';
+      error.status = response.status;
+      if (options.throwOnError) throw error;
       return null;
     }
     return result.order;
@@ -761,12 +774,25 @@ function App() {
   const [customerGroups, setCustomerGroups] = useState(() => loadCustomerGroups());
   const [remoteDeals, setRemoteDeals] = useState([]);
   const [orders, setOrders] = useState(() => loadOrders());
+  const [orderSyncIssues, setOrderSyncIssues] = useState(() => loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {}));
   const [favoriteIds, setFavoriteIds] = useState(() => loadJson(FAVORITES_KEY, []));
   const [hostDealIds, setHostDealIds] = useState(() => loadJson(HOST_DEALS_KEY, []));
   const [selectedDeal, setSelectedDeal] = useState(() => loadCreatedDeals()[0] || sampleDeals[0]);
   const [unreadCounts, setUnreadCounts] = useState({});
   const [statusNotices, setStatusNotices] = useState({});
   const [handledDeepLink, setHandledDeepLink] = useState('');
+
+  const updateOrderSyncIssue = useCallback((orderId, issue = null) => {
+    if (!orderId) return;
+    setOrderSyncIssues((current) => {
+      const next = { ...current };
+      if (issue) next[orderId] = issue;
+      else delete next[orderId];
+      if (JSON.stringify(next) === JSON.stringify(current)) return current;
+      saveJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, next);
+      return next;
+    });
+  }, []);
 
   const deals = useMemo(
     () => mergeDeals(
@@ -849,6 +875,25 @@ function App() {
     });
     track('group_status_notice_viewed', { group_id: deal.id, group_status: status });
   };
+
+  const openGroupNotification = (deal, destination = 'detail') => {
+    if (!deal?.id) return;
+    acknowledgeGroupStatus(deal);
+    setSelectedDeal(deal);
+    setCustomerScreen(destination === 'room' ? 'room' : 'detail');
+    track('group_notification_opened', {
+      group_id: deal.id,
+      destination: destination === 'room' ? 'room' : 'detail',
+      unread_count: Number(unreadCounts[deal.id] || 0),
+      has_status_notice: Boolean(statusNotices[deal.id]),
+    });
+  };
+
+  const handleRoomRead = useCallback((groupId) => {
+    setUnreadCounts((current) => (
+      Number(current[groupId] || 0) > 0 ? { ...current, [groupId]: 0 } : current
+    ));
+  }, []);
 
   useEffect(() => {
     if (!RELEASE_FEATURES.deepLinks || !profile || !['/customer', '/admin'].includes(route)) return;
@@ -1007,13 +1052,43 @@ function App() {
           (order) => fingerprints[order.id] !== orderSyncFingerprint(order),
         );
         const published = [];
+        const syncErrors = [];
         for (const order of pending) {
           if (cancelled) break;
-          published.push(await publishCustomerOrder(order));
+          try {
+            published.push(await publishCustomerOrder(order, { throwOnError: true }));
+            syncErrors.push(null);
+          } catch (error) {
+            published.push(null);
+            syncErrors.push(error);
+          }
         }
         const nextFingerprints = { ...fingerprints };
         pending.forEach((order, index) => {
-          if (published[index]) nextFingerprints[order.id] = orderSyncFingerprint(order);
+          if (published[index]) {
+            nextFingerprints[order.id] = orderSyncFingerprint(order);
+            completeCheckoutAttempt(order.id);
+            updateOrderSyncIssue(order.id);
+          }
+          if (isTerminalOrderSyncError(syncErrors[index])) {
+            nextFingerprints[order.id] = orderSyncFingerprint(order);
+            updateOrderSyncIssue(order.id, {
+              state: 'failed',
+              code: syncErrors[index]?.code || syncErrors[index]?.message || 'terminal_request_error',
+              updatedAt: new Date().toISOString(),
+            });
+            track('order_sync_rejected', {
+              order_id: order.id,
+              deal_id: order.dealId,
+              error_code: syncErrors[index]?.code || syncErrors[index]?.message || 'terminal_request_error',
+            });
+          } else if (syncErrors[index]) {
+            updateOrderSyncIssue(order.id, {
+              state: 'pending',
+              code: syncErrors[index]?.code || syncErrors[index]?.message || 'network_error',
+              updatedAt: new Date().toISOString(),
+            });
+          }
         });
 
         const centralOrders = await fetchCustomerOrders(profilePhone);
@@ -1021,6 +1096,7 @@ function App() {
         centralOrders.forEach((order) => {
           nextFingerprints[order.id] = orderSyncFingerprint(order);
           completeCheckoutAttempt(order.id);
+          updateOrderSyncIssue(order.id);
         });
         saveJson(CUSTOMER_ORDER_SYNCED_KEY, nextFingerprints);
         setOrders((current) => {
@@ -1037,7 +1113,7 @@ function App() {
       if (document.visibilityState === 'visible') syncOrders();
     };
     syncOrders();
-    const timer = window.setInterval(syncOrders, 15000);
+    const timer = window.setInterval(syncOrders, CUSTOMER_ORDER_SYNC_INTERVAL_MS);
     window.addEventListener('online', syncOrders);
     window.addEventListener('pageshow', syncOrders);
     document.addEventListener('visibilitychange', handleVisibility);
@@ -1048,7 +1124,7 @@ function App() {
       window.removeEventListener('pageshow', syncOrders);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [profile, orders]);
+  }, [profile, orders, updateOrderSyncIssue]);
 
   useEffect(() => {
     if (analyticsReady) trackPageview();
@@ -1576,24 +1652,41 @@ function App() {
     };
     let storedOrder = newOrder;
     const needsDurableOrderSync = checkoutNeedsDurableOrderSync(newOrder);
+    let orderSyncQueued = false;
     if (needsDurableOrderSync) {
-      const published = await publishCustomerOrder(newOrder, { throwOnError: true });
-      if (!published) throw new Error('order_sync_failed');
-      storedOrder = {
-        ...newOrder,
-        ...published,
-        deal: { ...newOrder.deal, ...(published.deal || {}) },
-      };
-      const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
-      fingerprints[newOrder.id] = orderSyncFingerprint(storedOrder);
-      saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+      try {
+        const published = await publishCustomerOrder(newOrder, { throwOnError: true });
+        if (!published) throw new Error('order_sync_failed');
+        storedOrder = {
+          ...newOrder,
+          ...published,
+          deal: { ...newOrder.deal, ...(published.deal || {}) },
+        };
+        const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+        fingerprints[newOrder.id] = orderSyncFingerprint(storedOrder);
+        saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+        updateOrderSyncIssue(newOrder.id);
+      } catch (error) {
+        if (!canQueueReservedGroupOrder(newOrder, error)) throw error;
+        orderSyncQueued = true;
+        updateOrderSyncIssue(newOrder.id, {
+          state: 'pending',
+          code: error.code || error.message || 'network_error',
+          updatedAt: new Date().toISOString(),
+        });
+        track('order_sync_queued', {
+          order_id: newOrder.id,
+          deal_id: newOrder.dealId,
+          error_code: error.code || error.message || 'network_error',
+        });
+      }
     }
     setOrders((current) => {
       const next = mergeOrders(current, [storedOrder]);
       saveJson(CUSTOMER_ORDERS_KEY, next);
       return next;
     });
-    if (checkoutAttempt) completeCheckoutAttempt(orderId);
+    if (checkoutAttempt && !orderSyncQueued) completeCheckoutAttempt(orderId);
     if (!needsDurableOrderSync) {
       publishCustomerOrder(newOrder).then((published) => {
         if (!published) return;
@@ -1774,6 +1867,7 @@ function App() {
     const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
     fingerprints[cancelledOrder.id] = orderSyncFingerprint(cancelledOrder);
     saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+    updateOrderSyncIssue(cancelledOrder.id);
 
     const participantStorageKey = participationKey(order);
     const countedParticipations = loadJson(COUNTED_PARTICIPATIONS_KEY, {});
@@ -2017,6 +2111,7 @@ function App() {
                 deals={deals}
                 profile={route === '/admin' ? profile : customerProfile}
                 orders={orders}
+                orderSyncIssues={orderSyncIssues}
                 favoriteIds={favoriteIds}
                 hostDealIds={hostDealIds}
                 selectedDeal={selectedDeal}
@@ -2037,6 +2132,14 @@ function App() {
                   });
                 }}
                 onScreen={setCustomerScreen}
+                onOpenNotifications={() => {
+                  setCustomerScreen('notifications');
+                  track('notification_center_opened', {
+                    notification_count: buildGroupNotifications(deals, unreadCounts, statusNotices).length,
+                  });
+                }}
+                onOpenNotification={openGroupNotification}
+                onRoomRead={handleRoomRead}
                 onOrderCreate={saveCustomerOrder}
                 onGroupCreate={createCustomerGroup}
                 onToggleFavorite={toggleFavorite}
@@ -2186,6 +2289,7 @@ function CustomerApp({
   deals,
   profile,
   orders,
+  orderSyncIssues = {},
   favoriteIds,
   hostDealIds,
   selectedDeal,
@@ -2196,6 +2300,9 @@ function CustomerApp({
   onProfileSubmit,
   onSelectDeal,
   onScreen,
+  onOpenNotifications,
+  onOpenNotification,
+  onRoomRead,
   onOrderCreate,
   onGroupCreate,
   onToggleFavorite,
@@ -2254,6 +2361,17 @@ function CustomerApp({
         isCreator={editableDealIds.includes(selectedDeal.id)}
         onBack={() => onScreen('detail')}
         onDealUpdate={onUpdateDeal}
+        onRead={onRoomRead}
+      />
+    );
+  }
+
+  if (screen === 'notifications') {
+    return (
+      <NotificationsTab
+        notifications={buildGroupNotifications(deals, unreadCounts, statusNotices)}
+        onBack={() => onScreen('list')}
+        onOpen={onOpenNotification}
       />
     );
   }
@@ -2332,6 +2450,7 @@ function CustomerApp({
     return (
       <OrdersTab
         orders={customerOrders}
+        orderSyncIssues={orderSyncIssues}
         deals={deals}
         onSelectDeal={onSelectDeal}
         onConfirmPickup={onConfirmPickup}
@@ -2375,6 +2494,7 @@ function CustomerApp({
       statusNotices={statusNotices}
       onSelectDeal={onSelectDeal}
       onScreen={onScreen}
+      onOpenNotifications={onOpenNotifications}
       onNeighborhoodChange={onNeighborhoodChange}
     />
   );
@@ -2520,7 +2640,7 @@ function Onboarding({ onSubmit, defaultTesterType = '사용자', lockTesterType 
   );
 }
 
-function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotices = {}, onSelectDeal, onScreen, onNeighborhoodChange }) {
+function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotices = {}, onSelectDeal, onScreen, onOpenNotifications, onNeighborhoodChange }) {
   useScreenAnalytics('deal_list', {
     region: profile.region,
     district: profile.district,
@@ -2530,8 +2650,12 @@ function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotice
   const [query, setQuery] = useState('');
   const [source, setSource] = useState('all');
   const [selectingNeighborhood, setSelectingNeighborhood] = useState(false);
-  const totalUnread = Object.values(unreadCounts).reduce((sum, value) => sum + Number(value || 0), 0);
-  const totalStatusNotices = Object.keys(statusNotices).length;
+  const groupNotifications = buildGroupNotifications(deals, unreadCounts, statusNotices);
+  const totalUnread = groupNotifications.reduce((sum, item) => sum + item.unreadCount, 0);
+  const totalStatusNotices = groupNotifications.reduce(
+    (sum, item) => sum + Number(Boolean(item.status)),
+    0,
+  );
 
   useEffect(() => {
     if (totalUnread > 0) {
@@ -2562,7 +2686,11 @@ function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotice
             <Calculator size={20} />
           </button>
           {RELEASE_FEATURES.unreadBadges && (
-            <button className="icon-button notification-button" aria-label="그룹별 새 메시지">
+            <button
+              className="icon-button notification-button"
+              aria-label={`그룹 알림 ${totalUnread + totalStatusNotices}건`}
+              onClick={onOpenNotifications}
+            >
               <Bell size={20} />
               {totalUnread + totalStatusNotices > 0 && (
                 <span>{Math.min(99, totalUnread + totalStatusNotices)}</span>
@@ -2656,6 +2784,51 @@ function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotice
             setSelectingNeighborhood(false);
           }}
         />
+      )}
+    </section>
+  );
+}
+
+function NotificationsTab({ notifications, onBack, onOpen }) {
+  useScreenAnalytics('notification_center', { notification_count: notifications.length });
+  return (
+    <section className="screen notification-center-screen">
+      <header className="top-nav compact">
+        <button className="icon-button" onClick={onBack} aria-label="뒤로">
+          <ArrowLeft size={22} />
+        </button>
+        <h1>그룹 알림</h1>
+        <Bell size={20} />
+      </header>
+
+      {notifications.length === 0 ? (
+        <EmptyCustomerState
+          icon={Bell}
+          title="새로운 그룹 알림이 없습니다"
+          body="새 메시지나 모집 상태 변경이 생기면 이곳에 그룹별로 표시됩니다."
+          actionLabel="공동구매 둘러보기"
+          onAction={onBack}
+        />
+      ) : (
+        <div className="notification-list">
+          {notifications.map(({ deal, unreadCount, status, destination }) => (
+            <button
+              className="notification-list-item"
+              key={deal.id}
+              onClick={() => onOpen(deal, destination)}
+            >
+              <div className="notification-list-icon">
+                {unreadCount > 0 ? <MessageCircle size={19} /> : <Bell size={19} />}
+              </div>
+              <div>
+                <strong>{deal.title}</strong>
+                {unreadCount > 0 && <span>확인하지 않은 새 메시지 {unreadCount}개</span>}
+                {status && <span>거래 상태 · {GROUP_STATUS_LABELS[status] || status}</span>}
+              </div>
+              <ChevronRight size={18} />
+            </button>
+          ))}
+        </div>
       )}
     </section>
   );
@@ -2854,7 +3027,7 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
   );
 }
 
-function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onCancelParticipation, onScreen }) {
+function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfirmPickup, onCancelParticipation, onScreen }) {
   useScreenAnalytics('customer_orders', { order_count: orders.length });
   const dealById = new Map(deals.map((deal) => [deal.id, deal]));
   const [cancellingId, setCancellingId] = useState('');
@@ -2908,6 +3081,7 @@ function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onCancelParti
         <div className="order-card-list">
           {orders.map((order) => {
             const deal = dealById.get(order.dealId) || order.deal;
+            const syncIssue = orderSyncIssues[order.id] || null;
             const cancelled = isCancelledOrder(order);
             const orderStage = getOrderStage(order);
             const orderStageIndex = ORDER_STAGES.findIndex((stage) => stage.id === orderStage.id);
@@ -2949,6 +3123,14 @@ function OrdersTab({ orders, deals, onSelectDeal, onConfirmPickup, onCancelParti
                   <span>{cancelled ? '취소 전 ' : ''}{formatWon(order.total ?? discountedPrice(deal?.originalPrice, deal?.discountRate))}</span>
                   <span>{order.time || order.deadline || deal?.deadline}</span>
                 </div>
+                {syncIssue ? (
+                  <div className={`customer-payment-state sync-${syncIssue.state === 'failed' ? 'failed' : 'pending'}`}>
+                    <strong>{syncIssue.state === 'failed' ? '주문 서버 반영 확인 필요' : '주문 서버 반영 중'}</strong>
+                    <span>{syncIssue.state === 'failed'
+                      ? '자동 전송이 완료되지 않았습니다. 새로고침 후에도 계속 보이면 운영자에게 알려 주세요.'
+                      : '참여 수량은 예약되었으며 연결이 복구되면 주문 정보가 자동으로 전송됩니다.'}</span>
+                  </div>
+                ) : null}
                 {order.type === 'purchase' && cancelled ? (
                   <div className="customer-payment-state cancelled">
                     <strong>참여 취소 완료</strong>
@@ -4429,7 +4611,6 @@ function OwnerApp({
       }}
       onOpenOrders={() => onScreen('orders')}
       onOpenProducts={() => onScreen('products')}
-      onPreviewCustomer={onPreviewCustomer}
       orderCount={neighborhoodOrders.length}
       communityGroups={neighborhoodGroups}
       location={location}
@@ -4443,7 +4624,6 @@ function OwnerForm({
   onCreate,
   onOpenOrders,
   onOpenProducts,
-  onPreviewCustomer,
   orderCount,
   communityGroups,
   location,
@@ -4540,19 +4720,13 @@ function OwnerForm({
           <h1>메뉴 상세</h1>
         </div>
         <div className="inline-actions">
-          <button
-            className="icon-button"
-            onClick={() => onPreviewCustomer('list', form)}
-            aria-label="메인 화면 미리보기"
-          >
-            <Home size={19} />
+          <button className="owner-orders-button" onClick={onOpenProducts}>
+            <Home size={18} />
+            <span>상품 관리</span>
           </button>
           <button className="owner-orders-button" onClick={onOpenOrders}>
             <ShoppingBag size={18} />
             <span>주문 {orderCount}</span>
-          </button>
-          <button className="icon-button" onClick={onOpenProducts} aria-label="등록 상품 관리">
-            <Pencil size={18} />
           </button>
         </div>
       </header>
@@ -4890,6 +5064,25 @@ function OwnerForm({
 
 function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
   useScreenAnalytics('owner_products', { product_count: deals.length });
+  const [busyDealId, setBusyDealId] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+
+  const handleDelete = async (deal) => {
+    if (!window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) return;
+    setBusyDealId(deal.id);
+    setDeleteError('');
+    try {
+      const deleted = await onDelete(deal);
+      if (!deleted) {
+        setDeleteError('상품을 삭제하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.');
+      }
+    } catch {
+      setDeleteError('상품을 삭제하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.');
+    } finally {
+      setBusyDealId('');
+    }
+  };
+
   return (
     <section className="screen">
       <header className="top-nav compact">
@@ -4899,6 +5092,7 @@ function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
         <h1>등록 상품 관리</h1>
         <Store size={20} />
       </header>
+      {deleteError ? <p className="form-error" role="alert" aria-live="assertive">{deleteError}</p> : null}
       {deals.length === 0 ? (
         <EmptyCustomerState
           icon={Store}
@@ -4930,18 +5124,21 @@ function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
                   )}
                 </div>
                 <div className="owner-product-actions">
-                  <button className="secondary-button compact-button" onClick={() => onEdit(deal)}>
+                  <button
+                    className="secondary-button compact-button"
+                    disabled={Boolean(busyDealId)}
+                    onClick={() => onEdit(deal)}
+                  >
                     <Pencil size={14} />
                     수정
                   </button>
                   <button
                     className="danger-button compact-button"
-                    onClick={() => {
-                      if (window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) onDelete(deal);
-                    }}
+                    disabled={Boolean(busyDealId)}
+                    onClick={() => handleDelete(deal)}
                   >
                     <Trash2 size={14} />
-                    삭제
+                    {busyDealId === deal.id ? '삭제 중…' : '삭제'}
                   </button>
                 </div>
               </article>

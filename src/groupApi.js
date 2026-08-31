@@ -161,28 +161,64 @@ export function normalizeSnapshot(result, groupId) {
   };
 }
 
-async function requestGroupOperation(payload, signal) {
-  const response = await fetch('/api/group-ops', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    signal,
+export function groupOperationRetryCount(error = {}) {
+  const status = Number(error.status || 0);
+  const code = String(error.code || error.message || '');
+  if (status === 503 || code === 'collector_busy') return 2;
+  if ([502, 504].includes(status) || code === 'upstream_timeout') return 1;
+  return 0;
+}
+
+function waitForRetry(delayMs, signal) {
+  const abortError = () => signal?.reason || Object.assign(new Error('Aborted'), { name: 'AbortError' });
+  if (signal?.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const handleAbort = () => {
+      clearTimeout(timer);
+      reject(abortError());
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', handleAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener('abort', handleAbort, { once: true });
   });
-  let result = {};
-  try {
-    result = await response.json();
-  } catch {
-    result = {};
+}
+
+async function requestGroupOperation(payload, signal) {
+  let attempt = 0;
+  while (true) {
+    try {
+      const response = await fetch('/api/group-ops', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal,
+      });
+      let result = {};
+      try {
+        result = await response.json();
+      } catch {
+        result = {};
+      }
+      if (!response.ok || !result.ok) {
+        const error = new Error(result.error || `group_api_${response.status}`);
+        error.code = result.error || `group_api_${response.status}`;
+        error.status = response.ok && !result.error ? 502 : response.status;
+        error.snapshot = result.snapshot
+          ? normalizeSnapshot({ snapshot: result.snapshot }, payload.groupId)
+          : undefined;
+        throw error;
+      }
+      return result;
+    } catch (error) {
+      const retryCount = groupOperationRetryCount(error);
+      if (signal?.aborted || attempt >= retryCount) throw error;
+      const delay = attempt === 0 ? 350 : 900;
+      attempt += 1;
+      await waitForRetry(delay, signal);
+    }
   }
-  if (!response.ok || !result.ok) {
-    const error = new Error(result.error || `group_api_${response.status}`);
-    error.status = response.ok && !result.error ? 502 : response.status;
-    error.snapshot = result.snapshot
-      ? normalizeSnapshot({ snapshot: result.snapshot }, payload.groupId)
-      : undefined;
-    throw error;
-  }
-  return result;
 }
 
 function isFallbackEligible(error) {
