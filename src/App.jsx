@@ -868,6 +868,7 @@ function App() {
       scopeByDeal: loadJson(OWNER_DEAL_SCOPES_KEY, {}),
       ownerScope: activeOwnerScope,
       createdDeals,
+      events: getEvents(),
       migrationCompleted: migrationState.completed === true,
     });
     if (migrationState.completed === true) return;

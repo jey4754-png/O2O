@@ -1,5 +1,6 @@
 const OWNER_DEAL_ID_PATTERN = /^owner-[a-zA-Z0-9-]{1,100}$/;
 const MIN_CAPABILITY_LENGTH = 32;
+const LEGACY_EVENT_MAX_TIME_DISTANCE_MS = 15 * 60 * 1000;
 
 export const OWNER_CLAIM_BATCH_SIZE = 50;
 
@@ -41,11 +42,56 @@ export function assignOwnerDealScope(scopeByDeal = {}, dealId, ownerScope = '') 
   return { scopeByDeal: nextScopeByDeal, allowed: true, changed: false };
 }
 
+function comparableText(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLocaleLowerCase('ko-KR');
+}
+
+function eventOwnerScope(event = {}) {
+  if (event?.name !== 'owner_product_created') return '';
+  const properties = event?.properties || {};
+  if (properties.tester_type !== '사장님') return '';
+  const phone = String(properties.customer_phone || '').replace(/\D/g, '');
+  return phone.length >= 8 ? `phone:${phone}` : '';
+}
+
+function validTimestamp(value) {
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+export function legacyOwnerEventMatchesDeal(event = {}, deal = {}, ownerScope = '') {
+  if (!ownerScope || eventOwnerScope(event) !== ownerScope) return false;
+  const properties = event?.properties || {};
+  const eventTime = validTimestamp(event.timestamp);
+  const dealTime = validTimestamp(deal.createdAt);
+  if (
+    eventTime === null
+    || dealTime === null
+    || Math.abs(eventTime - dealTime) > LEGACY_EVENT_MAX_TIME_DISTANCE_MS
+  ) {
+    return false;
+  }
+
+  const pairs = [
+    [properties.store_name, deal.store],
+    [properties.product_name, deal.title],
+    [properties.region, deal.region],
+    [properties.district, deal.district],
+    [properties.neighborhood, deal.neighborhood],
+  ];
+  return pairs.every(([eventValue, dealValue]) => {
+    const normalizedEventValue = comparableText(eventValue);
+    const normalizedDealValue = comparableText(dealValue);
+    return Boolean(normalizedEventValue && normalizedDealValue && normalizedEventValue === normalizedDealValue);
+  });
+}
+
 export function adoptLegacyOwnerScopes({
   capabilities = {},
   scopeByDeal = {},
   ownerScope = '',
   createdDeals = [],
+  events = [],
   migrationCompleted = false,
 } = {}) {
   const nextScopeByDeal = { ...scopeByDeal };
@@ -57,17 +103,34 @@ export function adoptLegacyOwnerScopes({
     };
   }
 
-  let changed = false;
-  createdDeals.forEach((deal) => {
+  const eligibleDeals = createdDeals.filter((deal) => {
     const dealId = String(deal?.id || '');
-    if (
+    return !(
       deal?.source !== 'merchant'
       || !isOwnerDealId(dealId)
       || nextScopeByDeal[dealId]
       || !isUsableOwnerCapability(capabilities?.[dealId])
-    ) {
-      return;
-    }
+    );
+  });
+  const eventMatches = new Map();
+  const dealMatches = new Map();
+  eligibleDeals.forEach((deal) => {
+    const matchingEventIndexes = events.flatMap((event, index) => (
+      legacyOwnerEventMatchesDeal(event, deal, ownerScope) ? [index] : []
+    ));
+    dealMatches.set(deal.id, matchingEventIndexes);
+    matchingEventIndexes.forEach((index) => {
+      eventMatches.set(index, [...(eventMatches.get(index) || []), deal.id]);
+    });
+  });
+
+  let changed = false;
+  eligibleDeals.forEach((deal) => {
+    const matchingEventIndexes = dealMatches.get(deal.id) || [];
+    if (matchingEventIndexes.length !== 1) return;
+    const [eventIndex] = matchingEventIndexes;
+    if ((eventMatches.get(eventIndex) || []).length !== 1) return;
+    const dealId = String(deal.id);
     nextScopeByDeal[dealId] = ownerScope;
     changed = true;
   });
