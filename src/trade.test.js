@@ -20,6 +20,7 @@ import {
   getPreviousGroupStatus,
   normalizeCategory,
   resolveGroupDealProgress,
+  resolveMerchantGroupPricing,
   resolveOwnerProductQuantity,
   transitionGroupStatus,
   transitionPaymentStatus,
@@ -61,6 +62,52 @@ test('owner quantity preserves active group allocations and a minimum instant st
     saleType: 'instant',
     stock: 2000,
   }).quantity, MAX_PRODUCT_QUANTITY);
+});
+
+test('merchant group stock never becomes the price divisor without an explicit split quantity', () => {
+  const bouquet = resolveMerchantGroupPricing({
+    originalPrice: 13000,
+    discountRate: 15,
+    totalQuantity: 5,
+    splitQuantity: 1,
+  });
+  assert.equal(bouquet.discountedTotal, 11050);
+  assert.equal(bouquet.totalQuantity, 5);
+  assert.equal(bouquet.splitQuantity, 1);
+  assert.equal(bouquet.unitPrice, 11050);
+  assert.equal(bouquet.splitPricing, false);
+
+  const moreStock = resolveMerchantGroupPricing({
+    originalPrice: 13000,
+    discountRate: 15,
+    totalQuantity: 10,
+    splitQuantity: 1,
+  });
+  assert.equal(moreStock.unitPrice, 11050);
+  assert.equal(moreStock.totalQuantity, 10);
+
+  const explicitlySplit = resolveMerchantGroupPricing({
+    originalPrice: 13000,
+    discountRate: 15,
+    totalQuantity: 5,
+    splitQuantity: 5,
+  });
+  assert.equal(explicitlySplit.unitPrice, 2210);
+  assert.equal(explicitlySplit.splitPricing, true);
+});
+
+test('merchant split quantity is clamped independently within the order capacity', () => {
+  const pricing = resolveMerchantGroupPricing({
+    originalPrice: 10000,
+    discountRate: 0,
+    totalQuantity: 3,
+    splitQuantity: 20,
+  });
+  assert.equal(pricing.totalQuantity, 3);
+  assert.equal(pricing.splitQuantity, 3);
+  assert.equal(pricing.unitPrice, 3333);
+  assert.equal(pricing.remainder, 1);
+  assert.equal(pricing.approximate, true);
 });
 
 test('PRODUCT_CATEGORIES contains the exact agreed 11 categories', () => {
@@ -276,12 +323,13 @@ test('calculateProductAllocation rejects invalid quantities', () => {
   assert.throws(() => calculateProductAllocation(41500, 7, 1.5), /within the total/);
 });
 
-test('merchant group allocation uses the discounted bundle total', () => {
+test('legacy merchant group allocation uses the discounted bundle total', () => {
   const allocation = calculateGroupDealAllocation({
     source: 'merchant',
     saleType: 'group',
     originalPrice: 10000,
     discountRate: 10,
+    splitPricing: true,
   }, 4, 2);
 
   assert.equal(allocation.total, 9000);
@@ -292,6 +340,34 @@ test('merchant group allocation uses the discounted bundle total', () => {
     originalPrice: 10000,
     discountRate: 10,
   }, 4).total, 10000);
+});
+
+test('explicit merchant pricing multiplies the discounted unit price by the ordered quantity', () => {
+  const unitSale = calculateGroupDealAllocation({
+    source: 'merchant',
+    saleType: 'group',
+    originalPrice: 13000,
+    discountRate: 15,
+    pricingModel: 'explicit_split',
+    splitQuantity: 1,
+  }, 5, 2);
+  assert.equal(unitSale.unitPrice, 11050);
+  assert.equal(unitSale.selectedAmount, 22100);
+  assert.equal(unitSale.productQuantity, 5);
+  assert.equal(unitSale.splitQuantity, 1);
+  assert.equal(unitSale.remainingQuantity, 3);
+
+  const splitSale = calculateGroupDealAllocation({
+    source: 'merchant',
+    saleType: 'group',
+    originalPrice: 13000,
+    discountRate: 15,
+    pricingModel: 'explicit_split',
+    splitQuantity: 5,
+  }, 5, 2);
+  assert.equal(splitSale.unitPrice, 2210);
+  assert.equal(splitSale.selectedAmount, 4420);
+  assert.equal(splitSale.splitQuantity, 5);
 });
 
 test('merchant group progress keeps product quantities separate from participant counts', () => {

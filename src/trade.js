@@ -125,6 +125,31 @@ export function resolveOwnerProductQuantity({
   };
 }
 
+export function resolveMerchantGroupPricing({
+  originalPrice = 0,
+  discountRate = 0,
+  totalQuantity = 1,
+  splitQuantity = 1,
+} = {}) {
+  const capacity = Math.min(
+    MAX_PRODUCT_QUANTITY,
+    Math.max(1, Math.floor(Number(totalQuantity) || 1)),
+  );
+  const divisor = Math.min(
+    capacity,
+    Math.max(1, Math.floor(Number(splitQuantity) || 1)),
+  );
+  const discountedTotal = discountedPrice(originalPrice, discountRate);
+  const allocation = calculateProductAllocation(discountedTotal, divisor, 1);
+  return {
+    ...allocation,
+    totalQuantity: capacity,
+    splitQuantity: divisor,
+    discountedTotal,
+    splitPricing: divisor > 1,
+  };
+}
+
 function hasValue(collection, value) {
   return collection.includes(value);
 }
@@ -370,10 +395,53 @@ export function calculateProductAllocation(total, productQuantity, selectedQuant
 }
 
 export function calculateGroupDealAllocation(deal, productQuantity, selectedQuantity = 1) {
-  const total = deal?.source === 'merchant' && deal?.saleType === 'group'
-    ? discountedPrice(deal.originalPrice, deal.discountRate)
-    : Math.max(0, Math.floor(Number(deal?.originalPrice || 0)));
-  return calculateProductAllocation(total, productQuantity, selectedQuantity);
+  const merchantGroup = deal?.source === 'merchant' && deal?.saleType === 'group';
+  if (!merchantGroup) {
+    return calculateProductAllocation(
+      Math.max(0, Math.floor(Number(deal?.originalPrice || 0))),
+      productQuantity,
+      selectedQuantity,
+    );
+  }
+
+  const capacity = Math.min(
+    MAX_PRODUCT_QUANTITY,
+    Math.max(1, Math.floor(Number(productQuantity) || 1)),
+  );
+  const normalizedSelectedQuantity = normalizedInteger(selectedQuantity);
+  if (
+    normalizedSelectedQuantity === null
+    || normalizedSelectedQuantity < 0
+    || normalizedSelectedQuantity > capacity
+  ) {
+    throw new RangeError('selectedQuantity must be an integer within the total product quantity');
+  }
+  const hasExplicitSplitQuantity = Number.isInteger(Number(deal?.splitQuantity))
+    && Number(deal.splitQuantity) > 0;
+  const splitQuantity = hasExplicitSplitQuantity
+    ? Number(deal.splitQuantity)
+    : deal?.splitPricing === true ? capacity : 1;
+  const pricing = resolveMerchantGroupPricing({
+    originalPrice: deal.originalPrice,
+    discountRate: deal.discountRate,
+    totalQuantity: capacity,
+    splitQuantity,
+  });
+  const selectedAmount = pricing.unitPrice * normalizedSelectedQuantity;
+
+  return {
+    total: pricing.discountedTotal,
+    productQuantity: capacity,
+    splitQuantity: pricing.splitQuantity,
+    selectedQuantity: normalizedSelectedQuantity,
+    unitPrice: pricing.unitPrice,
+    allocated: pricing.allocated,
+    approximate: pricing.approximate,
+    remainder: pricing.remainder,
+    selectedAmount,
+    hostSelectedAmount: selectedAmount + pricing.remainder,
+    remainingQuantity: capacity - normalizedSelectedQuantity,
+  };
 }
 
 export function resolveGroupDealProgress(deal = {}, group = {}) {

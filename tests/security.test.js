@@ -1672,6 +1672,255 @@ test('manager transitions are one-step, reversible, role-scoped, and compare-and
   );
 });
 
+test('group payment synchronization accepts only active purchase orders with exact reservation provenance', () => {
+  const collector = appsScriptContext();
+  const groupId = 'owner-payment-binding-test';
+  const actorId = 'visitor-payment-binding-test';
+  const history = [{
+    rowNumber: 2,
+    groupId,
+    fromStatus: '0',
+    toStatus: '2',
+    action: 'join',
+    actorId,
+    mutationId: 'join-payment-binding-test',
+  }];
+  const boundOrder = {
+    id: 'order-1234567890463',
+    type: 'purchase',
+    status: 'new',
+    paymentStatus: 'pending',
+    groupId,
+    dealId: groupId,
+    visitorId: actorId,
+    participantActorId: actorId,
+    selectedCount: 2,
+    reservationMutationId: 'join-payment-binding-test',
+    reservationAction: 'join',
+    reservationQuantity: 2,
+    _reservationMutationId: 'join-payment-binding-test',
+    _reservationAction: 'join',
+    _reservationQuantity: 2,
+  };
+
+  assert.equal(
+    collector.verifiedBoundGroupPurchaseOrder_(boundOrder, groupId, actorId, history),
+    true,
+  );
+  [
+    { ...boundOrder, type: 'group' },
+    { ...boundOrder, status: 'cancelled' },
+    { ...boundOrder, participantActorId: 'visitor-other-payment-binding' },
+    { ...boundOrder, _reservationMutationId: '' },
+    { ...boundOrder, reservationQuantity: 1 },
+    { ...boundOrder, selectedCount: 1 },
+  ].forEach((invalidOrder) => {
+    assert.equal(
+      collector.verifiedBoundGroupPurchaseOrder_(invalidOrder, groupId, actorId, history),
+      false,
+    );
+  });
+  assert.equal(
+    collector.verifiedBoundGroupPurchaseOrder_(boundOrder, groupId, actorId, []),
+    false,
+  );
+});
+
+test('group payment transition updates every verified bound order and ignores unverified lookalikes', () => {
+  const collector = appsScriptContext();
+  collector.Utilities = { getUuid: () => 'history-payment-sync-test' };
+  const groupId = 'owner-payment-sync-test';
+  const actorId = 'visitor-payment-sync-test';
+  const makeOrder = (id, quantity, mutationId, action) => ({
+    id,
+    createdAt: '2026-08-31T08:00:00.000Z',
+    type: 'purchase',
+    status: 'new',
+    paymentStatus: 'pending',
+    version: 1,
+    paymentVersion: 1,
+    groupId,
+    dealId: groupId,
+    visitorId: actorId,
+    participantActorId: actorId,
+    selectedCount: quantity,
+    reservationMutationId: mutationId,
+    reservationAction: action,
+    reservationQuantity: quantity,
+    _reservationMutationId: mutationId,
+    _reservationAction: action,
+    _reservationQuantity: quantity,
+    statusHistory: [],
+  });
+  const first = makeOrder('order-1234567890464', 2, 'join-payment-sync-test', 'join');
+  const second = makeOrder('order-1234567890465', 1, 'reserve-payment-sync-test', 'reserve_quantity');
+  const unverified = {
+    ...makeOrder('order-1234567890466', 1, 'missing-payment-sync-test', 'reserve_quantity'),
+    reservationMutationId: '',
+    _reservationMutationId: '',
+  };
+  const customerRows = [first, second, unverified].map((order) => [
+    new Date(order.createdAt), order.id, '01012345678', JSON.stringify(order),
+  ]);
+  const historyRows = [
+    ['', groupId, '', '', '0', '2', 'join', actorId, '', '', 'join-payment-sync-test', 1, '', ''],
+    ['', groupId, '', '', '2', '3', 'reserve_quantity', actorId, '', '', 'reserve-payment-sync-test', 2, '', ''],
+  ];
+  const capabilityHash = 'a'.repeat(64);
+  const participantRows = [[
+    groupId,
+    actorId,
+    '결제테스터',
+    'member',
+    true,
+    'requested',
+    0,
+    capabilityHash,
+    4,
+    '2026-08-31T08:00:00.000Z',
+    '2026-08-31T08:30:00.000Z',
+    3,
+  ]];
+  const memorySheet = (rows) => ({
+    getLastRow() { return rows.length + 1; },
+    appendRow(value) { rows.push(value.slice()); },
+    getRange(row, column, rowCount, columnCount) {
+      return {
+        getValues() {
+          return rows.slice(row - 2, row - 2 + rowCount)
+            .map((source) => source.slice(column - 1, column - 1 + columnCount));
+        },
+        setValues(values) {
+          values.forEach((value, index) => {
+            rows[row - 2 + index] = value.slice();
+          });
+        },
+      };
+    },
+  });
+  const sheets = {
+    customerOrders: memorySheet(customerRows),
+    groupHistory: memorySheet(historyRows),
+    groupParticipants: memorySheet(participantRows),
+    events: {},
+  };
+  const now = '2026-08-31T09:00:00.000Z';
+
+  const requested = collector.syncGroupPaymentOrders_(
+    sheets,
+    groupId,
+    actorId,
+    'pending',
+    'requested',
+    actorId,
+    'member',
+    'payment-request-sync-test',
+    now,
+  );
+  assert.equal(requested.changedCount, 2);
+  assert.equal(requested.paymentStatus, 'requested');
+  assert.equal(JSON.parse(customerRows[0][3]).paymentStatus, 'requested');
+  assert.equal(JSON.parse(customerRows[1][3]).paymentStatus, 'requested');
+  assert.equal(JSON.parse(customerRows[2][3]).paymentStatus, 'pending');
+
+  const confirmed = collector.syncGroupPaymentOrders_(
+    sheets,
+    groupId,
+    actorId,
+    'requested',
+    'confirmed',
+    'merchant-owner-payment-sync-test',
+    'merchant_owner',
+    'payment-confirm-sync-test',
+    now,
+  );
+  assert.equal(confirmed.changedCount, 2);
+  assert.equal(confirmed.paymentStatus, 'confirmed');
+  assert.equal(JSON.parse(customerRows[0][3]).paymentStatus, 'confirmed');
+  assert.equal(JSON.parse(customerRows[1][3]).paymentStatus, 'confirmed');
+
+  const participantSync = collector.syncParticipantPaymentFromOrders_(
+    sheets,
+    groupId,
+    actorId,
+    'merchant-owner-payment-sync-test',
+    'merchant_owner',
+    'participant-confirm-sync-test',
+    now,
+  );
+  assert.equal(participantSync.changed, true);
+  assert.equal(participantSync.paymentStatus, 'confirmed');
+  assert.equal(participantRows[0][5], 'confirmed');
+  assert.equal(participantRows[0][7], capabilityHash);
+  assert.equal(participantRows[0][8], 5);
+});
+
+test('participant payment projection repairs stale owner views without changing CAS versions', () => {
+  const collector = appsScriptContext();
+  const base = {
+    paymentStatus: 'pending',
+    version: 7,
+    paymentVersion: 7,
+    paymentRequestedAt: '',
+    paymentConfirmedAt: '',
+  };
+  const requestedAt = '2026-08-31T09:10:00.000Z';
+  const requested = collector.projectOrderPaymentFromParticipant_(base, {
+    paymentStatus: 'requested',
+    updatedAt: requestedAt,
+  });
+  assert.equal(requested.paymentStatus, 'requested');
+  assert.equal(requested.paymentRequestedAt, requestedAt);
+  assert.equal(requested.version, 7);
+  assert.equal(base.paymentStatus, 'pending');
+
+  const confirmed = collector.projectOrderPaymentFromParticipant_(requested, {
+    paymentStatus: 'confirmed',
+    updatedAt: requestedAt,
+  });
+  assert.equal(confirmed.paymentStatus, 'confirmed');
+  assert.equal(confirmed.paymentConfirmedAt, requestedAt);
+  assert.equal(confirmed.version, 7);
+});
+
+test('merchant group payments require a participant request while instant orders remain directly confirmable', () => {
+  const collector = appsScriptContext();
+  const groupDeal = {
+    id: 'owner-payment-request-test',
+    source: 'merchant',
+    saleType: 'group',
+  };
+  assert.throws(
+    () => collector.requireMerchantGroupPaymentRequest_({
+      groupId: groupDeal.id,
+      paymentStatus: 'pending',
+    }, groupDeal, 'payment_status', 'next'),
+    (error) => error?.code === 'payment_request_required',
+  );
+  assert.throws(
+    () => collector.requireMerchantGroupPaymentRequest_({
+      groupId: groupDeal.id,
+      paymentStatus: 'pending',
+    }, {
+      id: groupDeal.id,
+      source: 'merchant',
+    }, 'payment_status', 'next'),
+    (error) => error?.code === 'payment_request_required',
+  );
+  assert.equal(collector.requireMerchantGroupPaymentRequest_({
+    groupId: groupDeal.id,
+    paymentStatus: 'requested',
+  }, groupDeal, 'payment_status', 'next'), true);
+  assert.equal(collector.requireMerchantGroupPaymentRequest_({
+    groupId: '',
+    paymentStatus: 'pending',
+  }, {
+    id: 'owner-instant-payment-test',
+    source: 'merchant',
+    saleType: 'instant',
+  }, 'payment_status', 'next'), true);
+});
+
 test('merchant order management requires the exact deal owner capability', () => {
   const collector = appsScriptContext();
   const ownerHash = 'a'.repeat(64);

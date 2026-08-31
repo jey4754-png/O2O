@@ -337,17 +337,19 @@ function getOwnerPublicDealsResponse_(claimsValue) {
   }
 }
 
-function ownerScopedOrders_(orders, authorizedDealIds) {
+function ownerScopedOrders_(orders, authorizedDealIds, sheets) {
   return mergeCustomerOrderSnapshots_(orders || []).filter(function(order) {
     return Boolean(authorizedDealIds[customerOrderDealId_(order)]);
-  }).map(publicOrderValue_);
+  }).map(function(order) {
+    return publicOrderValue_(sheets ? projectStoredGroupOrderPayment_(sheets, order) : order);
+  });
 }
 
 function getOwnerCustomerOrdersResponse_(claimsValue) {
   try {
     const sheets = ensureSheets_();
     const authorized = authorizedOwnerDealIds_(sheets, claimsValue);
-    const orders = ownerScopedOrders_(storedCustomerOrders_(sheets.customerOrders), authorized);
+    const orders = ownerScopedOrders_(storedCustomerOrders_(sheets.customerOrders), authorized, sheets);
     return json_({ ok: true, orders: orders });
   } catch (error) {
     return json_({ ok: false, error: error.code || 'owner_orders_failed' });
@@ -396,6 +398,250 @@ function activePurchaseOrder_(order) {
     && String(order.status || '') !== 'cancelled'
     && String(order.paymentStatus || '') !== 'cancelled'
   );
+}
+
+function verifiedBoundGroupPurchaseOrder_(order, groupIdValue, actorIdValue, reservationHistoryValue) {
+  const groupId = String(groupIdValue || '');
+  const actorId = String(actorIdValue || '');
+  if (!groupId || !actorId || !activePurchaseOrder_(order)) return false;
+  if (String(order.groupId || '') !== groupId
+    || customerOrderDealId_(order) !== groupId
+    || String(order.participantActorId || order.visitorId || '') !== actorId) {
+    return false;
+  }
+
+  const mutationId = String(order._reservationMutationId || '');
+  const action = String(order._reservationAction || '');
+  const quantity = Number(order._reservationQuantity || 0);
+  if (!mutationId || !['create', 'join', 'reserve_quantity'].includes(action)
+    || !Number.isInteger(quantity) || quantity < 1
+    || String(order.reservationMutationId || '') !== mutationId
+    || String(order.reservationAction || '') !== action
+    || Number(order.reservationQuantity || 0) !== quantity
+    || customerOrderQuantity_(order) !== quantity) {
+    return false;
+  }
+
+  const history = Array.isArray(reservationHistoryValue) ? reservationHistoryValue : [];
+  const reservation = history.find(function(item) {
+    return String(item && item.mutationId || '') === mutationId
+      && String(item && item.action || '') === action;
+  });
+  return Boolean(
+    reservation
+    && customerOrderReservationQuantity_(reservation, history, quantity) === quantity
+  );
+}
+
+function groupPaymentOrderRecords_(sheets, groupIdValue, actorIdValue) {
+  const groupId = String(groupIdValue || '');
+  const actorId = String(actorIdValue || '');
+  const sheet = sheets && sheets.customerOrders;
+  if (!sheet || !groupId || !actorId || sheet.getLastRow() < 2) return [];
+  const reservationHistory = customerOrderReservationHistory_(sheets, groupId, actorId);
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, CUSTOMER_ORDER_HEADERS.length)
+    .getValues()
+    .map(function(row, index) {
+      try {
+        const order = JSON.parse(row[3] || '{}');
+        return { rowNumber: index + 2, order: order };
+      } catch (error) {
+        return null;
+      }
+    })
+    .filter(function(record) {
+      return Boolean(
+        record
+        && verifiedBoundGroupPurchaseOrder_(
+          record.order,
+          groupId,
+          actorId,
+          reservationHistory
+        )
+      );
+    });
+}
+
+function applyGroupPaymentStatusToOrder_(
+  orderValue,
+  fromStatusValue,
+  toStatusValue,
+  actorIdValue,
+  actorRoleValue,
+  mutationIdValue,
+  nowValue
+) {
+  const order = Object.assign({}, orderValue || {});
+  const before = String(order.paymentStatus || 'pending');
+  const fromStatus = String(fromStatusValue || '');
+  const toStatus = String(toStatusValue || '');
+  const allowed = (fromStatus === 'pending' && toStatus === 'requested' && before === 'pending')
+    || (fromStatus === 'requested' && toStatus === 'pending' && before === 'requested')
+    || (fromStatus === 'requested' && toStatus === 'confirmed'
+      && ['pending', 'requested'].includes(before))
+    || (fromStatus === 'confirmed' && toStatus === 'requested' && before === 'confirmed');
+  if (!allowed) return { order: order, changed: false };
+
+  const now = nowValue || new Date().toISOString();
+  const nextVersion = secureOrderVersion_(order) + 1;
+  order.paymentStatus = toStatus;
+  order.paymentRequestedAt = toStatus === 'pending'
+    ? ''
+    : (order.paymentRequestedAt || now);
+  order.paymentConfirmedAt = toStatus === 'confirmed' ? now : '';
+  order.statusUpdatedAt = now;
+  order.syncedAt = now;
+  order.version = nextVersion;
+  order.paymentVersion = nextVersion;
+  order.statusHistory = (Array.isArray(order.statusHistory) ? order.statusHistory : []).concat([{
+    status: String(order.status || 'new'),
+    before: before,
+    after: toStatus,
+    actor: String(actorIdValue || ''),
+    actorRole: String(actorRoleValue || ''),
+    action: 'sync_group_payment_status',
+    clientMutationId: String(mutationIdValue || ''),
+    version: nextVersion,
+    timestamp: now
+  }]).slice(-100);
+  return { order: order, changed: true };
+}
+
+function aggregateGroupOrderPaymentStatus_(ordersValue) {
+  const orders = (ordersValue || []).filter(activePurchaseOrder_);
+  if (!orders.length) return '';
+  if (orders.every(function(order) { return String(order.paymentStatus || 'pending') === 'confirmed'; })) {
+    return 'confirmed';
+  }
+  if (orders.some(function(order) { return String(order.paymentStatus || 'pending') === 'requested'; })) {
+    return 'requested';
+  }
+  return 'pending';
+}
+
+function projectOrderPaymentFromParticipant_(orderValue, participantValue) {
+  const order = Object.assign({}, orderValue || {});
+  const participantStatus = String(participantValue && participantValue.paymentStatus || 'pending');
+  const orderStatus = String(order.paymentStatus || 'pending');
+  const rank = { pending: 0, requested: 1, confirmed: 2 };
+  if (rank[participantStatus] === undefined || rank[orderStatus] === undefined
+    || rank[participantStatus] <= rank[orderStatus]) {
+    return order;
+  }
+  const timestamp = String(participantValue && participantValue.updatedAt || order.statusUpdatedAt || '');
+  order.paymentStatus = participantStatus;
+  order.paymentRequestedAt = order.paymentRequestedAt || timestamp;
+  order.paymentConfirmedAt = participantStatus === 'confirmed'
+    ? (order.paymentConfirmedAt || timestamp)
+    : '';
+  return order;
+}
+
+function projectStoredGroupOrderPayment_(sheets, orderValue) {
+  const order = Object.assign({}, orderValue || {});
+  const groupId = String(order.groupId || '');
+  const actorId = String(order.participantActorId || order.visitorId || '');
+  if (!groupId || !actorId) return order;
+  const reservationHistory = customerOrderReservationHistory_(sheets, groupId, actorId);
+  if (!verifiedBoundGroupPurchaseOrder_(order, groupId, actorId, reservationHistory)) return order;
+  const participant = getParticipantRecord_(sheets, groupId, actorId, false);
+  return participant ? projectOrderPaymentFromParticipant_(order, participant) : order;
+}
+
+function syncGroupPaymentOrders_(
+  sheets,
+  groupId,
+  participantActorId,
+  fromStatus,
+  toStatus,
+  actorId,
+  actorRole,
+  mutationId,
+  now
+) {
+  const records = groupPaymentOrderRecords_(sheets, groupId, participantActorId);
+  let changedCount = 0;
+  records.forEach(function(record) {
+    const transition = applyGroupPaymentStatusToOrder_(
+      record.order,
+      fromStatus,
+      toStatus,
+      actorId,
+      actorRole,
+      mutationId,
+      now
+    );
+    if (!transition.changed) return;
+    record.order = transition.order;
+    updateCustomerOrderRecord_(sheets, record);
+    changedCount += 1;
+    try {
+      appendCustomerOrderSnapshotEvent_(
+        sheets.events,
+        record.order,
+        String(record.order._customerCapabilityHash || '')
+      );
+    } catch (error) {}
+  });
+  return {
+    records: records,
+    changedCount: changedCount,
+    paymentStatus: aggregateGroupOrderPaymentStatus_(records.map(function(record) { return record.order; }))
+  };
+}
+
+function syncParticipantPaymentFromOrders_(
+  sheets,
+  groupIdValue,
+  actorIdValue,
+  managerActorId,
+  managerRole,
+  mutationId,
+  nowValue
+) {
+  const groupId = String(groupIdValue || '');
+  const actorId = String(actorIdValue || '');
+  if (!groupId || !actorId) return { changed: false, paymentStatus: '' };
+  const records = groupPaymentOrderRecords_(sheets, groupId, actorId);
+  const paymentStatus = aggregateGroupOrderPaymentStatus_(records.map(function(record) { return record.order; }));
+  if (!paymentStatus) return { changed: false, paymentStatus: '' };
+  const participant = getParticipantRecord_(sheets, groupId, actorId, true);
+  if (!participant || participant.paymentStatus === paymentStatus) {
+    return { changed: false, paymentStatus: paymentStatus };
+  }
+
+  const previous = participant.paymentStatus;
+  participant.paymentStatus = paymentStatus;
+  participant.version += 1;
+  participant.updatedAt = nowValue || new Date().toISOString();
+  updateParticipantRow_(sheets, participant);
+  appendGroupHistory_(sheets, {
+    groupId: groupId,
+    entityType: 'payment',
+    entityId: actorId,
+    fromStatus: previous,
+    toStatus: paymentStatus,
+    action: 'sync_order_payment_status',
+    actorId: String(managerActorId || ''),
+    actorRole: String(managerRole || ''),
+    clientMutationId: String(mutationId || ''),
+    version: participant.version,
+    createdAt: participant.updatedAt
+  });
+  return { changed: true, paymentStatus: paymentStatus };
+}
+
+function requireMerchantGroupPaymentRequest_(order, deal, kindValue, directionValue) {
+  if (String(kindValue || '') !== 'payment_status' || String(directionValue || '') !== 'next') {
+    return true;
+  }
+  const merchantGroup = String(deal && deal.source || '') === 'merchant'
+    && Boolean(String(order && order.groupId || ''))
+    && String(order && order.groupId || '') === String(deal && deal.id || '');
+  if (merchantGroup && String(order && order.paymentStatus || 'pending') !== 'requested') {
+    throw groupOperationError_('payment_request_required');
+  }
+  return true;
 }
 
 function customerOrderQuantity_(order) {
@@ -1441,7 +1687,7 @@ function manageCustomerOrder_(payload) {
     lock = acquireScriptLock_();
     const sheets = ensureSheets_();
     const record = getCustomerOrderRecord_(sheets, orderId);
-    const order = record.order;
+    let order = record.order;
     if (customerOrderDealId_(order) !== dealId) throw groupOperationError_('order_deal_conflict');
     if (String(order.status || '') === 'cancelled' || String(order.paymentStatus || '') === 'cancelled') {
       throw groupOperationError_('order_transition_forbidden');
@@ -1469,6 +1715,17 @@ function manageCustomerOrder_(payload) {
       throw groupOperationError_('order_manager_mismatch');
     }
 
+    if (String(order.groupId || '')) {
+      order = projectStoredGroupOrderPayment_(sheets, order);
+    }
+    const manageMutationExists = (Array.isArray(order.statusHistory) ? order.statusHistory : [])
+      .some(function(item) {
+        return String(item && item.clientMutationId || '') === mutationId;
+      });
+    if (source === 'merchant' && !manageMutationExists) {
+      requireMerchantGroupPaymentRequest_(order, publicDeal, kind, direction);
+    }
+
     const transition = applyManagedCustomerOrderTransition_(
       order,
       payload,
@@ -1476,6 +1733,18 @@ function manageCustomerOrder_(payload) {
       managerActorId
     );
     if (transition.duplicate) {
+      if (kind === 'payment_status' && String(transition.order.groupId || '')) {
+        syncParticipantPaymentFromOrders_(
+          sheets,
+          String(transition.order.groupId || ''),
+          String(transition.order.participantActorId || transition.order.visitorId || ''),
+          managerActorId,
+          managerRole,
+          mutationId,
+          String(transition.order.statusUpdatedAt || new Date().toISOString())
+        );
+        invalidateGroupSnapshot_(String(transition.order.groupId || ''));
+      }
       return json_({ ok: true, duplicate: true, order: publicOrderValue_(transition.order) });
     }
     record.order = transition.order;
@@ -1487,6 +1756,18 @@ function manageCustomerOrder_(payload) {
         String(record.order._customerCapabilityHash || '')
       );
     } catch (error) {}
+    if (kind === 'payment_status' && String(record.order.groupId || '')) {
+      syncParticipantPaymentFromOrders_(
+        sheets,
+        String(record.order.groupId || ''),
+        String(record.order.participantActorId || record.order.visitorId || ''),
+        managerActorId,
+        managerRole,
+        mutationId,
+        String(record.order.statusUpdatedAt || new Date().toISOString())
+      );
+      invalidateGroupSnapshot_(String(record.order.groupId || ''));
+    }
     invalidatePublicDealsCache_();
     return json_({ ok: true, order: publicOrderValue_(record.order) });
   } catch (error) {
@@ -1567,7 +1848,9 @@ function getCustomerOrders_(phoneValue, visitorIdValue, customerCapabilityHashVa
     visitorId,
     customerCapabilityHash
   );
-  return mergeCustomerOrderSnapshots_(authorized).map(publicOrderValue_);
+  return mergeCustomerOrderSnapshots_(authorized).map(function(order) {
+    return publicOrderValue_(projectStoredGroupOrderPayment_(sheets, order));
+  });
 }
 
 function getCustomerOrdersResponse_(phoneValue, visitorId, customerCapabilityHash) {
@@ -2533,6 +2816,17 @@ function executeGroupMutation_(action, payload, sheets) {
       throw groupOperationError_(actorId === participantActorId ? 'invalid_state_transition' : 'forbidden');
     }
     const previous = participant.paymentStatus;
+    const orderSync = syncGroupPaymentOrders_(
+      sheets,
+      groupId,
+      participantActorId,
+      previous,
+      nextStatus,
+      actorId,
+      actor.role,
+      mutationId,
+      now
+    );
     participant.paymentStatus = nextStatus;
     participant.version += 1;
     participant.updatedAt = now;
@@ -2541,7 +2835,8 @@ function executeGroupMutation_(action, payload, sheets) {
       groupId: groupId, entityType: 'payment', entityId: participantActorId,
       fromStatus: previous, toStatus: nextStatus, action: action, actorId: actorId,
       actorRole: actor.role, reason: groupText_(payload.reason, 200), clientMutationId: mutationId,
-      version: participant.version, createdAt: now
+      version: participant.version, createdAt: now,
+      result: { syncedOrderCount: orderSync.changedCount }
     });
   } else if (action === 'update_target') {
     requireTargetManager_(actor);
@@ -2675,7 +2970,9 @@ function getCustomerOrdersByGroup_(payload) {
     }
     const historic = historicCustomerOrders_(sheets.events, '', dealId)
       .filter(function(order) { return String(order.groupId || '') === groupId; });
-    const orders = mergeCustomerOrderSnapshots_(current.concat(historic)).map(publicOrderValue_);
+    const orders = mergeCustomerOrderSnapshots_(current.concat(historic)).map(function(order) {
+      return publicOrderValue_(projectStoredGroupOrderPayment_(sheets, order));
+    });
     return json_({ ok: true, orders: orders });
   } catch (error) {
     return json_({ ok: false, error: error.code || 'customer_orders_group_failed' });

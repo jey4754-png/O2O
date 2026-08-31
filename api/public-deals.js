@@ -6,6 +6,8 @@ const CAPABILITY_HASH_PATTERN = /^[a-f0-9]{64}$/;
 const DEAL_ID_PATTERN = /^(owner|customer)-[a-zA-Z0-9-]{1,100}$/;
 const OWNER_DEAL_ID_PATTERN = /^owner-[a-zA-Z0-9-]{1,100}$/;
 const OWNER_CLAIM_LIMIT = 50;
+const EXPLICIT_SPLIT_PRICING_MODEL = 'explicit_split';
+const EXPLICIT_SPLIT_PRICING_VERSION = 2;
 
 export const config = {
   maxDuration: 60,
@@ -137,6 +139,26 @@ function sanitizeDeal(input) {
   if (source === 'merchant' && groupId && groupId !== id) return null;
   const groupBacked = source === 'customer' || (source === 'merchant' && saleType === 'group');
   const totalQuantity = Math.max(1, Math.min(999, Math.floor(number(input.totalQuantity ?? input.target, 1))));
+  const rawPricingVersion = Number(input.pricingVersion);
+  const rawSplitQuantity = Number(input.splitQuantity);
+  const hasSplitQuantity = Object.prototype.hasOwnProperty.call(input, 'splitQuantity')
+    && input.splitQuantity !== ''
+    && input.splitQuantity !== null
+    && input.splitQuantity !== undefined
+    && Number.isFinite(rawSplitQuantity);
+  const explicitSplitPricing = source === 'merchant'
+    && saleType === 'group'
+    && (
+      input.pricingModel === EXPLICIT_SPLIT_PRICING_MODEL
+      || (Number.isFinite(rawPricingVersion) && Math.floor(rawPricingVersion) >= EXPLICIT_SPLIT_PRICING_VERSION)
+      || hasSplitQuantity
+    );
+  const splitQuantity = explicitSplitPricing
+    ? Math.max(1, Math.min(
+        totalQuantity,
+        Math.floor(hasSplitQuantity ? rawSplitQuantity : 1),
+      ))
+    : null;
   const orderedQuantity = Math.min(
     totalQuantity,
     Math.max(0, Math.floor(number(input.orderedQuantity ?? input.current, 0))),
@@ -179,7 +201,12 @@ function sanitizeDeal(input) {
     eventStart: text(input.eventStart, 80),
     eventEnd: text(input.eventEnd, 80),
     originalPrice: number(input.originalPrice),
-    splitPricing: Boolean(input.splitPricing),
+    splitPricing: explicitSplitPricing ? splitQuantity > 1 : Boolean(input.splitPricing),
+    ...(explicitSplitPricing ? {
+      pricingModel: EXPLICIT_SPLIT_PRICING_MODEL,
+      pricingVersion: EXPLICIT_SPLIT_PRICING_VERSION,
+      splitQuantity,
+    } : {}),
     expectedPerPerson: number(input.expectedPerPerson),
     unitPrice: number(input.unitPrice ?? input.expectedPerPerson),
     unitRemainder: number(input.unitRemainder ?? input.splitRemainder),

@@ -81,6 +81,7 @@ import {
   GROUP_STATUS_LABELS,
   normalizeCategory,
   PRODUCT_CATEGORIES,
+  resolveMerchantGroupPricing,
   resolveOwnerProductQuantity,
 } from './trade';
 import {
@@ -720,12 +721,70 @@ function loadProfile() {
 
 function isSplitMerchantDeal(deal = {}) {
   if (deal.source !== 'merchant' || deal.saleType !== 'group' || deal.menu?.length !== 1) return false;
+  if (
+    deal.pricingModel === 'explicit_split'
+    || Number(deal.pricingVersion || 0) >= 2
+    || Object.prototype.hasOwnProperty.call(deal, 'splitQuantity')
+  ) {
+    return Math.max(1, Math.floor(Number(deal.splitQuantity) || 1)) > 1;
+  }
   return deal.splitPricing === true
     || Number(deal.expectedPerPerson || 0) > 0
     || (Boolean(deal.approximatePrice) && Number(deal.totalQuantity || 0) > 0);
 }
 
+function getMerchantSplitQuantity(deal = {}) {
+  const totalQuantity = Math.min(999, Math.max(1, Math.floor(Number(
+    deal.totalQuantity ?? deal.productQuantity ?? deal.target ?? 1,
+  )) || 1));
+  if (Object.prototype.hasOwnProperty.call(deal, 'splitQuantity')) {
+    return clamp(Math.floor(Number(deal.splitQuantity) || 1), 1, totalQuantity);
+  }
+  return isSplitMerchantDeal(deal) ? totalQuantity : 1;
+}
+
 function migrateMerchantSplitDeal(deal = {}) {
+  const explicitPricing = deal.source === 'merchant'
+    && deal.saleType === 'group'
+    && (
+      deal.pricingModel === 'explicit_split'
+      || Number(deal.pricingVersion || 0) >= 2
+      || Object.prototype.hasOwnProperty.call(deal, 'splitQuantity')
+    );
+  if (explicitPricing) {
+    const totalQuantity = Math.min(999, Math.max(1, Math.floor(Number(
+      deal.totalQuantity ?? deal.productQuantity ?? deal.target ?? 1,
+    ))));
+    const pricing = resolveMerchantGroupPricing({
+      originalPrice: deal.originalPrice,
+      discountRate: deal.discountRate,
+      totalQuantity,
+      splitQuantity: deal.splitQuantity,
+    });
+    const orderedQuantity = Math.min(
+      totalQuantity,
+      Math.max(0, Number(deal.orderedQuantity ?? deal.current ?? 0)),
+    );
+    return {
+      ...deal,
+      pricingModel: 'explicit_split',
+      pricingVersion: 2,
+      splitPricing: pricing.splitPricing,
+      splitQuantity: pricing.splitQuantity,
+      totalQuantity,
+      productQuantity: totalQuantity,
+      orderedQuantity,
+      allocatedProductQuantity: orderedQuantity,
+      expectedPerPerson: pricing.unitPrice,
+      unitPrice: pricing.unitPrice,
+      splitRemainder: pricing.remainder,
+      unitRemainder: pricing.remainder,
+      approximatePrice: pricing.approximate,
+      menu: Array.isArray(deal.menu) && deal.menu.length
+        ? deal.menu.map((item, index) => (index === 0 ? { ...item, price: pricing.unitPrice } : item))
+        : deal.menu,
+    };
+  }
   if (isSplitMerchantDeal(deal)) return deal;
   const target = Math.min(999, Math.max(1, Math.floor(Number(deal.totalQuantity ?? deal.target ?? 1))));
   const discountedTotal = discountedPrice(deal.originalPrice, deal.discountRate);
@@ -799,6 +858,14 @@ function getDealQuantity(deal = {}) {
 
 function getOrderStage(order) {
   return ORDER_STAGES.find((stage) => stage.id === order.status) || ORDER_STAGES[0];
+}
+
+function getOrderPaymentStatus(order = {}) {
+  const status = String(order.paymentStatus || '');
+  if (['pending', 'requested', 'confirmed'].includes(status)) return status;
+  if (order.paymentConfirmedAt) return 'confirmed';
+  if (order.paymentRequestedAt) return 'requested';
+  return 'pending';
 }
 
 function normalizeRoute(pathname) {
@@ -1406,18 +1473,24 @@ function App() {
         Number(centralVersion?.orderedQuantity ?? centralVersion?.current ?? 0),
       );
     const hasActiveGroupOrders = previous?.saleType === 'group' && previousOrderedQuantity > 0;
-    const splitPricing = ownerProduct.saleType === 'group' || hasActiveGroupOrders;
+    const isGroupSale = ownerProduct.saleType === 'group' || hasActiveGroupOrders;
     const requestedTotalQuantity = resolveOwnerProductQuantity({
-      saleType: splitPricing ? 'group' : ownerProduct.saleType,
+      saleType: isGroupSale ? 'group' : ownerProduct.saleType,
       stock: ownerProduct.stock,
       maxQuantity: ownerProduct.maxQuantity,
-      minimumGroupQuantity: splitPricing ? previousOrderedQuantity : 1,
+      minimumGroupQuantity: isGroupSale ? previousOrderedQuantity : 1,
     }).quantity;
-    const totalQuantity = splitPricing
+    const totalQuantity = isGroupSale
       ? Math.max(requestedTotalQuantity, Math.ceil(previousOrderedQuantity))
       : requestedTotalQuantity;
     const discountedTotal = discountedPrice(ownerProduct.originalPrice, ownerProduct.discountRate);
-    const splitAllocation = calculateProductAllocation(discountedTotal, totalQuantity, 1);
+    const groupPricing = resolveMerchantGroupPricing({
+      originalPrice: ownerProduct.originalPrice,
+      discountRate: ownerProduct.discountRate,
+      totalQuantity,
+      splitQuantity: ownerProduct.splitQuantity,
+    });
+    const splitPricing = isGroupSale && groupPricing.splitPricing;
     const orderedQuantity = editingId ? previousOrderedQuantity : 0;
     const dealId = editingId || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`;
     const capabilityToken = getDealCapability(dealId, {
@@ -1431,7 +1504,7 @@ function App() {
       createdAt: previous?.createdAt || new Date().toISOString(),
       visibility: 'public',
       source: 'merchant',
-      saleType: splitPricing ? 'group' : ownerProduct.saleType,
+      saleType: isGroupSale ? 'group' : ownerProduct.saleType,
       category: normalizeCategory(ownerProduct.category),
       region: ownerProduct.region,
       district: ownerProduct.district,
@@ -1456,31 +1529,36 @@ function App() {
         : 0,
       quantityTracking: true,
       target: totalQuantity,
-      groupId: splitPricing ? dealId : '',
-      targetCount: splitPricing ? Math.min(20, totalQuantity) : 0,
+      groupId: isGroupSale ? dealId : '',
+      targetCount: isGroupSale ? Math.min(20, totalQuantity) : 0,
       currentCount: 0,
-      groupStatus: splitPricing ? 'recruiting' : '',
+      groupStatus: isGroupSale ? 'recruiting' : '',
       chatLocked: false,
-      hostMode: splitPricing ? 'recruiting' : 'self',
+      hostMode: isGroupSale ? 'recruiting' : 'self',
       hostActorId: '',
       hostMatched: false,
       totalQuantity,
       productQuantity: totalQuantity,
       orderedQuantity: editingId ? orderedQuantity : 0,
       allocatedProductQuantity: editingId ? orderedQuantity : 0,
+      pricingModel: isGroupSale ? 'explicit_split' : '',
+      pricingVersion: isGroupSale ? 2 : 0,
       splitPricing,
-      expectedPerPerson: splitPricing ? splitAllocation.unitPrice : 0,
-      splitRemainder: splitPricing ? splitAllocation.remainder : 0,
-      approximatePrice: splitPricing ? splitAllocation.approximate : false,
+      splitQuantity: isGroupSale ? groupPricing.splitQuantity : 1,
+      expectedPerPerson: isGroupSale ? groupPricing.unitPrice : 0,
+      unitPrice: isGroupSale ? groupPricing.unitPrice : discountedTotal,
+      splitRemainder: isGroupSale ? groupPricing.remainder : 0,
+      unitRemainder: isGroupSale ? groupPricing.remainder : 0,
+      approximatePrice: isGroupSale ? groupPricing.approximate : false,
       likes: 0,
       image: ownerProduct.image || fallbackImage,
       menu: [
         {
           id: 'owner-menu-1',
           name: ownerProduct.productName,
-          price: splitPricing ? splitAllocation.unitPrice : discountedTotal,
-          option: splitPricing
-            ? `${ownerProduct.methods.join(', ')} · 1개 예상금액`
+          price: isGroupSale ? groupPricing.unitPrice : discountedTotal,
+          option: isGroupSale
+            ? `${ownerProduct.methods.join(', ')} · ${splitPricing ? `${groupPricing.splitQuantity}개 분할 예상금액` : '할인 후 1개 가격'}`
             : ownerProduct.methods.join(', '),
         },
       ],
@@ -2074,8 +2152,8 @@ function App() {
     ) {
       return false;
     }
-    const existingOrder = orders.find((item) => item.id === managedOrder.id)
-      || scopedOwnerOrders.find((item) => item.id === managedOrder.id)
+    const existingOrder = scopedOwnerOrders.find((item) => item.id === managedOrder.id)
+      || orders.find((item) => item.id === managedOrder.id)
       || {};
     const mergedManagedOrder = {
       ...existingOrder,
@@ -2101,8 +2179,8 @@ function App() {
 
   const updateOrderStatus = async (orderId, direction = 'next') => {
     const requestOwnerScope = activeOwnerScope;
-    const order = orders.find((item) => item.id === orderId)
-      || scopedOwnerOrders.find((item) => item.id === orderId);
+    const order = scopedOwnerOrders.find((item) => item.id === orderId)
+      || orders.find((item) => item.id === orderId);
     if (!order || isCancelledOrder(order)) return;
     const currentStage = getOrderStage(order);
     const currentIndex = ORDER_STAGES.findIndex((stage) => stage.id === currentStage.id);
@@ -2158,11 +2236,13 @@ function App() {
 
   const confirmManualPayment = async (orderId, direction = 'next') => {
     const requestOwnerScope = activeOwnerScope;
-    const order = orders.find((item) => item.id === orderId)
-      || scopedOwnerOrders.find((item) => item.id === orderId);
+    const order = scopedOwnerOrders.find((item) => item.id === orderId)
+      || orders.find((item) => item.id === orderId);
     if (!order || isCancelledOrder(order) || order.type !== 'purchase') return;
-    if (direction === 'next' && order.paymentConfirmedAt) return;
-    if (direction === 'previous' && !order.paymentConfirmedAt) return;
+    const paymentStatus = getOrderPaymentStatus(order);
+    if (direction === 'next' && paymentStatus === 'confirmed') return;
+    if (direction === 'previous' && paymentStatus !== 'confirmed') return;
+    if (direction === 'next' && order.groupId && paymentStatus !== 'requested') return;
     const deal = deals.find((item) => item.id === order.dealId) || order.deal || {};
     if (!isOwnerDealInScope(deal.id, ownerScopeByDeal, requestOwnerScope)) return;
     const managedOrder = await manageCustomerOrder(order, deal, {
@@ -3256,6 +3336,7 @@ function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfir
             const syncIssue = orderSyncIssues[order.id] || null;
             const cancelled = isCancelledOrder(order);
             const orderStage = getOrderStage(order);
+            const paymentStatus = getOrderPaymentStatus(order);
             const orderStageIndex = ORDER_STAGES.findIndex((stage) => stage.id === orderStage.id);
             const groupRole = dealHasGroupRoom(deal)
               ? getGroupCredential(deal.id, order.visitorId)?.role || ''
@@ -3272,7 +3353,7 @@ function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfir
             const verificationComplete = !cancelled && order.type === 'purchase'
               && orderStage.id === 'completed'
               && Boolean(order.customerPickupConfirmedAt)
-              && Boolean(order.paymentConfirmedAt);
+              && paymentStatus === 'confirmed';
             return (
               <article className={cancelled ? 'order-card cancelled' : 'order-card'} key={order.id}>
                 <div className="order-status-line">
@@ -3309,9 +3390,17 @@ function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfir
                     <span>선택했던 수량이 공동구매의 남은 수량에 다시 반영되었습니다.</span>
                   </div>
                 ) : order.type === 'purchase' && (
-                  <div className={order.paymentConfirmedAt ? 'customer-payment-state confirmed' : 'customer-payment-state'}>
-                    <strong>{order.paymentConfirmedAt ? '수동 결제 확인 완료' : '가상 주문 접수 · 결제 확인 대기'}</strong>
-                    <span>{order.paymentConfirmedAt ? '사장님이 결제 확인 상태를 반영했습니다.' : '실제 결제 후 사장님이 확인하면 이 화면에 표시됩니다.'}</span>
+                  <div className={`customer-payment-state ${paymentStatus}`}>
+                    <strong>{paymentStatus === 'confirmed'
+                      ? '입금완료'
+                      : paymentStatus === 'requested' ? '입금확인요청 전송 완료' : '입금대기'}</strong>
+                    <span>{paymentStatus === 'confirmed'
+                      ? '사장님이 입금 완료 상태를 반영했습니다.'
+                      : paymentStatus === 'requested'
+                        ? '사장님이 실제 입금을 확인하면 완료 상태로 바뀝니다.'
+                        : order.groupId
+                          ? '입금 후 그룹 채팅에서 “입금했어요”를 눌러 확인을 요청해 주세요.'
+                          : '실제 결제 후 사장님이 확인하면 이 화면에 표시됩니다.'}</span>
                   </div>
                 )}
                 {verificationComplete && (
@@ -3745,14 +3834,20 @@ function DealDetail({
             <p>1인 구매 부담액 <b>{formatWon(Math.max(0, Number(deal.originalPrice || 0) - expectedPerPerson))} 감소</b></p>
             {productSplit.remainder > 0 && <p>나머지 {formatWon(productSplit.remainder)}은 호스트가 부담해 총액을 정확히 맞춥니다.</p>}
           </div>
-        ) : isSplitMerchant ? (
+        ) : isMerchantGroup ? (
           <div className="detail-price-grid split-merchant-price-grid">
             <span>정상가</span>
             <del>{formatWon(deal.originalPrice)}</del>
-            <span>할인 묶음 총액</span>
+            <span>{isSplitMerchant ? '할인 후 상품가격' : '할인 후 1개 가격'}</span>
             <strong>{formatWon(discountedPrice(deal.originalPrice, deal.discountRate))}</strong>
-            <span>제품 1개 예상금액</span>
-            <strong>{deal.approximatePrice ? '약 ' : ''}{formatWon(getDealPrice(deal))}</strong>
+            {isSplitMerchant && (
+              <>
+                <span>분할 1개당 예상금액</span>
+                <strong>{deal.approximatePrice ? '약 ' : ''}{formatWon(getDealPrice(deal))}</strong>
+              </>
+            )}
+            <span>가격 분할수량</span>
+            <strong>{getMerchantSplitQuantity(deal)}개</strong>
             <span>공구 총수량</span>
             <strong>{dealQuantity.target}개</strong>
           </div>
@@ -3885,13 +3980,13 @@ function DealDetail({
         ))}
       </div>
 
-      {isSplitMerchant && (
+      {isMerchantGroup && (
         <p className="evidence-note merchant-direct-group-note">
           사장님 상품 등록과 동시에 이 공동구매가 생성되어, 별도 그룹방을 다시 만들지 않고 바로 참여할 수 있습니다.
         </p>
       )}
 
-      <div className={isSplitMerchant && !showMerchantRoom ? 'sticky-actions single' : 'sticky-actions'}>
+      <div className={isMerchantGroup && !showMerchantRoom ? 'sticky-actions single' : 'sticky-actions'}>
         {isCustomerGroup ? (
           <>
             <button className="secondary-button room-entry-button" onClick={onOpenRoom}>
@@ -3921,7 +4016,7 @@ function DealDetail({
                 {RELEASE_FEATURES.chat ? `그룹 채팅${unreadCount > 0 ? ` · ${Math.min(99, unreadCount)}` : ''}` : '거래 상태 관리'}
               </button>
             )}
-            {!isSplitMerchant && (
+            {!isMerchantGroup && (
               <button
                 className="secondary-button"
                 onClick={() => {
@@ -4831,6 +4926,18 @@ function OwnerForm({
       ?? 0,
     )))
     : 0;
+  const initialTotalQuantity = Math.max(
+    activeAllocatedQuantity,
+    Math.floor(Number(
+      initialDeal?.totalQuantity
+      ?? initialDeal?.productQuantity
+      ?? initialDeal?.target
+      ?? 1,
+    )) || 1,
+  );
+  const initialSplitQuantity = initialDeal?.saleType === 'group'
+    ? clamp(getMerchantSplitQuantity(initialDeal), 1, initialTotalQuantity)
+    : 1;
   const [form, setForm] = useState({
     saleType: 'group',
     ...normalizeLocation(location),
@@ -4842,6 +4949,7 @@ function OwnerForm({
     discountRate: 15,
     stock: 1,
     maxQuantity: 1,
+    splitQuantity: 1,
     deadlineDate: new Date().toISOString().slice(0, 10),
     deadlineTime: '20:00',
     eventStart: '14:30',
@@ -4869,6 +4977,7 @@ function OwnerForm({
         activeAllocatedQuantity,
         Number(initialDeal.totalQuantity || initialDeal.productQuantity || initialDeal.target || 1),
       ),
+      splitQuantity: initialSplitQuantity,
       deadlineDate: /^\d{4}-\d{2}-\d{2}$/.test(deadlineParts[0]) ? deadlineParts[0] : new Date().toISOString().slice(0, 10),
       deadlineTime: /^\d{2}:\d{2}$/.test(deadlineParts[1]) ? deadlineParts[1] : '20:00',
       eventStart: initialDeal.eventStart || '14:30',
@@ -4892,7 +5001,12 @@ function OwnerForm({
     minimumGroupQuantity: activeAllocatedQuantity,
   });
   const groupTotalQuantity = canonicalQuantity.quantity;
-  const groupPricePreview = calculateProductAllocation(price, groupTotalQuantity, 1);
+  const groupPricePreview = resolveMerchantGroupPricing({
+    originalPrice: form.originalPrice,
+    discountRate: form.discountRate,
+    totalQuantity: groupTotalQuantity,
+    splitQuantity: form.splitQuantity,
+  });
 
   const toggleMethod = (method) => {
     const methods = form.methods.includes(method)
@@ -5048,6 +5162,7 @@ function OwnerForm({
           event.preventDefault();
           const payload = {
             ...form,
+            splitQuantity: form.saleType === 'group' ? groupPricePreview.splitQuantity : 1,
             deadline: form.saleType === 'instant'
               ? `${form.eventStart} ~ ${form.eventEnd}`
               : `${form.deadlineDate} ${form.deadlineTime}`,
@@ -5066,6 +5181,7 @@ function OwnerForm({
             calculated_price: price,
             expected_per_item: form.saleType === 'group' ? groupPricePreview.unitPrice : price,
             total_quantity: canonicalQuantity.quantity,
+            split_quantity: form.saleType === 'group' ? groupPricePreview.splitQuantity : 1,
             stock: canonicalQuantity.stock,
             max_quantity: canonicalQuantity.maxQuantity,
             deadline: payload.deadline,
@@ -5143,21 +5259,46 @@ function OwnerForm({
           />
         </label>
         <div className="calculated-price">
-          <span>{form.saleType === 'group' ? '자동 계산 할인 묶음 총액' : '자동 계산 할인가'}</span>
+          <span>{form.saleType === 'group' ? '할인 후 상품가격' : '자동 계산 할인가'}</span>
           <strong>{formatWon(price)}</strong>
         </div>
 
         <div className="creator-grid">
           {form.saleType === 'group' ? (
-            <FieldCounter
-              label="공구 총수량"
-              value={form.maxQuantity}
-              onMinus={() => setForm({
-                ...form,
-                maxQuantity: clamp(form.maxQuantity - 1, Math.max(1, activeAllocatedQuantity), 999),
-              })}
-              onPlus={() => setForm({ ...form, maxQuantity: clamp(form.maxQuantity + 1, 1, 999) })}
-            />
+            <>
+              <FieldCounter
+                label="공구 총수량"
+                value={form.maxQuantity}
+                onMinus={() => setForm((current) => {
+                  const maxQuantity = clamp(
+                    current.maxQuantity - 1,
+                    Math.max(1, activeAllocatedQuantity),
+                    999,
+                  );
+                  return {
+                    ...current,
+                    maxQuantity,
+                    splitQuantity: clamp(current.splitQuantity, 1, maxQuantity),
+                  };
+                })}
+                onPlus={() => setForm((current) => ({
+                  ...current,
+                  maxQuantity: clamp(current.maxQuantity + 1, 1, 999),
+                }))}
+              />
+              <FieldCounter
+                label="가격 분할수량"
+                value={groupPricePreview.splitQuantity}
+                onMinus={() => setForm((current) => ({
+                  ...current,
+                  splitQuantity: clamp(current.splitQuantity - 1, 1, canonicalQuantity.quantity),
+                }))}
+                onPlus={() => setForm((current) => ({
+                  ...current,
+                  splitQuantity: clamp(current.splitQuantity + 1, 1, canonicalQuantity.quantity),
+                }))}
+              />
+            </>
           ) : (
             <FieldCounter
               label="재고 수량"
@@ -5170,13 +5311,14 @@ function OwnerForm({
 
         {form.saleType === 'group' && (
           <div className="group-create-price-preview owner-split-price-preview" aria-live="polite">
-            <span>제품 1개당 예상금액</span>
+            <span>{groupPricePreview.splitPricing ? '분할 1개당 예상금액' : '할인 후 1개 가격'}</span>
             <strong>{groupPricePreview.approximate ? '약 ' : ''}{formatWon(groupPricePreview.unitPrice)}</strong>
             <div className="allocation-inline-summary">
-              <span>할인 묶음 총액 {formatWon(groupPricePreview.total)}</span>
-              <strong>총 {groupPricePreview.productQuantity}개</strong>
+              <span>할인 후 상품가격 {formatWon(groupPricePreview.discountedTotal)}</span>
+              <strong>총 {groupPricePreview.totalQuantity}개 모집 · 가격 {groupPricePreview.splitQuantity}개 분할</strong>
             </div>
-            <p>공구 총수량은 주문 가능한 전체 수량과 제품 1개 예상금액 계산에 사용됩니다.</p>
+            <p>공구 총수량은 주문 가능한 전체 수량이며 가격을 나누지 않습니다.</p>
+            <p>가격 분할수량이 1이면 할인 후 상품가격을 그대로 표시하고, 2 이상일 때만 해당 수량으로 나눕니다.</p>
             <p>상품 등록을 완료하면 같은 정보로 사용자 공동구매가 한 번만 생성됩니다.</p>
             {activeAllocatedQuantity > 0 && (
               <p>현재 주문 {activeAllocatedQuantity}개가 있어 공구 총수량은 이보다 작게 줄일 수 없습니다.</p>
@@ -5316,15 +5458,20 @@ function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
                 <div>
                   <strong>{deal.title}</strong>
                   <p>{deal.store} · {formatLocation(deal)}</p>
-                  <span>{splitMerchant ? '1개 예상 ' : ''}{formatWon(getDealPrice(deal))}</span>
+                  <span>{deal.saleType === 'group'
+                    ? `${splitMerchant ? '분할 1개 예상 ' : '할인 후 1개 '}${formatWon(getDealPrice(deal))}`
+                    : formatWon(getDealPrice(deal))}</span>
                   {splitMerchant && (
                     <small className="owner-bundle-total">
-                      할인 묶음 총액 {formatWon(discountedPrice(deal.originalPrice, deal.discountRate))}
+                      할인 후 상품가격 {formatWon(discountedPrice(deal.originalPrice, deal.discountRate))}
                     </small>
                   )}
                   {deal.quantityTracking && (
                     <span className="owner-quantity-state">
-                      주문 {getDealQuantity(deal).ordered}개 · 남은 수량 {getDealQuantity(deal).remaining}개
+                      {deal.saleType === 'group'
+                        ? `공구 총 ${getDealQuantity(deal).target}개 · 가격 ${getMerchantSplitQuantity(deal)}개 분할`
+                        : `재고 총 ${getDealQuantity(deal).target}개`}
+                      {' · '}주문 {getDealQuantity(deal).ordered}개 · 남은 수량 {getDealQuantity(deal).remaining}개
                     </span>
                   )}
                 </div>
@@ -5371,18 +5518,24 @@ function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
       <img className="done-image" src={deal.image} alt="" />
       <div className="completion-summary">
         <div>
-          <span>{splitMerchant ? '할인 묶음 총액' : '할인가'}</span>
+          <span>{isInstant ? '할인가' : splitMerchant ? '할인 후 상품가격' : '할인 후 1개 가격'}</span>
           <strong>{formatWon(discountedPrice(deal.originalPrice, deal.discountRate))}</strong>
         </div>
         {splitMerchant && (
           <div>
-            <span>제품 1개 예상금액</span>
+            <span>분할 1개당 예상금액</span>
             <strong>{deal.approximatePrice ? '약 ' : ''}{formatWon(getDealPrice(deal))}</strong>
+          </div>
+        )}
+        {!isInstant && (
+          <div>
+            <span>가격 분할수량</span>
+            <strong>{getMerchantSplitQuantity(deal)}개</strong>
           </div>
         )}
         <div>
           <span>{isInstant ? '재고 수량' : '공구 총수량'}</span>
-          <strong>{deal.target}개</strong>
+          <strong>{getDealQuantity(deal).target}개</strong>
         </div>
       </div>
       <button className="primary-button" onClick={() => onPreviewCustomer('detail', deal)}>
@@ -5421,6 +5574,8 @@ function OwnerOrders({ orders, summaries = [], location, onBack, onStatusChange,
       setActionError(
         ['missing_owner_capability', 'manager_capability_required', 'forbidden', 'order_manager_mismatch'].includes(code)
           ? '이 주문을 관리할 권한을 확인할 수 없습니다. 상품을 등록한 사장님 계정이나 그룹 호스트·관리자로 접속해 주세요.'
+          : code === 'payment_request_required'
+            ? '사용자가 “입금했어요”를 눌러 입금확인을 요청한 뒤 완료 처리할 수 있습니다.'
           : code === 'state_conflict'
             ? '다른 변경이 먼저 반영되었습니다. 잠시 후 최신 주문을 확인하고 다시 시도해 주세요.'
             : '주문 상태를 변경하지 못했습니다. 잠시 후 다시 시도해 주세요.',
@@ -5489,6 +5644,10 @@ function OwnerOrders({ orders, summaries = [], location, onBack, onStatusChange,
           {orders.map((order) => {
             const cancelled = isCancelledOrder(order);
             const stage = getOrderStage(order);
+            const paymentStatus = getOrderPaymentStatus(order);
+            const groupedPayment = Boolean(order.groupId);
+            const canAdvancePayment = paymentStatus === 'requested'
+              || (!groupedPayment && paymentStatus === 'pending');
             return (
               <article className={cancelled ? 'owner-order-card cancelled' : 'owner-order-card'} key={order.id}>
                 <div className="owner-order-heading">
@@ -5513,22 +5672,32 @@ function OwnerOrders({ orders, summaries = [], location, onBack, onStatusChange,
                   </div>
                 ) : (
                   <>
-                    <div className={order.paymentConfirmedAt ? 'manual-payment-state confirmed' : 'manual-payment-state'}>
+                    <div className={`manual-payment-state ${paymentStatus}`}>
                       <div>
-                        <strong>{order.paymentConfirmedAt ? '수동 결제 확인 완료' : '수동 결제 확인 대기'}</strong>
-                        <span>{order.paymentConfirmedAt ? '사용자 화면에도 결제 확인 상태가 반영됩니다.' : '실제 입금·결제를 확인한 뒤 눌러주세요.'}</span>
+                        <strong>{paymentStatus === 'confirmed'
+                          ? '입금완료'
+                          : paymentStatus === 'requested' ? '입금확인요청' : '입금대기'}</strong>
+                        <span>{paymentStatus === 'confirmed'
+                          ? '사용자 화면에도 입금 완료 상태가 반영됩니다.'
+                          : paymentStatus === 'requested'
+                            ? '사용자가 “입금했어요”를 눌렀습니다. 실제 입금을 확인해 주세요.'
+                            : groupedPayment
+                              ? '사용자가 입금확인을 요청하면 여기에서 완료 처리할 수 있습니다.'
+                              : '실제 입금·결제를 확인한 뒤 눌러주세요.'}</span>
                       </div>
                       <button
                         className="secondary-button compact-button"
-                        disabled={Boolean(busyAction)}
+                        disabled={Boolean(busyAction) || (paymentStatus !== 'confirmed' && !canAdvancePayment)}
                         onClick={() => runOwnerAction(
                           `payment-${order.id}`,
-                          () => onPaymentConfirm(order.id, order.paymentConfirmedAt ? 'previous' : 'next'),
+                          () => onPaymentConfirm(order.id, paymentStatus === 'confirmed' ? 'previous' : 'next'),
                         )}
                       >
                         {busyAction === `payment-${order.id}`
                           ? '반영 중…'
-                          : order.paymentConfirmedAt ? '결제 확인 취소' : '결제 확인'}
+                          : paymentStatus === 'confirmed'
+                            ? '입금완료 취소'
+                            : paymentStatus === 'requested' ? '입금완료 처리' : groupedPayment ? '요청 대기' : '입금완료 처리'}
                       </button>
                     </div>
                     <div className={order.customerPickupConfirmedAt ? 'owner-customer-confirm active' : 'owner-customer-confirm'}>

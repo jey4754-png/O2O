@@ -842,6 +842,16 @@ button:disabled {
   color: #1c5682;
 }
 
+.customer-payment-state.requested {
+  border: 1px solid #f1d8a8;
+  background: #fff8e8;
+  color: #805f1c;
+}
+
+.customer-payment-state.requested strong {
+  color: #805f1c;
+}
+
 .customer-payment-state.sync-pending {
   border: 1px solid #f1d8a8;
   background: #fff8e8;
@@ -2092,6 +2102,19 @@ button:disabled {
 
 .manual-payment-state.confirmed span {
   color: #316188;
+}
+
+.manual-payment-state.requested {
+  border: 1px solid #e6bd66;
+  background: #fff8e8;
+}
+
+.manual-payment-state.requested strong {
+  color: #805f1c;
+}
+
+.manual-payment-state.requested span {
+  color: #805f1c;
 }
 
 .owner-order-actions {

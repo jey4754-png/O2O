@@ -70,3 +70,34 @@ test('unsynced merchant snapshots keep the legacy maximum-progress fallback', ()
   assert.equal(merged.current, 4);
   assert.equal(merged.participantCount, 3);
 });
+
+test('newer explicit merchant pricing keeps stock capacity separate from its price divisor', () => {
+  const local = {
+    id: 'owner-explicit-pricing',
+    source: 'merchant',
+    saleType: 'group',
+    updatedAt: '2026-08-31T09:00:00.000Z',
+    totalQuantity: 5,
+    productQuantity: 5,
+    splitQuantity: 5,
+    pricingModel: 'explicit_split',
+    pricingVersion: 2,
+  };
+  const remote = {
+    ...local,
+    updatedAt: '2026-08-31T09:01:00.000Z',
+    syncedAt: '2026-08-31T09:01:01.000Z',
+    totalQuantity: 10,
+    productQuantity: 10,
+    splitQuantity: 1,
+    splitPricing: false,
+  };
+
+  const [merged] = mergeDeals([local], [remote]);
+  assert.equal(merged.totalQuantity, 10);
+  assert.equal(merged.productQuantity, 10);
+  assert.equal(merged.splitQuantity, 1);
+  assert.equal(merged.splitPricing, false);
+  assert.equal(merged.pricingModel, 'explicit_split');
+  assert.equal(merged.pricingVersion, 2);
+});
