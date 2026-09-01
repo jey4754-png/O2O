@@ -1,5 +1,9 @@
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
 const SERVER_ONLY_EVENTS = new Set(['customer_order_snapshot']);
+const SERVER_ONLY_EVENT_PROPERTY_NAMES = new Set([
+  'ownercapabilityhash',
+  'owneridentityhash',
+]);
 
 import { callDataApi, fetchUpstreamJson } from './_data-upstream.js';
 
@@ -37,6 +41,23 @@ function isAllowedOrigin(originValue, request) {
   }
 }
 
+function containsServerOnlyEventProperty(value) {
+  const pending = [value];
+  let inspected = 0;
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current || typeof current !== 'object') continue;
+    inspected += 1;
+    if (inspected > 5000) return true;
+    for (const [key, nestedValue] of Object.entries(current)) {
+      const normalizedKey = String(key).replace(/[^a-z0-9]/gi, '').toLowerCase();
+      if (SERVER_ONLY_EVENT_PROPERTY_NAMES.has(normalizedKey)) return true;
+      if (nestedValue && typeof nestedValue === 'object') pending.push(nestedValue);
+    }
+  }
+  return false;
+}
+
 export default async function handler(request, response) {
   if (request.method !== 'POST') {
     response.setHeader('Allow', 'POST');
@@ -54,6 +75,11 @@ export default async function handler(request, response) {
   }
   if (SERVER_ONLY_EVENTS.has(event.name)) {
     return response.status(403).json({ ok: false, error: 'reserved_event' });
+  }
+  // `owner_product_created` remains a client analytics event. Ownership is
+  // established only by the private deal capability path, never by event data.
+  if (containsServerOnlyEventProperty(event.properties)) {
+    return response.status(403).json({ ok: false, error: 'reserved_event_property' });
   }
   if (
     !/^[a-z][a-z0-9_]{0,63}$/.test(event.name)

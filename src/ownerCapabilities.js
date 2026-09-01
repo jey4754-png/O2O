@@ -1,6 +1,5 @@
 const OWNER_DEAL_ID_PATTERN = /^owner-[a-zA-Z0-9-]{1,100}$/;
 const MIN_CAPABILITY_LENGTH = 32;
-const LEGACY_EVENT_MAX_TIME_DISTANCE_MS = 15 * 60 * 1000;
 
 export const OWNER_CLAIM_BATCH_SIZE = 50;
 
@@ -8,31 +7,6 @@ export function ownerScopeKey(profile = {}) {
   if (profile?.testerType !== '사장님') return '';
   const phone = String(profile?.phone || '').replace(/\D/g, '');
   return phone.length >= 8 ? `phone:${phone}` : '';
-}
-
-export function completedOwnerMigrationScopes(state = {}) {
-  const scopes = Array.isArray(state?.completedScopes) ? state.completedScopes : [];
-  const legacyScope = state?.completed === true ? String(state?.ownerScope || '') : '';
-  return [...new Set([...scopes, legacyScope])]
-    .filter((scope) => /^phone:\d{8,}$/.test(String(scope || '')));
-}
-
-export function hasCompletedOwnerScopeMigration(state = {}, ownerScope = '') {
-  return Boolean(ownerScope && completedOwnerMigrationScopes(state).includes(ownerScope));
-}
-
-export function completeOwnerScopeMigration(state = {}, ownerScope = '', migratedAt = '') {
-  const completedScopes = completedOwnerMigrationScopes(state);
-  if (!ownerScope || !/^phone:\d{8,}$/.test(ownerScope)) {
-    return { ...state, completedScopes };
-  }
-  return {
-    completedScopes: [...new Set([...completedScopes, ownerScope])],
-    migratedAtByScope: {
-      ...(state?.migratedAtByScope || {}),
-      ...(migratedAt ? { [ownerScope]: migratedAt } : {}),
-    },
-  };
 }
 
 export function isOwnerDealId(dealId) {
@@ -67,106 +41,6 @@ export function assignOwnerDealScope(scopeByDeal = {}, dealId, ownerScope = '') 
   return { scopeByDeal: nextScopeByDeal, allowed: true, changed: false };
 }
 
-function comparableText(value) {
-  return String(value || '').trim().replace(/\s+/g, ' ').toLocaleLowerCase('ko-KR');
-}
-
-function eventOwnerScope(event = {}) {
-  if (event?.name !== 'owner_product_created') return '';
-  const properties = event?.properties || {};
-  if (properties.tester_type !== '사장님') return '';
-  const phone = String(properties.customer_phone || '').replace(/\D/g, '');
-  return phone.length >= 8 ? `phone:${phone}` : '';
-}
-
-function validTimestamp(value) {
-  const parsed = Date.parse(String(value || ''));
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-export function legacyOwnerEventMatchesDeal(event = {}, deal = {}, ownerScope = '') {
-  if (!ownerScope || eventOwnerScope(event) !== ownerScope) return false;
-  const properties = event?.properties || {};
-  const eventTime = validTimestamp(event.timestamp);
-  const dealTime = validTimestamp(deal.createdAt);
-  if (
-    eventTime === null
-    || dealTime === null
-    || Math.abs(eventTime - dealTime) > LEGACY_EVENT_MAX_TIME_DISTANCE_MS
-  ) {
-    return false;
-  }
-
-  const pairs = [
-    [properties.store_name, deal.store],
-    [properties.product_name, deal.title],
-    [properties.region, deal.region],
-    [properties.district, deal.district],
-    [properties.neighborhood, deal.neighborhood],
-  ];
-  return pairs.every(([eventValue, dealValue]) => {
-    const normalizedEventValue = comparableText(eventValue);
-    const normalizedDealValue = comparableText(dealValue);
-    return Boolean(normalizedEventValue && normalizedDealValue && normalizedEventValue === normalizedDealValue);
-  });
-}
-
-export function adoptLegacyOwnerScopes({
-  capabilities = {},
-  scopeByDeal = {},
-  ownerScope = '',
-  createdDeals = [],
-  events = [],
-  migrationCompleted = false,
-} = {}) {
-  const nextScopeByDeal = { ...scopeByDeal };
-  if (migrationCompleted || !ownerScope) {
-    return {
-      scopeByDeal: nextScopeByDeal,
-      changed: false,
-      migrationCompleted: Boolean(migrationCompleted),
-    };
-  }
-
-  const eligibleDeals = createdDeals.filter((deal) => {
-    const dealId = String(deal?.id || '');
-    return !(
-      deal?.source !== 'merchant'
-      || !isOwnerDealId(dealId)
-      || nextScopeByDeal[dealId]
-      || !isUsableOwnerCapability(capabilities?.[dealId])
-    );
-  });
-  const eventMatches = new Map();
-  const dealMatches = new Map();
-  eligibleDeals.forEach((deal) => {
-    const matchingEventIndexes = events.flatMap((event, index) => (
-      legacyOwnerEventMatchesDeal(event, deal, ownerScope) ? [index] : []
-    ));
-    dealMatches.set(deal.id, matchingEventIndexes);
-    matchingEventIndexes.forEach((index) => {
-      eventMatches.set(index, [...(eventMatches.get(index) || []), deal.id]);
-    });
-  });
-
-  let changed = false;
-  eligibleDeals.forEach((deal) => {
-    const matchingEventIndexes = dealMatches.get(deal.id) || [];
-    if (matchingEventIndexes.length !== 1) return;
-    const [eventIndex] = matchingEventIndexes;
-    if ((eventMatches.get(eventIndex) || []).length !== 1) return;
-    const dealId = String(deal.id);
-    nextScopeByDeal[dealId] = ownerScope;
-    changed = true;
-  });
-
-  return {
-    scopeByDeal: nextScopeByDeal,
-    changed,
-    migrationCompleted: true,
-  };
-}
-
 export function scopedOwnerCapabilityEntries(
   capabilities = {},
   scopeByDeal = {},
@@ -179,6 +53,162 @@ export function scopedOwnerCapabilityEntries(
       && isUsableOwnerCapability(capabilityToken)
     ))
     .map(([dealId, capabilityToken]) => ({ dealId, capabilityToken }));
+}
+
+/**
+ * Returns valid merchant capabilities that have not yet been assigned to any
+ * local merchant profile. These are lookup inputs for the existing owner deal
+ * listing endpoint. A returned deal proves that the browser-held management key
+ * is valid, but it does not prove who is using the browser, so assignment still
+ * requires an explicit confirmation in the current merchant profile.
+ */
+export function unscopedOwnerCapabilityEntries(
+  capabilities = {},
+  scopeByDeal = {},
+) {
+  return Object.entries(capabilities)
+    .filter(([dealId, capabilityToken]) => (
+      isOwnerDealId(dealId)
+      && !scopeByDeal?.[dealId]
+      && isUsableOwnerCapability(capabilityToken)
+    ))
+    .map(([dealId, capabilityToken]) => ({ dealId, capabilityToken }));
+}
+
+/**
+ * Builds manual recovery candidates from unscoped management keys that the
+ * standard owner listing endpoint verified. Public title/store metadata is
+ * included so the person at the browser can identify each product before
+ * explicitly assigning it to the active merchant profile.
+ */
+export function buildOwnerRecoveryCandidates({
+  capabilities = {},
+  scopeByDeal = {},
+  verifiedDeals = [],
+  recoveryScope = '',
+} = {}) {
+  if (!/^phone:\d{8,}$/.test(String(recoveryScope || ''))) return [];
+  const verifiedDealById = new Map(
+    (Array.isArray(verifiedDeals) ? verifiedDeals : [])
+      .filter((deal) => isOwnerDealId(deal?.id))
+      .map((deal) => [String(deal.id), deal]),
+  );
+
+  return unscopedOwnerCapabilityEntries(capabilities, scopeByDeal)
+    .flatMap((entry) => {
+      const deal = verifiedDealById.get(entry.dealId);
+      if (!deal) return [];
+      return [{
+        ...entry,
+        recoveryScope,
+        title: String(deal.title || '').trim(),
+        store: String(deal.store || '').trim(),
+      }];
+    });
+}
+
+/**
+ * Assigns explicitly confirmed legacy deals after the standard owner listing
+ * endpoint verified the browser-held capability. Existing assignments are never
+ * overwritten, and a locally missing/changed capability makes recovery
+ * ineligible. This is a management-key recovery, not account authentication.
+ */
+export function confirmOwnerRecovery({
+  capabilities = {},
+  scopeByDeal = {},
+  ownerScope = '',
+  verifiedRecoveryEntries = [],
+  confirmedDealIds = [],
+} = {}) {
+  const nextScopeByDeal = { ...scopeByDeal };
+  const candidateIds = new Set(
+    unscopedOwnerCapabilityEntries(capabilities, scopeByDeal)
+      .map(({ dealId }) => dealId),
+  );
+  const verifiedCapabilities = new Map();
+  (Array.isArray(verifiedRecoveryEntries) ? verifiedRecoveryEntries : [])
+    .forEach((entry) => {
+      const dealId = String(entry?.dealId || '');
+      const capabilityToken = entry?.capabilityToken;
+      if (!isOwnerDealId(dealId) || !isUsableOwnerCapability(capabilityToken)) return;
+      verifiedCapabilities.set(dealId, capabilityToken);
+    });
+  const recoveredDealIds = [];
+
+  (Array.isArray(confirmedDealIds) ? confirmedDealIds : []).forEach((value) => {
+    const dealId = String(value || '');
+    if (
+      recoveredDealIds.includes(dealId)
+      || !candidateIds.has(dealId)
+      || verifiedCapabilities.get(dealId) !== capabilities?.[dealId]
+    ) {
+      return;
+    }
+    const assignment = assignOwnerDealScope(nextScopeByDeal, dealId, ownerScope);
+    if (!assignment.allowed || !assignment.changed) return;
+    Object.assign(nextScopeByDeal, assignment.scopeByDeal);
+    recoveredDealIds.push(dealId);
+  });
+
+  return {
+    scopeByDeal: nextScopeByDeal,
+    recoveredDealIds,
+    changed: recoveredDealIds.length > 0,
+  };
+}
+
+/**
+ * Reconciles an in-flight recovery request against the browser's current
+ * identity and storage snapshot. Callers should load capabilities and scopes
+ * again after the server response, then pass those fresh values here.
+ *
+ * A recovery is rejected when the active merchant changed, a requested token
+ * changed, another tab already claimed the deal, or the standard owner listing
+ * did not return that exact deal id. Unrelated assignments in the latest scope
+ * map are kept.
+ */
+export function reconcileOwnerRecovery({
+  capabilities = {},
+  scopeByDeal = {},
+  expectedOwnerScope = '',
+  currentOwnerScope = '',
+  requestedRecoveryEntries = [],
+  verifiedDealIds = [],
+} = {}) {
+  const unchanged = {
+    scopeByDeal: { ...scopeByDeal },
+    recoveredDealIds: [],
+    changed: false,
+  };
+  if (
+    !expectedOwnerScope
+    || currentOwnerScope !== expectedOwnerScope
+    || !/^phone:\d{8,}$/.test(currentOwnerScope)
+  ) {
+    return unchanged;
+  }
+
+  const verifiedIds = new Set(
+    (Array.isArray(verifiedDealIds) ? verifiedDealIds : [])
+      .map((dealId) => String(dealId || ''))
+      .filter(isOwnerDealId),
+  );
+  const verifiedRecoveryEntries = (Array.isArray(requestedRecoveryEntries)
+    ? requestedRecoveryEntries
+    : [])
+    .filter((entry) => (
+      entry?.recoveryScope === currentOwnerScope
+      && verifiedIds.has(String(entry?.dealId || ''))
+    ))
+    .map(({ dealId, capabilityToken }) => ({ dealId, capabilityToken }));
+
+  return confirmOwnerRecovery({
+    capabilities,
+    scopeByDeal,
+    ownerScope: currentOwnerScope,
+    verifiedRecoveryEntries,
+    confirmedDealIds: verifiedRecoveryEntries.map(({ dealId }) => dealId),
+  });
 }
 
 export function chunkOwnerCapabilities(

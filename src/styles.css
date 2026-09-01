@@ -1777,6 +1777,39 @@ button:disabled {
   gap: 10px;
 }
 
+.owner-recovery-banner {
+  display: grid;
+  gap: 9px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid #f0c36c;
+  border-radius: 8px;
+  background: #fff9e8;
+  color: #704d00;
+}
+
+.owner-recovery-banner > div {
+  display: grid;
+  gap: 3px;
+}
+
+.owner-recovery-banner strong {
+  font-size: 12px;
+}
+
+.owner-recovery-banner span {
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.owner-recovery-banner button {
+  width: 100%;
+}
+
+.owner-recovery-banner .form-error {
+  margin: 0;
+}
+
 .owner-product-card {
   display: grid;
   grid-template-columns: 72px 1fr;

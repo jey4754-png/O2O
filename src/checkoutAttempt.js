@@ -10,7 +10,8 @@ const TRANSIENT_ORDER_SYNC_CODES = new Set([
   'upstream_timeout',
 ]);
 const TRANSIENT_ORDER_SYNC_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
-const TRANSIENT_ORDER_PUBLISH_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
+const TRANSIENT_ORDER_PUBLISH_CODES = new Set(['collector_busy', 'upstream_timeout']);
+const TRANSIENT_ORDER_PUBLISH_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 let memoryAttempts = {};
 const storageMemoryAttempts = new WeakMap();
@@ -146,16 +147,20 @@ export function checkoutNeedsDurableOrderSync(order = {}) {
 }
 
 export function isTransientOrderSyncError(error = {}) {
-  const status = Number(error.status || 0);
-  const code = String(error.code || error.message || '');
-  return TRANSIENT_ORDER_SYNC_STATUSES.has(status)
-    || TRANSIENT_ORDER_SYNC_CODES.has(code)
-    || (!status && error?.name === 'TypeError');
+  const status = Number(error?.status || 0);
+  const code = String(error?.code || error?.message || '');
+  if (TRANSIENT_ORDER_SYNC_STATUSES.has(status)) return true;
+  // A semantic 4xx response is authoritative even when its body contains a
+  // generic sync code; do not leave it in the periodic retry queue.
+  if (status >= 400 && status < 500) return false;
+  return TRANSIENT_ORDER_SYNC_CODES.has(code) || (!status && error?.name === 'TypeError');
 }
 
 export function orderPublishRetryCount(error = {}) {
-  const status = Number(error.status || 0);
-  if (TRANSIENT_ORDER_PUBLISH_STATUSES.has(status) || status >= 500) return 3;
+  const status = Number(error?.status || 0);
+  const code = String(error?.code || error?.message || '');
+  if (TRANSIENT_ORDER_PUBLISH_STATUSES.has(status)) return 3;
+  if (!status && TRANSIENT_ORDER_PUBLISH_CODES.has(code)) return 3;
   if (!status && error?.name === 'TypeError') return 3;
   return 0;
 }
@@ -207,7 +212,7 @@ export function canQueueReservedGroupOrder(order = {}, error = {}) {
 }
 
 export function isTerminalOrderSyncError(error = {}) {
-  const status = Number(error.status || 0);
+  const status = Number(error?.status || 0);
   return status >= 400 && status < 500 && !TRANSIENT_ORDER_SYNC_STATUSES.has(status);
 }
 

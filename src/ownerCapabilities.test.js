@@ -2,47 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  adoptLegacyOwnerScopes,
   assignOwnerDealScope,
+  buildOwnerRecoveryCandidates,
   chunkOwnerCapabilities,
-  completeOwnerScopeMigration,
-  completedOwnerMigrationScopes,
-  hasCompletedOwnerScopeMigration,
+  confirmOwnerRecovery,
   isOwnerDealInScope,
-  legacyOwnerEventMatchesDeal,
   ownerScopeKey,
+  reconcileOwnerRecovery,
   scopedOwnerCapabilityEntries,
+  unscopedOwnerCapabilityEntries,
 } from './ownerCapabilities.js';
 
 const token = (character) => `deal-${character.repeat(40)}`;
-const createdAt = '2026-08-31T09:00:00.000Z';
-const legacyDeal = (overrides = {}) => ({
-  id: 'owner-legacy',
-  source: 'merchant',
-  createdAt,
-  store: '판교 마트',
-  title: '오곡 물티슈',
-  region: '경기도',
-  district: '성남시 분당구',
-  neighborhood: '판교동',
-  ...overrides,
-});
-const creationEvent = (overrides = {}) => ({
-  id: 'event-owner-legacy',
-  name: 'owner_product_created',
-  timestamp: '2026-08-31T09:01:00.000Z',
-  properties: {
-    tester_type: '사장님',
-    customer_phone: '010-3333-4444',
-    store_name: '판교 마트',
-    product_name: '오곡 물티슈',
-    region: '경기도',
-    district: '성남시 분당구',
-    neighborhood: '판교동',
-    ...(overrides.properties || {}),
-  },
-  ...Object.fromEntries(Object.entries(overrides).filter(([key]) => key !== 'properties')),
-});
 
 test('merchant scope is stable for formatted versions of the same phone number', () => {
   assert.equal(
@@ -55,30 +26,6 @@ test('merchant scope is stable for formatted versions of the same phone number',
   );
   assert.equal(ownerScopeKey({ testerType: '사용자', phone: '010-1234-5678' }), '');
   assert.equal(ownerScopeKey({ testerType: '사장님', phone: '1234' }), '');
-});
-
-test('legacy migration completion is tracked independently for each merchant scope', () => {
-  const firstScope = 'phone:01011112222';
-  const secondScope = 'phone:01033334444';
-  const first = completeOwnerScopeMigration({}, firstScope, '2026-08-31T10:00:00.000Z');
-  assert.equal(hasCompletedOwnerScopeMigration(first, firstScope), true);
-  assert.equal(hasCompletedOwnerScopeMigration(first, secondScope), false);
-
-  const second = completeOwnerScopeMigration(first, secondScope, '2026-08-31T10:05:00.000Z');
-  assert.deepEqual(completedOwnerMigrationScopes(second), [firstScope, secondScope]);
-  assert.equal(hasCompletedOwnerScopeMigration(second, firstScope), true);
-  assert.equal(hasCompletedOwnerScopeMigration(second, secondScope), true);
-});
-
-test('legacy global completion markers migrate only their recorded merchant scope', () => {
-  const legacy = {
-    completed: true,
-    ownerScope: 'phone:01011112222',
-    migratedAt: '2026-08-31T09:00:00.000Z',
-  };
-  assert.deepEqual(completedOwnerMigrationScopes(legacy), ['phone:01011112222']);
-  assert.equal(hasCompletedOwnerScopeMigration(legacy, 'phone:01011112222'), true);
-  assert.equal(hasCompletedOwnerScopeMigration(legacy, 'phone:01033334444'), false);
 });
 
 test('a merchant deal cannot be reassigned to a switched merchant profile', () => {
@@ -94,108 +41,6 @@ test('a merchant deal cannot be reassigned to a switched merchant profile', () =
   assert.equal(switched.changed, false);
   assert.equal(isOwnerDealInScope('owner-secure-deal', switched.scopeByDeal, secondScope), false);
   assert.equal(switched.scopeByDeal['owner-secure-deal'], firstScope);
-});
-
-test('legacy unscoped local owner deals are adopted once without taking another owner scope', () => {
-  const existingScope = 'phone:01011112222';
-  const currentScope = 'phone:01033334444';
-  const input = {
-    capabilities: {
-      'owner-legacy': token('a'),
-      'owner-already-owned': token('b'),
-      'owner-short-secret': 'short',
-      'customer-not-owner': token('c'),
-    },
-    scopeByDeal: { 'owner-already-owned': existingScope },
-    ownerScope: currentScope,
-    createdDeals: [
-      legacyDeal(),
-      { id: 'owner-already-owned', source: 'merchant' },
-      { id: 'owner-short-secret', source: 'merchant' },
-      { id: 'customer-not-owner', source: 'customer' },
-    ],
-    events: [creationEvent()],
-  };
-  const adopted = adoptLegacyOwnerScopes(input);
-  assert.equal(adopted.changed, true);
-  assert.equal(adopted.migrationCompleted, true);
-  assert.equal(adopted.scopeByDeal['owner-legacy'], currentScope);
-  assert.equal(adopted.scopeByDeal['owner-already-owned'], existingScope);
-  assert.equal(adopted.scopeByDeal['owner-short-secret'], undefined);
-
-  const attemptedAgain = adoptLegacyOwnerScopes({
-    ...input,
-    scopeByDeal: adopted.scopeByDeal,
-    createdDeals: [...input.createdDeals, { id: 'owner-late-legacy', source: 'merchant' }],
-    capabilities: { ...input.capabilities, 'owner-late-legacy': token('d') },
-    migrationCompleted: true,
-  });
-  assert.equal(attemptedAgain.changed, false);
-  assert.equal(attemptedAgain.scopeByDeal['owner-late-legacy'], undefined);
-});
-
-test('legacy adoption requires exact owner, product, store, location, and a close timestamp', () => {
-  const scope = 'phone:01033334444';
-  const deal = legacyDeal();
-  assert.equal(legacyOwnerEventMatchesDeal(creationEvent(), deal, scope), true);
-  assert.equal(legacyOwnerEventMatchesDeal(creationEvent({
-    properties: { customer_phone: '010-9999-8888' },
-  }), deal, scope), false);
-  assert.equal(legacyOwnerEventMatchesDeal(creationEvent({
-    properties: { product_name: '다른 상품' },
-  }), deal, scope), false);
-  assert.equal(legacyOwnerEventMatchesDeal(creationEvent({
-    properties: { store_name: '다른 매장' },
-  }), deal, scope), false);
-  assert.equal(legacyOwnerEventMatchesDeal(creationEvent({
-    properties: { neighborhood: '운중동' },
-  }), deal, scope), false);
-  assert.equal(legacyOwnerEventMatchesDeal(creationEvent({
-    timestamp: '2026-08-31T09:16:00.001Z',
-  }), deal, scope), false);
-  assert.equal(legacyOwnerEventMatchesDeal(creationEvent({
-    properties: { customer_phone: '' },
-  }), deal, scope), false);
-});
-
-test('ambiguous legacy evidence stays quarantined without a fallback assignment', () => {
-  const scope = 'phone:01033334444';
-  const first = legacyDeal({ id: 'owner-duplicate-one' });
-  const second = legacyDeal({
-    id: 'owner-duplicate-two',
-    createdAt: '2026-08-31T09:02:00.000Z',
-  });
-  const result = adoptLegacyOwnerScopes({
-    capabilities: {
-      [first.id]: token('a'),
-      [second.id]: token('b'),
-    },
-    ownerScope: scope,
-    createdDeals: [first, second],
-    events: [creationEvent()],
-  });
-  assert.equal(result.changed, false);
-  assert.equal(result.migrationCompleted, true);
-  assert.equal(result.scopeByDeal[first.id], undefined);
-  assert.equal(result.scopeByDeal[second.id], undefined);
-});
-
-test('a missing creation event leaves a legacy deal quarantined', () => {
-  const input = {
-    capabilities: { 'owner-legacy': token('a') },
-    ownerScope: 'phone:01033334444',
-    createdDeals: [legacyDeal()],
-  };
-  const missingEvent = adoptLegacyOwnerScopes({ ...input, events: [] });
-  assert.equal(missingEvent.changed, false);
-  assert.equal(missingEvent.scopeByDeal['owner-legacy'], undefined);
-
-  const mismatchedPhone = adoptLegacyOwnerScopes({
-    ...input,
-    events: [creationEvent({ properties: { customer_phone: '010-9999-8888' } })],
-  });
-  assert.equal(mismatchedPhone.changed, false);
-  assert.equal(mismatchedPhone.scopeByDeal['owner-legacy'], undefined);
 });
 
 test('owner claims expose only the active merchant scope', () => {
@@ -219,6 +64,235 @@ test('owner claims expose only the active merchant scope', () => {
     { dealId: 'owner-second', capabilityToken: capabilities['owner-second'] },
   ]);
   assert.deepEqual(scopedOwnerCapabilityEntries(capabilities, scopes, ''), []);
+});
+
+test('manual recovery lookup includes valid unscoped browser management keys', () => {
+  const currentScope = 'phone:01011112222';
+  const capabilities = {
+    'owner-already-scoped': token('a'),
+    'owner-server-only': token('b'),
+    'owner-other-profile': token('c'),
+    'owner-short-secret': 'short',
+    'customer-invalid': token('d'),
+  };
+  const scopeByDeal = {
+    'owner-already-scoped': currentScope,
+    'owner-other-profile': 'phone:01099998888',
+  };
+
+  assert.deepEqual(unscopedOwnerCapabilityEntries(capabilities, scopeByDeal), [
+    { dealId: 'owner-server-only', capabilityToken: capabilities['owner-server-only'] },
+  ]);
+});
+
+test('manual recovery candidates contain metadata only for keys verified by owner listing', () => {
+  const recoveryScope = 'phone:01011112222';
+  const capabilities = {
+    'owner-first': token('a'),
+    'owner-not-returned': token('b'),
+    'owner-already-scoped': token('c'),
+  };
+  const candidates = buildOwnerRecoveryCandidates({
+    capabilities,
+    scopeByDeal: { 'owner-already-scoped': recoveryScope },
+    verifiedDeals: [
+      { id: 'owner-first', title: '오곡 물티슈', store: '판교 마트' },
+      { id: 'owner-already-scoped', title: '이미 연결됨', store: '다른 매장' },
+      { id: 'customer-invalid', title: '잘못된 ID', store: '잘못된 매장' },
+    ],
+    recoveryScope,
+  });
+
+  assert.deepEqual(candidates, [{
+    dealId: 'owner-first',
+    capabilityToken: capabilities['owner-first'],
+    recoveryScope,
+    title: '오곡 물티슈',
+    store: '판교 마트',
+  }]);
+});
+
+test('manual recovery requires both owner listing verification and explicit confirmation', () => {
+  const ownerScope = 'phone:01011112222';
+  const capabilities = {
+    'owner-first': token('a'),
+    'owner-second': token('b'),
+  };
+
+  const onlyVerified = confirmOwnerRecovery({
+    capabilities,
+    ownerScope,
+    verifiedRecoveryEntries: [
+      { dealId: 'owner-first', capabilityToken: capabilities['owner-first'] },
+    ],
+  });
+  assert.equal(onlyVerified.changed, false);
+  assert.deepEqual(onlyVerified.recoveredDealIds, []);
+  assert.deepEqual(onlyVerified.scopeByDeal, {});
+
+  const onlyConfirmed = confirmOwnerRecovery({
+    capabilities,
+    ownerScope,
+    confirmedDealIds: ['owner-first'],
+  });
+  assert.equal(onlyConfirmed.changed, false);
+  assert.deepEqual(onlyConfirmed.recoveredDealIds, []);
+  assert.deepEqual(onlyConfirmed.scopeByDeal, {});
+});
+
+test('manual recovery assigns only the owner-listing-verified and confirmed candidate intersection', () => {
+  const ownerScope = 'phone:01011112222';
+  const anotherScope = 'phone:01033334444';
+  const capabilities = {
+    'owner-recover': token('a'),
+    'owner-not-verified': token('b'),
+    'owner-another': token('c'),
+    'owner-invalid-secret': 'short',
+  };
+  const scopeByDeal = {
+    'owner-another': anotherScope,
+    'owner-preserved': ownerScope,
+  };
+
+  const result = confirmOwnerRecovery({
+    capabilities,
+    scopeByDeal,
+    ownerScope,
+    verifiedRecoveryEntries: [
+      { dealId: 'owner-recover', capabilityToken: capabilities['owner-recover'] },
+      { dealId: 'owner-another', capabilityToken: capabilities['owner-another'] },
+      { dealId: 'owner-invalid-secret', capabilityToken: capabilities['owner-invalid-secret'] },
+    ],
+    confirmedDealIds: [
+      'owner-recover',
+      'owner-recover',
+      'owner-not-verified',
+      'owner-another',
+      'owner-invalid-secret',
+      'customer-not-owner',
+    ],
+  });
+
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.recoveredDealIds, ['owner-recover']);
+  assert.deepEqual(result.scopeByDeal, {
+    ...scopeByDeal,
+    'owner-recover': ownerScope,
+  });
+  assert.equal(result.scopeByDeal['owner-another'], anotherScope);
+  assert.equal(scopeByDeal['owner-recover'], undefined);
+});
+
+test('manual recovery is idempotent and cannot reassign an existing scope', () => {
+  const firstScope = 'phone:01011112222';
+  const secondScope = 'phone:01033334444';
+  const capabilities = { 'owner-recovered': token('a') };
+  const recovered = confirmOwnerRecovery({
+    capabilities,
+    ownerScope: firstScope,
+    verifiedRecoveryEntries: [
+      { dealId: 'owner-recovered', capabilityToken: capabilities['owner-recovered'] },
+    ],
+    confirmedDealIds: ['owner-recovered'],
+  });
+  const repeated = confirmOwnerRecovery({
+    capabilities,
+    scopeByDeal: recovered.scopeByDeal,
+    ownerScope: secondScope,
+    verifiedRecoveryEntries: [
+      { dealId: 'owner-recovered', capabilityToken: capabilities['owner-recovered'] },
+    ],
+    confirmedDealIds: ['owner-recovered'],
+  });
+
+  assert.equal(repeated.changed, false);
+  assert.deepEqual(repeated.recoveredDealIds, []);
+  assert.equal(repeated.scopeByDeal['owner-recovered'], firstScope);
+});
+
+test('manual recovery rejects a capability changed after owner listing verification', () => {
+  const dealId = 'owner-token-changed';
+  const verifiedToken = token('a');
+  const currentToken = token('b');
+  const result = confirmOwnerRecovery({
+    capabilities: { [dealId]: currentToken },
+    ownerScope: 'phone:01011112222',
+    verifiedRecoveryEntries: [{ dealId, capabilityToken: verifiedToken }],
+    confirmedDealIds: [dealId],
+  });
+
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.recoveredDealIds, []);
+  assert.deepEqual(result.scopeByDeal, {});
+});
+
+test('in-flight recovery merges into the latest scope map without overwriting another tab', () => {
+  const ownerScope = 'phone:01011112222';
+  const capabilityToken = token('a');
+  const latestScopeByDeal = {
+    'owner-existing': ownerScope,
+    'owner-other-shop': 'phone:01099998888',
+  };
+  const result = reconcileOwnerRecovery({
+    capabilities: { 'owner-recover': capabilityToken },
+    scopeByDeal: latestScopeByDeal,
+    expectedOwnerScope: ownerScope,
+    currentOwnerScope: ownerScope,
+    requestedRecoveryEntries: [
+      { dealId: 'owner-recover', capabilityToken, recoveryScope: ownerScope },
+    ],
+    verifiedDealIds: ['owner-recover'],
+  });
+
+  assert.deepEqual(result.recoveredDealIds, ['owner-recover']);
+  assert.deepEqual(result.scopeByDeal, {
+    ...latestScopeByDeal,
+    'owner-recover': ownerScope,
+  });
+  assert.equal(latestScopeByDeal['owner-recover'], undefined);
+});
+
+test('in-flight recovery fails closed when identity, token, scope, or server result changed', () => {
+  const requestedScope = 'phone:01011112222';
+  const requestedToken = token('a');
+  const base = {
+    expectedOwnerScope: requestedScope,
+    currentOwnerScope: requestedScope,
+    requestedRecoveryEntries: [
+      {
+        dealId: 'owner-recover',
+        capabilityToken: requestedToken,
+        recoveryScope: requestedScope,
+      },
+    ],
+    verifiedDealIds: ['owner-recover'],
+  };
+
+  const identityChanged = reconcileOwnerRecovery({
+    ...base,
+    capabilities: { 'owner-recover': requestedToken },
+    currentOwnerScope: 'phone:01099998888',
+  });
+  const tokenChanged = reconcileOwnerRecovery({
+    ...base,
+    capabilities: { 'owner-recover': token('b') },
+  });
+  const claimedByAnotherTab = reconcileOwnerRecovery({
+    ...base,
+    capabilities: { 'owner-recover': requestedToken },
+    scopeByDeal: { 'owner-recover': 'phone:01099998888' },
+  });
+  const omittedByServer = reconcileOwnerRecovery({
+    ...base,
+    capabilities: { 'owner-recover': requestedToken },
+    verifiedDealIds: [],
+  });
+
+  [identityChanged, tokenChanged, claimedByAnotherTab, omittedByServer].forEach((result) => {
+    assert.equal(result.changed, false);
+    assert.deepEqual(result.recoveredDealIds, []);
+  });
+  assert.equal(claimedByAnotherTab.scopeByDeal['owner-recover'], 'phone:01099998888');
 });
 
 test('owner capabilities are batched without silently dropping claims after fifty', () => {

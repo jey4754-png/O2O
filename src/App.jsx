@@ -59,6 +59,11 @@ import {
 import { buildCommerceStats } from './commerceStats';
 import { mergeDeals } from './dealMerge';
 import {
+  mergeAuthoritativeOwnerOrders,
+  mergeOwnerOrderRefresh,
+  summarizeOwnerOrderDisplay,
+} from './orderMerge';
+import {
   buildGroupNotifications,
   canOpenOrderGroupRoom,
   dealHasGroupRoom,
@@ -85,15 +90,15 @@ import {
   resolveOwnerProductQuantity,
 } from './trade';
 import {
-  adoptLegacyOwnerScopes,
   assignOwnerDealScope,
+  buildOwnerRecoveryCandidates,
   chunkOwnerCapabilities,
-  completeOwnerScopeMigration,
-  hasCompletedOwnerScopeMigration,
   isOwnerDealId,
   isOwnerDealInScope,
   ownerScopeKey,
+  reconcileOwnerRecovery,
   scopedOwnerCapabilityEntries,
+  unscopedOwnerCapabilityEntries,
 } from './ownerCapabilities';
 import {
   clearProfile,
@@ -127,7 +132,6 @@ const CUSTOMER_ORDER_SYNCED_KEY = 'o2o_mvp_customer_order_sync_fingerprints';
 const CUSTOMER_ORDER_SYNC_ISSUES_KEY = 'o2o_mvp_customer_order_sync_issues_v1';
 const PUBLIC_DEAL_CAPABILITIES_KEY = 'o2o_mvp_public_deal_capabilities_v1';
 const OWNER_DEAL_SCOPES_KEY = 'o2o_mvp_owner_deal_scopes_v1';
-const OWNER_SCOPE_MIGRATION_KEY = 'o2o_mvp_owner_scope_migration_v1';
 const CUSTOMER_ORDER_CAPABILITY_KEY = 'o2o_mvp_customer_order_capability_v1';
 const GROUP_STATUS_SEEN_KEY = 'o2o_mvp_group_status_seen_v1';
 const COUNTED_PARTICIPATIONS_KEY = 'o2o_mvp_counted_participations';
@@ -381,22 +385,33 @@ async function fetchPublicDeals() {
 async function fetchOwnedRecords(endpoint, resultKey, capabilities) {
   const batches = chunkOwnerCapabilities(capabilities);
   if (!batches.length) return [];
-  try {
-    const records = [];
-    for (const batch of batches) {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'list_owner', capabilities: batch }),
-      });
-      const result = await response.json();
-      if (!response.ok || !result.ok || !Array.isArray(result[resultKey])) return null;
-      records.push(...result[resultKey]);
+  const records = [];
+  for (const batch of batches) {
+    let batchRecords = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'list_owner', capabilities: batch }),
+        });
+        const result = await response.json();
+        if (response.ok && result.ok && Array.isArray(result[resultKey])) {
+          batchRecords = result[resultKey];
+          break;
+        }
+        if (![502, 503, 504].includes(response.status)) return null;
+      } catch {
+        // Retry a single transient owner workspace read before preserving the last good state.
+      }
+      if (attempt === 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+      }
     }
-    return records;
-  } catch {
-    return null;
+    if (!batchRecords) return null;
+    records.push(...batchRecords);
   }
+  return records;
 }
 
 async function fetchOwnedPublicDeals(capabilities) {
@@ -413,7 +428,7 @@ async function fetchOwnedCustomerOrders(capabilities) {
   return records ? records.map((order) => migrateLocationFields(order)) : null;
 }
 
-async function publishPublicDeal(deal) {
+async function publishPublicDeal(deal, options = {}) {
   try {
     const capabilityToken = getDealCapability(deal.id, { create: true });
     const syncedDeal = {
@@ -426,9 +441,22 @@ async function publishPublicDeal(deal) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: 'publish', deal: syncedDeal, capabilityToken }),
     });
-    const result = await response.json();
-    return response.ok && result.ok ? result.deal : null;
-  } catch {
+    let result = {};
+    try {
+      result = await response.json();
+    } catch {
+      result = {};
+    }
+    if (!response.ok || !result.ok) {
+      const error = new Error(result.error || 'public_deal_sync_failed');
+      error.code = result.error || 'public_deal_sync_failed';
+      error.status = response.status;
+      if (options.throwOnError) throw error;
+      return null;
+    }
+    return result.deal;
+  } catch (error) {
+    if (options.throwOnError) throw error;
     return null;
   }
 }
@@ -887,6 +915,10 @@ function App() {
   const [ownerScopeByDeal, setOwnerScopeByDeal] = useState(() => loadJson(OWNER_DEAL_SCOPES_KEY, {}));
   const [ownedDeals, setOwnedDeals] = useState([]);
   const [ownerWorkspaceScope, setOwnerWorkspaceScope] = useState('');
+  const [ownerRecoveryCandidates, setOwnerRecoveryCandidates] = useState([]);
+  const [ownerRecoveryBusy, setOwnerRecoveryBusy] = useState(false);
+  const [ownerRecoveryError, setOwnerRecoveryError] = useState('');
+  const [ownerRecoveryLookupVersion, setOwnerRecoveryLookupVersion] = useState(0);
   const [customerGroups, setCustomerGroups] = useState(() => loadCustomerGroups());
   const [remoteDeals, setRemoteDeals] = useState([]);
   const [orders, setOrders] = useState(() => loadOrders());
@@ -930,31 +962,11 @@ function App() {
   );
 
   useEffect(() => {
-    if (route !== '/owner' || !activeOwnerScope) return;
-    const migrationState = loadJson(OWNER_SCOPE_MIGRATION_KEY, {});
-    const migrationCompleted = hasCompletedOwnerScopeMigration(migrationState, activeOwnerScope);
-    const result = adoptLegacyOwnerScopes({
-      capabilities: loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {}),
-      scopeByDeal: loadJson(OWNER_DEAL_SCOPES_KEY, {}),
-      ownerScope: activeOwnerScope,
-      createdDeals,
-      events: getEvents(),
-      migrationCompleted,
-    });
-    if (migrationCompleted) return;
-    if (result.changed && !saveJson(OWNER_DEAL_SCOPES_KEY, result.scopeByDeal)) return;
-    setOwnerScopeByDeal(result.scopeByDeal);
-    if (result.migrationCompleted) {
-      saveJson(
-        OWNER_SCOPE_MIGRATION_KEY,
-        completeOwnerScopeMigration(migrationState, activeOwnerScope, new Date().toISOString()),
-      );
-    }
-  }, [activeOwnerScope, createdDeals, route]);
-
-  useEffect(() => {
     setOwnedDeals([]);
     setOwnerOrders([]);
+    setOwnerRecoveryCandidates([]);
+    setOwnerRecoveryBusy(false);
+    setOwnerRecoveryError('');
     setOwnerWorkspaceScope(activeOwnerScope);
     setOwnerScreen('form');
   }, [activeOwnerScope]);
@@ -1060,13 +1072,17 @@ function App() {
       const capabilities = getOwnerCapabilityEntries(activeOwnerScope, ownerScopeByDeal);
       refreshing = true;
       try {
-        const [nextDeals, nextOrders] = await Promise.all([
+        const [verifiedOwnerDeals, nextOrders] = await Promise.all([
           fetchOwnedPublicDeals(capabilities),
           fetchOwnedCustomerOrders(capabilities),
         ]);
         if (cancelled) return;
-        if (nextDeals) setOwnedDeals(nextDeals);
-        if (nextOrders) setOwnerOrders(nextOrders);
+        if (verifiedOwnerDeals) {
+          setOwnedDeals(verifiedOwnerDeals);
+        }
+        if (nextOrders) {
+          setOwnerOrders((current) => mergeOwnerOrderRefresh(current, nextOrders));
+        }
         setOwnerWorkspaceScope(activeOwnerScope);
       } finally {
         refreshing = false;
@@ -1088,6 +1104,139 @@ function App() {
       document.removeEventListener('visibilitychange', handleVisible);
     };
   }, [activeOwnerScope, ownerScopeByDeal, route]);
+
+  useEffect(() => {
+    if (route !== '/owner' || !activeOwnerScope) {
+      setOwnerRecoveryCandidates([]);
+      return undefined;
+    }
+    setOwnerRecoveryCandidates([]);
+    let cancelled = false;
+    let loading = false;
+    const loadRecoveryCandidates = async () => {
+      if (loading || document.visibilityState === 'hidden') return;
+      const storedCapabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
+      const unscopedCapabilities = unscopedOwnerCapabilityEntries(
+        storedCapabilities,
+        ownerScopeByDeal,
+      );
+      if (!unscopedCapabilities.length) {
+        setOwnerRecoveryCandidates([]);
+        setOwnerRecoveryError('');
+        return;
+      }
+      loading = true;
+      setOwnerRecoveryError('');
+      try {
+        const recoverableOwnerDeals = await fetchOwnedPublicDeals(unscopedCapabilities);
+        if (cancelled) return;
+        if (!recoverableOwnerDeals) {
+          setOwnerRecoveryError('이 브라우저의 미연결 상품 관리키 확인이 지연되고 있습니다. 다시 확인해 주세요.');
+          return;
+        }
+        setOwnerRecoveryCandidates(
+          buildOwnerRecoveryCandidates({
+            capabilities: storedCapabilities,
+            scopeByDeal: ownerScopeByDeal,
+            verifiedDeals: recoverableOwnerDeals,
+            recoveryScope: activeOwnerScope,
+          }),
+        );
+      } finally {
+        loading = false;
+      }
+    };
+    const handleVisible = () => {
+      if (document.visibilityState === 'visible') loadRecoveryCandidates();
+    };
+    loadRecoveryCandidates();
+    window.addEventListener('online', loadRecoveryCandidates);
+    document.addEventListener('visibilitychange', handleVisible);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('online', loadRecoveryCandidates);
+      document.removeEventListener('visibilitychange', handleVisible);
+    };
+  }, [activeOwnerScope, ownerRecoveryLookupVersion, ownerScopeByDeal, route]);
+
+  const recoverOwnerDeals = useCallback(async () => {
+    if (!activeOwnerScope || ownerRecoveryBusy || ownerRecoveryCandidates.length === 0) return;
+    const candidateLines = ownerRecoveryCandidates.slice(0, 5).map((entry) => (
+      `- ${entry.title || '상품명 미확인'}${entry.store ? ` · ${entry.store}` : ''}`
+    ));
+    if (ownerRecoveryCandidates.length > candidateLines.length) {
+      candidateLines.push(`- 외 ${ownerRecoveryCandidates.length - candidateLines.length}개`);
+    }
+    const confirmed = window.confirm(
+      `이 브라우저에 저장된 미연결 상품 관리키 ${ownerRecoveryCandidates.length}개를 현재 사장님 화면에 연결할까요?\n\n${candidateLines.join('\n')}\n\n상품명과 매장을 확인해 주세요. 이 관리키는 계정 본인 확인 정보가 아닙니다. 공용 기기이거나 다른 사장님이 사용하던 기기라면 취소해 주세요.`,
+    );
+    if (!confirmed) return;
+
+    setOwnerRecoveryBusy(true);
+    setOwnerRecoveryError('');
+    try {
+      const requestedOwnerScope = activeOwnerScope;
+      const requestCapabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
+      const requestedRecoveryEntries = ownerRecoveryCandidates
+        .filter((entry) => (
+          entry.recoveryScope === requestedOwnerScope
+          && requestCapabilities?.[entry.dealId] === entry.capabilityToken
+        ));
+      if (!requestedRecoveryEntries.length) {
+        setOwnerRecoveryError('현재 사장님 정보와 상품 연결 후보가 달라졌습니다. 다시 확인해 주세요.');
+        return;
+      }
+      const recoverableOwnerDeals = await fetchOwnedPublicDeals(
+        requestedRecoveryEntries.map(({ dealId, capabilityToken }) => ({
+          dealId,
+          capabilityToken,
+        })),
+      );
+      if (!recoverableOwnerDeals) {
+        setOwnerRecoveryError('상품 관리키를 서버에서 다시 확인하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+        return;
+      }
+      const currentOwnerScope = ownerScopeKey(loadProfile());
+      if (currentOwnerScope !== requestedOwnerScope) {
+        setOwnerRecoveryError('사장님 계정 정보가 변경되어 상품을 연결하지 않았습니다. 다시 확인해 주세요.');
+        return;
+      }
+
+      // Re-read both stores after the network boundary. This preserves changes
+      // from another tab and rejects capabilities that changed while awaiting.
+      const currentCapabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
+      const currentScopeByDeal = loadJson(OWNER_DEAL_SCOPES_KEY, {});
+      const result = reconcileOwnerRecovery({
+        capabilities: currentCapabilities,
+        scopeByDeal: currentScopeByDeal,
+        expectedOwnerScope: requestedOwnerScope,
+        currentOwnerScope,
+        requestedRecoveryEntries,
+        verifiedDealIds: recoverableOwnerDeals.map((deal) => deal.id),
+      });
+      if (!result.changed || !saveJson(OWNER_DEAL_SCOPES_KEY, result.scopeByDeal)) {
+        setOwnerRecoveryError('상품 연결 정보를 확인하지 못했습니다. 새로고침 후 다시 시도해 주세요.');
+        return;
+      }
+      setOwnerScopeByDeal(result.scopeByDeal);
+      setOwnerRecoveryCandidates([]);
+      track('owner_products_recovered', { product_count: result.recoveredDealIds.length });
+    } finally {
+      setOwnerRecoveryBusy(false);
+    }
+  }, [
+    activeOwnerScope,
+    ownerRecoveryBusy,
+    ownerRecoveryCandidates,
+  ]);
+
+  const handleOwnerRecoveryAction = useCallback(() => {
+    if (ownerRecoveryCandidates.length > 0) {
+      recoverOwnerDeals();
+      return;
+    }
+    setOwnerRecoveryLookupVersion((current) => current + 1);
+  }, [ownerRecoveryCandidates.length, recoverOwnerDeals]);
 
   useEffect(() => {
     if (!RELEASE_FEATURES.deepLinks || !profile || !['/customer', '/admin'].includes(route)) return;
@@ -1159,20 +1308,27 @@ function App() {
       syncing = true;
       try {
         const published = [];
+        const syncErrors = [];
         for (const deal of pending) {
           if (cancelled) break;
-          published.push(await publishPublicDeal(deal));
+          try {
+            published.push(await publishPublicDeal(deal, { throwOnError: true }));
+            syncErrors.push(null);
+          } catch (error) {
+            published.push(null);
+            syncErrors.push(error);
+          }
         }
         if (cancelled) return;
         const valid = published.filter(Boolean);
-        if (!valid.length) return;
         const nextFingerprints = { ...loadJson(PUBLIC_DEAL_SYNCED_KEY, {}) };
-        valid.forEach((deal) => {
-          const local = localPublicDeals.find((item) => item.id === deal.id);
-          if (local) nextFingerprints[deal.id] = dealSyncFingerprint(local);
+        pending.forEach((deal, index) => {
+          if (published[index] || isTerminalOrderSyncError(syncErrors[index])) {
+            nextFingerprints[deal.id] = dealSyncFingerprint(deal);
+          }
         });
         saveJson(PUBLIC_DEAL_SYNCED_KEY, nextFingerprints);
-        setRemoteDeals((current) => mergeDeals(valid, current));
+        if (valid.length) setRemoteDeals((current) => mergeDeals(valid, current));
       } finally {
         syncing = false;
       }
@@ -1575,7 +1731,7 @@ function App() {
     setOwnedDeals((current) => mergeDeals([deal], current.filter((item) => item.id !== deal.id)));
     setSelectedDeal(deal);
     setOwnerScreen('done');
-    return true;
+    return deal;
   };
 
   const updateCustomerDeal = async (deal, options = {}) => {
@@ -2419,6 +2575,10 @@ function App() {
               onDeleteDeal={removeDeal}
               orders={orders}
               ownerOrders={scopedOwnerOrders}
+              ownerRecoveryCount={ownerRecoveryCandidates.length}
+              ownerRecoveryBusy={ownerRecoveryBusy}
+              ownerRecoveryError={ownerRecoveryError}
+              onRecoverOwnerProducts={handleOwnerRecoveryAction}
               onOrderStatusChange={updateOrderStatus}
               onPaymentConfirm={confirmManualPayment}
               onPreviewCustomer={openOwnerCustomerPreview}
@@ -4799,10 +4959,14 @@ function OwnerApp({
   ownedDeals,
   orders,
   ownerOrders,
+  ownerRecoveryCount = 0,
+  ownerRecoveryBusy = false,
+  ownerRecoveryError = '',
   location,
   onScreen,
   onCreate,
   onDeleteDeal,
+  onRecoverOwnerProducts,
   onPreviewCustomer,
   onOrderStatusChange,
   onPaymentConfirm,
@@ -4830,7 +4994,7 @@ function OwnerApp({
     () => new Set(managedOwnerDeals.map((deal) => deal.id)),
     [managedOwnerDeals],
   );
-  const neighborhoodOrders = useMemo(() => mergeOrders(ownerOrders, orders).filter(
+  const neighborhoodOrders = useMemo(() => mergeAuthoritativeOwnerOrders(ownerOrders, orders).filter(
     (order) => ['purchase', 'group'].includes(order.type)
       && ownerDealIds.has(order.dealId)
       && (!order.neighborhood || sameLocation(order, location)),
@@ -4844,6 +5008,10 @@ function OwnerApp({
     const pendingQuantity = Math.max(0, centralQuantity - detailedQuantity);
     return pendingQuantity > 0 ? [{ deal, pendingQuantity, centralQuantity }] : [];
   }), [location, managedOwnerDeals, neighborhoodOrders]);
+  const ownerOrderDisplay = useMemo(
+    () => summarizeOwnerOrderDisplay(neighborhoodOrders, orderSummaries),
+    [neighborhoodOrders, orderSummaries],
+  );
   const neighborhoodGroups = deals.filter(
     (deal) => deal.source === 'customer' && sameLocation(deal, location),
   );
@@ -4853,6 +5021,7 @@ function OwnerApp({
       <OwnerOrders
         orders={neighborhoodOrders}
         summaries={orderSummaries}
+        displayMetrics={ownerOrderDisplay}
         location={location}
         onBack={() => onScreen('form')}
         onStatusChange={onOrderStatusChange}
@@ -4865,6 +5034,10 @@ function OwnerApp({
       <OwnerProducts
         deals={managedOwnerDeals}
         onBack={() => onScreen('form')}
+        recoveryCount={ownerRecoveryCount}
+        recoveryBusy={ownerRecoveryBusy}
+        recoveryError={ownerRecoveryError}
+        onRecover={onRecoverOwnerProducts}
         onEdit={(deal) => {
           setEditingDeal(deal);
           setFormVersion((current) => current + 1);
@@ -4893,12 +5066,17 @@ function OwnerApp({
       key={formVersion}
       initialDeal={editingDeal}
       onCreate={(payload) => {
-        onCreate(payload, editingDeal?.id || null);
-        setEditingDeal(null);
+        const savedDeal = onCreate(payload, editingDeal?.id || null);
+        if (savedDeal) setEditingDeal(null);
+        return savedDeal;
       }}
       onOpenOrders={() => onScreen('orders')}
       onOpenProducts={() => onScreen('products')}
-      orderCount={neighborhoodOrders.length + orderSummaries.length}
+      orderDisplay={ownerOrderDisplay}
+      recoveryCount={ownerRecoveryCount}
+      recoveryBusy={ownerRecoveryBusy}
+      recoveryError={ownerRecoveryError}
+      onRecover={onRecoverOwnerProducts}
       communityGroups={neighborhoodGroups}
       location={location}
       onNeighborhoodChange={onNeighborhoodChange}
@@ -4911,7 +5089,11 @@ function OwnerForm({
   onCreate,
   onOpenOrders,
   onOpenProducts,
-  orderCount,
+  orderDisplay = summarizeOwnerOrderDisplay(),
+  recoveryCount = 0,
+  recoveryBusy = false,
+  recoveryError = '',
+  onRecover,
   communityGroups,
   location,
   onNeighborhoodChange,
@@ -5044,10 +5226,22 @@ function OwnerForm({
           </button>
           <button className="owner-orders-button" onClick={onOpenOrders}>
             <ShoppingBag size={18} />
-            <span>주문 {orderCount}</span>
+            <span>
+              주문 {orderDisplay.activeOrderCount}건
+              {orderDisplay.pendingDetailQuantity > 0
+                ? ` · 동기화 ${orderDisplay.pendingDetailQuantity}개`
+                : ''}
+            </span>
           </button>
         </div>
       </header>
+
+      <OwnerRecoveryBanner
+        count={recoveryCount}
+        busy={recoveryBusy}
+        error={recoveryError}
+        onRecover={onRecover}
+      />
 
       <div className="owner-neighborhood-link">
         <div>
@@ -5168,7 +5362,10 @@ function OwnerForm({
               : `${form.deadlineDate} ${form.deadlineTime}`,
             calculatedPrice: price,
           };
+          const savedDeal = onCreate(payload);
+          if (!savedDeal) return;
           track(initialDeal ? 'owner_product_updated' : 'owner_product_created', {
+            deal_id: savedDeal.id,
             sale_type: form.saleType,
             region: form.region,
             district: form.district,
@@ -5189,7 +5386,6 @@ function OwnerForm({
             methods: form.methods,
             has_image: Boolean(form.image),
           });
-          onCreate(payload);
         }}
       >
         <div className="content-block flush">
@@ -5409,7 +5605,40 @@ function OwnerForm({
   );
 }
 
-function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
+function OwnerRecoveryBanner({ count = 0, busy = false, error = '', onRecover }) {
+  if (count <= 0 && !error) return null;
+  return (
+    <div className="owner-recovery-banner" role="status" aria-live="polite">
+      <div>
+        <strong>{count > 0 ? `이 브라우저의 미연결 상품 ${count}개를 확인했습니다` : '상품 연결을 확인해 주세요'}</strong>
+        <span>{count > 0
+          ? '브라우저에 저장된 상품 관리키를 서버에서 확인했습니다. 상품명과 매장을 확인한 뒤 수동으로 연결해 주세요.'
+          : error}</span>
+      </div>
+      {(count > 0 || error) && (
+        <button
+          className="secondary-button compact-button"
+          disabled={busy}
+          onClick={onRecover}
+        >
+          {busy ? '확인 중…' : count > 0 ? '확인 후 연결' : '다시 확인'}
+        </button>
+      )}
+      {count > 0 && error ? <p className="form-error">{error}</p> : null}
+    </div>
+  );
+}
+
+function OwnerProducts({
+  deals,
+  onBack,
+  onEdit,
+  onDelete,
+  recoveryCount = 0,
+  recoveryBusy = false,
+  recoveryError = '',
+  onRecover,
+}) {
   useScreenAnalytics('owner_products', { product_count: deals.length });
   const [busyDealId, setBusyDealId] = useState('');
   const [deleteError, setDeleteError] = useState('');
@@ -5439,6 +5668,12 @@ function OwnerProducts({ deals, onBack, onEdit, onDelete }) {
         <h1>등록 상품 관리</h1>
         <Store size={20} />
       </header>
+      <OwnerRecoveryBanner
+        count={recoveryCount}
+        busy={recoveryBusy}
+        error={recoveryError}
+        onRecover={onRecover}
+      />
       {deleteError ? <p className="form-error" role="alert" aria-live="assertive">{deleteError}</p> : null}
       {deals.length === 0 ? (
         <EmptyCustomerState
@@ -5554,7 +5789,15 @@ function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
   );
 }
 
-function OwnerOrders({ orders, summaries = [], location, onBack, onStatusChange, onPaymentConfirm }) {
+function OwnerOrders({
+  orders,
+  summaries = [],
+  displayMetrics = summarizeOwnerOrderDisplay(orders, summaries),
+  location,
+  onBack,
+  onStatusChange,
+  onPaymentConfirm,
+}) {
   useScreenAnalytics('owner_orders', {
     order_count: orders.length,
     aggregate_order_count: summaries.length,
@@ -5592,7 +5835,15 @@ function OwnerOrders({ orders, summaries = [], location, onBack, onStatusChange,
           <ArrowLeft size={22} />
         </button>
         <h1>주문 관리</h1>
-        <span className="order-count-badge">{location.neighborhood} · {orders.length + summaries.length}건</span>
+        <span className="order-count-badge">
+          {location.neighborhood} · 활성 {displayMetrics.activeOrderCount}건
+          {displayMetrics.cancelledOrderCount > 0
+            ? ` · 취소 ${displayMetrics.cancelledOrderCount}건`
+            : ''}
+          {displayMetrics.pendingDetailQuantity > 0
+            ? ` · 동기화 ${displayMetrics.pendingDetailQuantity}개`
+            : ''}
+        </span>
       </header>
 
       <div className="neighborhood-sync-banner owner-sync-banner">

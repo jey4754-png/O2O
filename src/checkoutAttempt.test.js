@@ -248,7 +248,21 @@ test('order publish retry budget is bounded to transient network and HTTP failur
   assert.equal(orderPublishRetryCount({ status: 429 }), 3);
   assert.equal(orderPublishRetryCount({ status: 503 }), 3);
   assert.equal(orderPublishRetryCount({ status: 500 }), 3);
+  assert.equal(orderPublishRetryCount({ code: 'collector_busy' }), 3);
+  assert.equal(orderPublishRetryCount({ code: 'upstream_timeout' }), 3);
   assert.equal(orderPublishRetryCount({ name: 'TypeError' }), 3);
+  assert.equal(orderPublishRetryCount({ status: 501 }), 0);
   assert.equal(orderPublishRetryCount({ status: 409 }), 0);
   assert.equal(orderPublishRetryCount({ status: 400 }), 0);
+});
+
+test('semantic 4xx responses are terminal even with a generic sync error code', () => {
+  const semanticError = { status: 400, code: 'order_sync_failed' };
+  assert.equal(isTransientOrderSyncError(semanticError), false);
+  assert.equal(isTerminalOrderSyncError(semanticError), true);
+});
+
+test('an empty sync error is never treated as a terminal rejection', () => {
+  assert.equal(isTerminalOrderSyncError(null), false);
+  assert.equal(isTerminalOrderSyncError(undefined), false);
 });

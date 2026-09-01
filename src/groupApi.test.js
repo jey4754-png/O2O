@@ -16,8 +16,11 @@ import {
 test('only transient group API failures receive a bounded retry budget', () => {
   assert.equal(groupOperationRetryCount({ status: 503, code: 'collector_busy' }), 3);
   assert.equal(groupOperationRetryCount({ status: 504, code: 'upstream_timeout' }), 2);
+  assert.equal(groupOperationRetryCount({ name: 'TypeError' }), 2);
   assert.equal(groupOperationRetryCount({ status: 409, code: 'state_conflict' }), 0);
+  assert.equal(groupOperationRetryCount({ status: 409, code: 'collector_busy' }), 0);
   assert.equal(groupOperationRetryCount({ status: 403, code: 'forbidden' }), 0);
+  assert.equal(groupOperationRetryCount({ name: 'AbortError' }), 0);
 });
 
 function memoryStorage() {
@@ -251,15 +254,20 @@ test('group creation retries reuse the same membership mutation id after a lost 
   }
 });
 
-test('group join automatically retries collector contention with the identical mutation and quantity', async () => {
+test('group join retries network loss and collector contention with an identical request body', async () => {
   const previousStorage = globalThis.localStorage;
   const previousFetch = globalThis.fetch;
   globalThis.localStorage = memoryStorage();
   const payloads = [];
+  const requestBodies = [];
   globalThis.fetch = async (_url, options) => {
+    requestBodies.push(options.body);
     const payload = JSON.parse(options.body);
     payloads.push(payload);
     if (payloads.length === 1) {
+      throw new TypeError('Failed to fetch');
+    }
+    if (payloads.length === 2) {
       return {
         ok: false,
         status: 503,
@@ -304,9 +312,11 @@ test('group join automatically retries collector contention with the identical m
       clientMutationId: 'checkout-collector-retry-1234',
     });
     assert.equal(result.snapshot.group.orderedQuantity, 3);
-    assert.equal(payloads.length, 2);
-    assert.equal(payloads[0].clientMutationId, payloads[1].clientMutationId);
-    assert.equal(payloads[0].selectedQuantity, payloads[1].selectedQuantity);
+    assert.equal(payloads.length, 3);
+    assert.equal(requestBodies[0], requestBodies[1]);
+    assert.equal(requestBodies[1], requestBodies[2]);
+    assert.equal(payloads[0].clientMutationId, payloads[2].clientMutationId);
+    assert.equal(payloads[0].selectedQuantity, payloads[2].selectedQuantity);
   } finally {
     globalThis.fetch = previousFetch;
     if (previousStorage === undefined) delete globalThis.localStorage;

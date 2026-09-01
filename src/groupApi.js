@@ -162,10 +162,12 @@ export function normalizeSnapshot(result, groupId) {
 }
 
 export function groupOperationRetryCount(error = {}) {
-  const status = Number(error.status || 0);
-  const code = String(error.code || error.message || '');
+  const status = Number(error?.status || 0);
+  const code = String(error?.code || error?.message || '');
+  if (status >= 400 && status < 500) return 0;
   if (status === 503 || code === 'collector_busy') return 3;
   if ([502, 504].includes(status) || code === 'upstream_timeout') return 2;
+  if (!status && error?.name === 'TypeError') return 2;
   return 0;
 }
 
@@ -186,13 +188,16 @@ function waitForRetry(delayMs, signal) {
 }
 
 async function requestGroupOperation(payload, signal) {
+  // Freeze the request body once so retries cannot accidentally change the
+  // mutation identity or reserved quantity across an async backoff boundary.
+  const body = JSON.stringify(payload);
   let attempt = 0;
   while (true) {
     try {
       const response = await fetch('/api/group-ops', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body,
         signal,
       });
       let result = {};

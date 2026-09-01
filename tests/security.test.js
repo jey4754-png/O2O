@@ -459,6 +459,103 @@ test('public analytics endpoint rejects server-only order snapshots', async () =
   assert.deepEqual(response.body, { ok: false, error: 'reserved_event' });
 });
 
+test('public analytics rejects private owner proof fields, including nested aliases', async () => {
+  const previousFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+    throw new Error('fetch_should_not_run');
+  };
+  try {
+    const privateProofProperties = [
+      { ownerIdentityHash: 'a'.repeat(64) },
+      { _owner_identity_hash: 'b'.repeat(64) },
+      { nested: { ownerCapabilityHash: 'c'.repeat(64) } },
+      { nested: [{ _owner_capability_hash: 'd'.repeat(64) }] },
+    ];
+    for (const [index, properties] of privateProofProperties.entries()) {
+      const response = await invoke(collectHandler, {
+        headers: { origin: 'http://localhost:5173' },
+        body: {
+          event: {
+            id: `event-owner-proof-${index}`,
+            name: 'owner_product_created',
+            timestamp: new Date().toISOString(),
+            visitorId: 'visitor-owner-proof',
+            sessionId: 'session-owner-proof',
+            properties,
+          },
+        },
+      });
+      assert.equal(response.statusCode, 403);
+      assert.deepEqual(response.body, { ok: false, error: 'reserved_event_property' });
+    }
+    assert.equal(fetchCount, 0);
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+});
+
+test('owner product creation remains analytics-only and is forwarded without ownership authority', async () => {
+  const previous = {
+    fetch: globalThis.fetch,
+    collectorUrl: process.env.GOOGLE_SHEETS_COLLECTOR_URL,
+    collectorToken: process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN,
+    dataOrigin: process.env.O2O_DATA_API_ORIGIN,
+    dataToken: process.env.O2O_DATA_API_TOKEN,
+  };
+  process.env.GOOGLE_SHEETS_COLLECTOR_URL = 'https://collector.example.test';
+  process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN = 'collector-token';
+  delete process.env.O2O_DATA_API_ORIGIN;
+  delete process.env.O2O_DATA_API_TOKEN;
+  let forwarded;
+  globalThis.fetch = async (_url, options) => {
+    forwarded = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      async json() { return { ok: true }; },
+    };
+  };
+
+  try {
+    const response = await invoke(collectHandler, {
+      headers: { origin: 'http://localhost:5173' },
+      body: {
+        event: {
+          id: 'event-owner-analytics-only',
+          name: 'owner_product_created',
+          timestamp: new Date().toISOString(),
+          visitorId: 'visitor-owner-analytics',
+          sessionId: 'session-owner-analytics',
+          properties: {
+            deal_id: 'owner-analytics-only',
+            product_name: '분석용 상품명',
+          },
+        },
+      },
+    });
+
+    assert.equal(response.statusCode, 202);
+    assert.equal(response.body.ok, true);
+    assert.equal(forwarded.event.name, 'owner_product_created');
+    assert.equal(forwarded.event.properties.deal_id, 'owner-analytics-only');
+    assert.equal(forwarded.event.properties.ownerIdentityHash, undefined);
+    assert.equal(forwarded.event.properties.ownerCapabilityHash, undefined);
+  } finally {
+    globalThis.fetch = previous.fetch;
+    for (const [key, value] of Object.entries({
+      GOOGLE_SHEETS_COLLECTOR_URL: previous.collectorUrl,
+      GOOGLE_SHEETS_COLLECTOR_TOKEN: previous.collectorToken,
+      O2O_DATA_API_ORIGIN: previous.dataOrigin,
+      O2O_DATA_API_TOKEN: previous.dataToken,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test('invalid service headers cannot fall back to browser-origin authorization', async () => {
   const previousToken = process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN;
   process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN = 'expected-service-token';
