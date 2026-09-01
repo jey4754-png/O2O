@@ -5666,7 +5666,9 @@ function OwnerProducts({
           <ArrowLeft size={22} />
         </button>
         <h1>등록 상품 관리</h1>
-        <Store size={20} />
+        <button className="icon-button" onClick={onBack} aria-label="사장님 홈">
+          <Home size={20} />
+        </button>
       </header>
       <OwnerRecoveryBanner
         count={recoveryCount}
