@@ -66,6 +66,7 @@ async function credentialRequest(payload) {
   if (!url || !token) throw adminAuthError('admin_not_configured', 503);
   try {
     const body = JSON.stringify({ token, action: 'admin_credentials', payload });
+    const retryDelays = [300, 700];
     for (let attempt = 0; ; attempt += 1) {
       const { upstream, result } = await fetchUpstreamJson(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
@@ -73,10 +74,10 @@ async function credentialRequest(payload) {
       // These exact GAS responses originate only before acquiring the auth
       // script lock, before reading or changing the limiter. Do not replay an
       // uncertain response, a limiter denial, or any credential mutation.
-      if (attempt === 0 && ['rate_begin', 'rate_success'].includes(payload.operation)
+      if (attempt < retryDelays.length && ['rate_begin', 'rate_success'].includes(payload.operation)
         && upstream.status === 200 && result.ok === false && result.error === 'collector_busy'
         && Object.keys(result).length === 2) {
-        await new Promise((resolve) => setTimeout(resolve, 350));
+        await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
         continue;
       }
       if (upstream.status >= 400 || result.ok !== true) {

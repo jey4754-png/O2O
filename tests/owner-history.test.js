@@ -71,16 +71,20 @@ function fixture({ current = [], historic = [], extraEvents = [], deals } = {}) 
   runInNewContext(readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8'), context);
   const searches = [];
   const eventRows = [Array(16).fill('header'), ...historic.map((value) => snapshotRow(value)), ...extraEvents];
-  const sheets = {
-    publicDeals: {},
-    customerOrders: readOnlySheet([['id', 'phone', 'updated', 'snapshot'], ...current.map((value) => [value.id, '', '', JSON.stringify(value)])]),
-    events: readOnlySheet(eventRows, searches),
-  };
   const records = deals || {
     [OWNED_ID]: { id: OWNED_ID, source: 'merchant', _ownerCapabilityHash: OWNER_HASH },
   };
+  const publicDealRows = [Array(7).fill('header'), ...Object.values(records).map((deal) => {
+    const row = Array(7).fill('');
+    row[6] = JSON.stringify(deal);
+    return row;
+  })];
+  const sheets = {
+    publicDeals: readOnlySheet(publicDealRows, searches),
+    customerOrders: readOnlySheet([['id', 'phone', 'updated', 'snapshot'], ...current.map((value) => [value.id, '', '', JSON.stringify(value)])]),
+    events: readOnlySheet(eventRows, searches),
+  };
   context.ensureSheets_ = () => sheets;
-  context.publicDealRecord_ = (_sheet, id) => records[id] || null;
   context.json_ = (value) => JSON.parse(JSON.stringify(value));
   return {
     context,
@@ -99,7 +103,7 @@ test('owner history includes event-only orders as well as current rows without w
   assert.deepEqual(result.orders.map((item) => item.id), ['order-1234567890101', 'order-1234567890100']);
   assert.equal(result.orders[1]._customerCapabilityHash, undefined);
   assert.equal(result.orders[1]._reservationMutationId, undefined);
-  assert.deepEqual(f.searches, [OWNED_ID, 'customer_order_snapshot']);
+  assert.deepEqual(f.searches, ['customer_order_snapshot']);
 });
 
 test('owner history selects canonical versions rather than rolling payment or cancellation back to older events', () => {
@@ -140,7 +144,25 @@ test('owner history queries only verified products and exact-matches event produ
   assert.equal(result.ok, true);
   assert.deepEqual(result.orders.map((item) => item.id), ['order-1234567890105']);
   assert.doesNotMatch(JSON.stringify(result), /01099999999/);
-  assert.deepEqual(f.searches, [OWNED_ID, 'customer_order_snapshot']);
+  assert.deepEqual(f.searches, ['customer_order_snapshot']);
+});
+
+test('owner history keeps Spreadsheet searches bounded when many verified products are claimed', () => {
+  const claims = [];
+  const deals = {};
+  const historic = [];
+  for (let index = 0; index < 50; index += 1) {
+    const dealId = `owner-history-batch-${index}`;
+    const capabilityHash = String(index % 10).repeat(64);
+    claims.push({ dealId, ownerCapabilityHash: capabilityHash });
+    deals[dealId] = { id: dealId, source: 'merchant', _ownerCapabilityHash: capabilityHash };
+    historic.push(order(String(1234567890200 + index), { dealId }));
+  }
+  const f = fixture({ deals, historic });
+  const result = f.read(claims);
+  assert.equal(result.ok, true);
+  assert.equal(result.orders.length, 50);
+  assert.deepEqual(f.searches, ['customer_order_snapshot']);
 });
 
 test('owner history cannot expose stale snapshots when a newer canonical row belongs to an unverified product', () => {
@@ -196,7 +218,7 @@ test('owner history ignores unrelated or corrupt event rows but reports event-st
       snapshotRow(order('1234567890114'), 'customer_order_snapshot_debug')],
   });
   assert.deepEqual(f.read().orders.map((item) => item.id), ['order-1234567890111']);
-  f.context.historicCustomerOrders_ = () => { throw new Error('synthetic_read_failure'); };
+  f.context.historicCustomerOrdersForDeals_ = () => { throw new Error('synthetic_read_failure'); };
   assert.deepEqual(f.read(), { ok: false, error: 'owner_orders_failed' });
 });
 

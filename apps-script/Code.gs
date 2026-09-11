@@ -687,11 +687,37 @@ function ownerClaimMatchesDeal_(claim, deal) {
   );
 }
 
+function publicDealRecordsByIds_(sheet, dealIds) {
+  const requested = Object.create(null);
+  (dealIds || []).forEach(function(dealId) {
+    const normalized = String(dealId || '');
+    if (normalized) requested[normalized] = true;
+  });
+  const records = Object.create(null);
+  if (!sheet || !Object.keys(requested).length || sheet.getLastRow() < 2) return records;
+  // An owner can present up to 50 claims. Reading the compact JSON column once
+  // avoids one Spreadsheet TextFinder plus one cell read per product. Exact id
+  // and capability checks still happen below, so this changes only read cost.
+  sheet.getRange(2, 7, sheet.getLastRow() - 1, 1).getValues().forEach(function(row) {
+    try {
+      const deal = JSON.parse(row[0] || '{}');
+      const dealId = String(deal && deal.id || '');
+      if (requested[dealId] && deal && typeof deal === 'object' && !Array.isArray(deal)) {
+        records[dealId] = deal;
+      }
+    } catch (error) {}
+  });
+  return records;
+}
+
 function authorizedOwnerDealIds_(sheets, claimsValue) {
   const claims = normalizeOwnerClaims_(claimsValue);
+  const records = publicDealRecordsByIds_(sheets.publicDeals, claims.map(function(claim) {
+    return claim.dealId;
+  }));
   const authorized = Object.create(null);
   claims.forEach(function(claim) {
-    const deal = publicDealRecord_(sheets.publicDeals, claim.dealId);
+    const deal = records[claim.dealId] || null;
     if (ownerClaimMatchesDeal_(claim, deal)) authorized[claim.dealId] = true;
   });
   return authorized;
@@ -728,9 +754,7 @@ function getOwnerCustomerOrdersResponse_(claimsValue) {
     let snapshots = storedCustomerOrders_(sheets.customerOrders);
     // Legacy orders can exist only in the event log. Read those snapshots only
     // after verifying the current product capability, as in the admin view.
-    authorizedDealIds.forEach(function(dealId) {
-      snapshots = snapshots.concat(historicCustomerOrders_(sheets.events, '', dealId));
-    });
+    snapshots = snapshots.concat(historicCustomerOrdersForDeals_(sheets.events, authorized));
     // Merge before scoping so an older snapshot cannot override a newer order
     // belonging to another product, or roll back its status/version.
     const orders = ownerScopedOrders_(snapshots, authorized, sheets);
@@ -3989,6 +4013,29 @@ function historicCustomerOrders_(events, phone, dealId) {
       const orderDealId = String(order.dealId || (order.deal && order.deal.id) || '');
       if (dealId && orderDealId !== dealId) return;
       if (order && order.id) results.push(order);
+    } catch (error) {}
+  });
+  return results;
+}
+
+function historicCustomerOrdersForDeals_(events, authorizedDealIds) {
+  const authorized = authorizedDealIds || Object.create(null);
+  if (!Object.keys(authorized).length || !events || events.getLastRow() < 2) return [];
+  // Find the immutable order snapshots once and filter their parsed product id
+  // against the already capability-authorized set. This keeps the query cost
+  // bounded when one owner has many products and cannot widen authorization.
+  const matches = events.getRange(2, 7, events.getLastRow() - 1, 1)
+    .createTextFinder('customer_order_snapshot').matchCase(true).matchEntireCell(true)
+    .findAll();
+  if (!matches.length) return [];
+  const results = [];
+  matchedEventRows_(events, matches).forEach(function(row) {
+    if (String(row[6] || '') !== 'customer_order_snapshot') return;
+    try {
+      const details = JSON.parse(row[11] || '{}');
+      const order = JSON.parse(details.order_snapshot || '{}');
+      const orderDealId = customerOrderDealId_(order);
+      if (order && order.id && authorized[orderDealId]) results.push(order);
     } catch (error) {}
   });
   return results;

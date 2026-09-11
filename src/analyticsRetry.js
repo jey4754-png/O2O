@@ -1,12 +1,16 @@
 export const PENDING_EVENT_BATCH_SIZE = 3;
-export const PENDING_EVENT_BASE_BACKOFF_MS = 15000;
+export const PENDING_EVENT_BASE_BACKOFF_MS = 60000;
 export const PENDING_EVENT_MAX_BACKOFF_MS = 5 * 60 * 1000;
 
-export function pendingCentralBatch(events, pendingIds, limit = PENDING_EVENT_BATCH_SIZE) {
+export function pendingCentralBatch(events, pendingIds, limit = PENDING_EVENT_BATCH_SIZE, offset = 0) {
   const batchSize = Math.max(1, Math.floor(Number(limit) || PENDING_EVENT_BATCH_SIZE));
-  return (Array.isArray(events) ? events : [])
-    .filter((event) => event?.pendingCentral && pendingIds?.has(event.id))
-    .slice(0, batchSize);
+  const eligible = (Array.isArray(events) ? events : [])
+    .filter((event) => event?.pendingCentral && pendingIds?.has(event.id));
+  if (!eligible.length) return [];
+  const start = Math.max(0, Math.floor(Number(offset) || 0)) % eligible.length;
+  return Array.from({ length: Math.min(batchSize, eligible.length) }, (_, index) => (
+    eligible[(start + index) % eligible.length]
+  ));
 }
 
 export function pendingCentralBackoffDelay(failureCount, randomValue = Math.random()) {

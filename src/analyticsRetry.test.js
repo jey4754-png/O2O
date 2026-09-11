@@ -22,6 +22,22 @@ test('pending analytics retries use a small oldest-first batch', () => {
   assert.equal(PENDING_EVENT_BATCH_SIZE, 3);
 });
 
+test('pending analytics retries can continue from a bounded cursor after a failed batch', () => {
+  const events = Array.from({ length: 6 }, (_, index) => ({
+    id: `event-${index + 1}`,
+    pendingCentral: true,
+  }));
+  const pendingIds = new Set(events.map((event) => event.id));
+  assert.deepEqual(
+    pendingCentralBatch(events, pendingIds, 3, 3).map((event) => event.id),
+    ['event-4', 'event-5', 'event-6'],
+  );
+  assert.deepEqual(
+    pendingCentralBatch(events, pendingIds, 3, 5).map((event) => event.id),
+    ['event-6', 'event-1', 'event-2'],
+  );
+});
+
 test('pending analytics retries keep the bounded batch moving after a failed event', async () => {
   const attempted = [];
   const results = await processPendingCentralBatch(
@@ -116,8 +132,8 @@ test('a thrown send error is isolated to its event', async () => {
 });
 
 test('pending analytics retry delay grows exponentially with bounded jitter', () => {
-  assert.equal(pendingCentralBackoffDelay(1, 0), 12000);
-  assert.equal(pendingCentralBackoffDelay(2, 0.5), 30000);
-  assert.equal(pendingCentralBackoffDelay(3, 1), 72000);
+  assert.equal(pendingCentralBackoffDelay(1, 0), 48000);
+  assert.equal(pendingCentralBackoffDelay(2, 0.5), 120000);
+  assert.equal(pendingCentralBackoffDelay(3, 1), 288000);
   assert.ok(pendingCentralBackoffDelay(20, 1) <= 5 * 60 * 1000);
 });

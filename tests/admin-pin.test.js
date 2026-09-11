@@ -216,7 +216,7 @@ for (const busyPhase of ['rate_begin', 'rate_success']) {
     assert.deepEqual(state.clients, {}, 'successful completion must release exactly one reserved attempt');
   });
 
-  test(`persistent ${busyPhase} busy stops after two requests without entering an admin operation`, async (t) => {
+  test(`persistent ${busyPhase} busy stops after three requests without entering an admin operation`, async (t) => {
     const store = fixture(t);
     let phase = '';
     store.context.LockService.getScriptLock = () => ({ tryLock: () => phase !== busyPhase, releaseLock() {} });
@@ -227,7 +227,7 @@ for (const busyPhase of ['rate_begin', 'rate_success']) {
     const result = await invoke(adminHandler, { action: 'list', actorId: 'qa_admin', adminPin: bootstrapPin });
     assert.equal(result.statusCode, 503);
     assert.equal(result.body.error, 'admin_credential_store_unavailable');
-    assert.equal(store.calls.filter((call) => call.payload.operation === busyPhase).length, 2);
+    assert.equal(store.calls.filter((call) => call.payload.operation === busyPhase).length, 3);
     assert.equal(store.calls.some((call) => call.action === 'admin_operation'), false);
     if (busyPhase === 'rate_begin') assert.equal(store.properties.size, 0);
     else assert.equal(JSON.parse(store.properties.get('O2O_ADMIN_AUTH_RATE_LIMIT_V1')).global.inFlight, 1);

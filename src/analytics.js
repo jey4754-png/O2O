@@ -92,6 +92,7 @@ let centralQueue = Promise.resolve();
 let pendingFlushPromise = null;
 let pendingCentralFailureCount = 0;
 let pendingCentralRetryAt = 0;
+let pendingCentralCursor = 0;
 
 function sanitizeAnalyticsProperties(input, {
   maxString = 2000,
@@ -277,15 +278,20 @@ export function flushPendingEvents(profile = getProfile()) {
 
   persistEvents(normalized);
   const pendingIds = new Set(pending.map((event) => event.id));
-  const batch = pendingCentralBatch(normalized, pendingIds);
+  const batch = pendingCentralBatch(normalized, pendingIds, undefined, pendingCentralCursor);
   pendingFlushPromise = processPendingCentralBatch(batch, collectEvent)
     .then((results) => {
-      if (results.some((stored) => !stored)) {
+      const stillPending = getEvents().some((event) => event.pendingCentral);
+      if (results.some((stored) => !stored) && stillPending && pendingCentralRetryAt <= Date.now()) {
         pendingCentralFailureCount += 1;
         pendingCentralRetryAt = Date.now() + pendingCentralBackoffDelay(pendingCentralFailureCount);
-      } else {
+      }
+      if (results.some((stored) => !stored) && stillPending) {
+        pendingCentralCursor = (pendingCentralCursor + batch.length) % Math.max(1, pendingIds.size);
+      } else if (!stillPending) {
         pendingCentralFailureCount = 0;
         pendingCentralRetryAt = 0;
+        pendingCentralCursor = 0;
       }
       return results;
     })
@@ -418,6 +424,11 @@ function collectEvent(payload) {
 
   const request = centralQueue.catch(() => undefined).then(async () => {
     try {
+      // Once one background analytics request encounters a transient outage,
+      // keep later queued events local until the retry window. Without this
+      // gate a navigation burst can start dozens of Apps Script executions and
+      // starve payment, order-history and group requests on the same service.
+      if (Date.now() < pendingCentralRetryAt) return false;
       const response = await runCentralMutation(
         () => fetch('/api/collect', {
           method: 'POST',
@@ -429,6 +440,10 @@ function collectEvent(payload) {
       );
       if (!response.ok) {
         const retryable = [408, 409, 425, 429].includes(response.status) || response.status >= 500;
+        if (retryable) {
+          pendingCentralFailureCount += 1;
+          pendingCentralRetryAt = Date.now() + pendingCentralBackoffDelay(pendingCentralFailureCount);
+        }
         if (!retryable && response.status >= 400 && response.status < 500) {
           const events = getEvents();
           const next = events.map((event) => {
@@ -447,8 +462,12 @@ function collectEvent(payload) {
         return stored;
       });
       persistEvents(next);
+      pendingCentralFailureCount = 0;
+      pendingCentralRetryAt = 0;
       return true;
     } catch {
+      pendingCentralFailureCount += 1;
+      pendingCentralRetryAt = Date.now() + pendingCentralBackoffDelay(pendingCentralFailureCount);
       return false;
     } finally {
       centralRequests.delete(payload.id);

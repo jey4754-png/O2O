@@ -257,7 +257,9 @@ test('Apps Script owner scope accepts only exact merchant capabilities and filte
     'owner-wrong-token': { id: 'owner-wrong-token', source: 'merchant', _ownerCapabilityHash: otherHash },
     'owner-not-merchant': { id: 'owner-not-merchant', source: 'customer', _ownerCapabilityHash: validHash },
   };
-  collector.publicDealRecord_ = (_sheet, dealId) => deals[dealId] || null;
+  collector.publicDealRecordsByIds_ = (_sheet, dealIds) => Object.fromEntries(
+    dealIds.filter((dealId) => deals[dealId]).map((dealId) => [dealId, deals[dealId]]),
+  );
 
   const authorized = collector.authorizedOwnerDealIds_({ publicDeals: {} }, [
     { dealId: 'owner-valid', ownerCapabilityHash: validHash },
