@@ -1,3 +1,5 @@
+import { runCentralMutation } from './centralMutationQueue.js';
+
 const CHECKOUT_ATTEMPTS_KEY = 'o2o_mvp_checkout_attempts_v1';
 const CHECKOUT_ATTEMPT_TTL_MS = 24 * 60 * 60 * 1000;
 const ORDER_ID_PATTERN = /^order-\d{10,20}$/;
@@ -9,12 +11,28 @@ const TRANSIENT_ORDER_SYNC_CODES = new Set([
   'order_sync_failed',
   'upstream_timeout',
 ]);
-const TRANSIENT_ORDER_SYNC_STATUSES = new Set([408, 425, 429, 502, 503, 504]);
+const TRANSIENT_ORDER_SYNC_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 const TRANSIENT_ORDER_PUBLISH_CODES = new Set(['collector_busy', 'upstream_timeout']);
 const TRANSIENT_ORDER_PUBLISH_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 let memoryAttempts = {};
 const storageMemoryAttempts = new WeakMap();
+const activeCheckoutAttemptIds = new Set();
+const RESERVATION_STAGES = new Set([
+  'prepared',
+  'creating_group',
+  'publishing_deal',
+  'reserving',
+  'reserved',
+  'publishing_order',
+]);
+const SIDE_EFFECT_STAGES = new Set([
+  'creating_group',
+  'publishing_deal',
+  'reserving',
+  'reserved',
+  'publishing_order',
+]);
 
 function availableStorage(storage) {
   if (storage !== undefined) return storage;
@@ -70,12 +88,18 @@ function attemptStorageKey(input, fingerprint) {
   return `${String(input.actorId || '')}::${String(input.dealId || input.deal?.id || '')}::${fingerprint}`;
 }
 
-function validAttempt(attempt, fingerprint, nowMs) {
-  if (!attempt || attempt.fingerprint !== fingerprint) return false;
+function validStoredAttempt(attempt, nowMs) {
+  if (!attempt) return false;
   if (!ORDER_ID_PATTERN.test(String(attempt.orderId || ''))) return false;
   if (!MUTATION_ID_PATTERN.test(String(attempt.reservationMutationId || ''))) return false;
   const updatedAtMs = Date.parse(attempt.updatedAt || attempt.createdAt || '');
-  return Number.isFinite(updatedAtMs) && nowMs - updatedAtMs <= CHECKOUT_ATTEMPT_TTL_MS;
+  if (!Number.isFinite(updatedAtMs)) return false;
+  return SIDE_EFFECT_STAGES.has(attempt.stage)
+    || nowMs - updatedAtMs <= CHECKOUT_ATTEMPT_TTL_MS;
+}
+
+function validAttempt(attempt, fingerprint, nowMs) {
+  return attempt?.fingerprint === fingerprint && validStoredAttempt(attempt, nowMs);
 }
 
 function randomNonce(randomValue) {
@@ -102,31 +126,171 @@ export function beginCheckoutAttempt(input, options = {}) {
   const key = attemptStorageKey({ actorId, dealId }, fingerprint);
   const attempts = readAttempts(options.storage);
   const existing = attempts[key];
-  if (validAttempt(existing, fingerprint, nowMs)) return existing;
+  if (validAttempt(existing, fingerprint, nowMs)) {
+    activeCheckoutAttemptIds.add(existing.orderId);
+    return existing;
+  }
 
   Object.entries(attempts).forEach(([attemptKey, attempt]) => {
-    const updatedAtMs = Date.parse(attempt?.updatedAt || attempt?.createdAt || '');
-    if (!Number.isFinite(updatedAtMs) || nowMs - updatedAtMs > CHECKOUT_ATTEMPT_TTL_MS) {
+    if (!validStoredAttempt(attempt, nowMs)) {
       delete attempts[attemptKey];
+      activeCheckoutAttemptIds.delete(attempt?.orderId);
     }
   });
+
+  const groupId = String(input?.groupId || '');
+  const unresolvedGroupAttempt = groupId && Object.values(attempts).find((attempt) => (
+    validStoredAttempt(attempt, nowMs)
+    && attempt.actorId === actorId
+    && attempt.groupId === groupId
+    && attempt.fingerprint !== fingerprint
+    && SIDE_EFFECT_STAGES.has(attempt.stage)
+  ));
+  if (unresolvedGroupAttempt) {
+    const error = new Error('checkout_recovery_pending');
+    error.code = 'checkout_recovery_pending';
+    throw error;
+  }
 
   const nonce = String(randomNonce(options.randomValue)).padStart(6, '0');
   const attempt = {
     actorId,
     dealId,
+    groupId,
     fingerprint,
     orderId: `order-${Math.floor(nowMs)}${nonce}`,
     createdAt: new Date(nowMs).toISOString(),
     updatedAt: new Date(nowMs).toISOString(),
     reservationMutationId: requestedMutationId,
+    reservationAction: ['create', 'join', 'reserve_quantity'].includes(input?.reservationAction)
+      ? input.reservationAction
+      : '',
+    reservationQuantity: Math.max(0, Math.floor(numericValue(input?.selectedCount ?? input?.quantity))),
+    nickname: String(input?.nickname || '').slice(0, 80),
+    workflowDeal: input?.workflowDeal && typeof input.workflowDeal === 'object'
+      ? JSON.parse(JSON.stringify(input.workflowDeal))
+      : null,
+    orderPayload: input?.orderPayload && typeof input.orderPayload === 'object'
+      ? JSON.parse(JSON.stringify(input.orderPayload))
+      : null,
+    stage: 'prepared',
   };
   attempts[key] = attempt;
   writeAttempts(attempts, options.storage);
+  activeCheckoutAttemptIds.add(attempt.orderId);
   return attempt;
 }
 
+export function updateCheckoutAttempt(orderId, patch = {}, options = {}) {
+  const attempts = readAttempts(options.storage);
+  const entry = Object.entries(attempts).find(([, attempt]) => attempt?.orderId === orderId);
+  if (!entry) return null;
+  const [key, current] = entry;
+  const stage = RESERVATION_STAGES.has(patch.stage) ? patch.stage : current.stage;
+  const next = {
+    ...current,
+    stage,
+    reservationAction: ['create', 'join', 'reserve_quantity'].includes(patch.reservationAction)
+      ? patch.reservationAction
+      : current.reservationAction,
+    reservationQuantity: Number.isInteger(Number(patch.reservationQuantity))
+      ? Math.max(0, Number(patch.reservationQuantity))
+      : current.reservationQuantity,
+    nickname: patch.nickname === undefined
+      ? current.nickname
+      : String(patch.nickname || '').slice(0, 80),
+    workflowDeal: patch.workflowDeal && typeof patch.workflowDeal === 'object'
+      ? JSON.parse(JSON.stringify(patch.workflowDeal))
+      : current.workflowDeal,
+    orderPayload: patch.orderPayload && typeof patch.orderPayload === 'object'
+      ? JSON.parse(JSON.stringify(patch.orderPayload))
+      : current.orderPayload,
+    updatedAt: new Date(Number(options.nowMs ?? Date.now())).toISOString(),
+  };
+  attempts[key] = next;
+  writeAttempts(attempts, options.storage);
+  return next;
+}
+
+export function releaseCheckoutAttempt(orderId) {
+  return activeCheckoutAttemptIds.delete(orderId);
+}
+
+// Payment can close a reservation while an additional order is still being
+// published. Include active attempts here as well as interrupted ones; the
+// recovery list deliberately excludes attempts another caller is working on.
+export function hasUnfinishedGroupCheckout(groupId, actorId, options = {}) {
+  return listUnfinishedGroupCheckoutAttempts(groupId, actorId, options).length > 0;
+}
+
+export function listUnfinishedGroupCheckoutAttempts(groupId, actorId, options = {}) {
+  const nowMs = Number(options.nowMs ?? Date.now());
+  return Object.values(readAttempts(options.storage)).filter((attempt) => (
+    validStoredAttempt(attempt, nowMs)
+    && attempt.actorId === actorId
+    && (attempt.groupId || attempt.dealId) === groupId
+    && SIDE_EFFECT_STAGES.has(attempt.stage)
+  )).map((attempt) => ({ ...attempt, active: activeCheckoutAttemptIds.has(attempt.orderId) }));
+}
+
+// An order ID alone is not proof that an interrupted reservation committed.
+// Callers must obtain `order` from an authenticated canonical read/publication,
+// never a local display record or its synchronization fingerprint.
+export function matchesCheckoutReservation(order, attempt) {
+  const quantity = Number(attempt?.reservationQuantity);
+  return Boolean(order && attempt
+    && ORDER_ID_PATTERN.test(String(attempt.orderId || ''))
+    && MUTATION_ID_PATTERN.test(String(attempt.reservationMutationId || ''))
+    && ['create', 'join', 'reserve_quantity'].includes(attempt.reservationAction)
+    && Number.isInteger(quantity) && quantity > 0
+    && order.id === attempt.orderId
+    && order.groupId === attempt.groupId && order.dealId === attempt.dealId
+    && order.visitorId === attempt.actorId && order.participantActorId === attempt.actorId
+    && order.reservationMutationId === attempt.reservationMutationId
+    && order.reservationAction === attempt.reservationAction
+    && Number(order.reservationQuantity) === quantity
+    && Number(order.quantity) === quantity && Number(order.selectedCount) === quantity
+    && order.status !== 'cancelled' && order.paymentStatus !== 'cancelled' && !order.cancelledAt
+    && order.paymentSyncStatus !== 'repair_required');
+}
+
+export function reconcileGroupCheckoutAttempts(groupId, actorId, centralOrders, options = {}) {
+  if (!Array.isArray(centralOrders)) return [];
+  const completed = [];
+  // Re-read after the asynchronous history request: another checkout may have
+  // resumed while it was pending. Never complete a currently active attempt.
+  for (const attempt of listUnfinishedGroupCheckoutAttempts(groupId, actorId, options)) {
+    const candidates = centralOrders.filter((order) => order?.id === attempt.orderId);
+    if (attempt.active || candidates.length !== 1 || !matchesCheckoutReservation(candidates[0], attempt)) continue;
+    if (completeCheckoutAttempt(attempt.orderId, options)) completed.push(attempt.orderId);
+  }
+  return completed;
+}
+
+export function listRecoverableCheckoutAttempts(options = {}) {
+  const nowMs = Number(options.nowMs ?? Date.now());
+  const attempts = readAttempts(options.storage);
+  let changed = false;
+  const recoverable = [];
+  Object.entries(attempts).forEach(([key, attempt]) => {
+    if (!validStoredAttempt(attempt, nowMs)) {
+      delete attempts[key];
+      activeCheckoutAttemptIds.delete(attempt?.orderId);
+      changed = true;
+      return;
+    }
+    if (
+      attempt.groupId
+      && SIDE_EFFECT_STAGES.has(attempt.stage)
+      && !activeCheckoutAttemptIds.has(attempt.orderId)
+    ) recoverable.push({ ...attempt });
+  });
+  if (changed) writeAttempts(attempts, options.storage);
+  return recoverable;
+}
+
 export function completeCheckoutAttempt(orderId, options = {}) {
+  activeCheckoutAttemptIds.delete(orderId);
   const attempts = readAttempts(options.storage);
   let changed = false;
   Object.entries(attempts).forEach(([key, attempt]) => {
@@ -139,7 +303,7 @@ export function completeCheckoutAttempt(orderId, options = {}) {
 }
 
 export function checkoutNeedsDurableOrderSync(order = {}) {
-  if (order.type !== 'purchase') return false;
+  if (!['purchase', 'group'].includes(order.type)) return false;
   const deal = order.deal || {};
   return deal.source === 'merchant'
     || deal.source === 'customer'
@@ -150,9 +314,9 @@ export function isTransientOrderSyncError(error = {}) {
   const status = Number(error?.status || 0);
   const code = String(error?.code || error?.message || '');
   if (TRANSIENT_ORDER_SYNC_STATUSES.has(status)) return true;
+  if (status >= 400 && status < 500) return false;
   // A semantic 4xx response is authoritative even when its body contains a
   // generic sync code; do not leave it in the periodic retry queue.
-  if (status >= 400 && status < 500) return false;
   return TRANSIENT_ORDER_SYNC_CODES.has(code) || (!status && error?.name === 'TypeError');
 }
 
@@ -169,7 +333,7 @@ function waitForOrderPublishRetry(delayMs) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
-export async function publishCustomerOrderRequest(payload, options = {}) {
+async function performCustomerOrderPublish(payload, options = {}) {
   const fetchImpl = options.fetchImpl || globalThis.fetch;
   const wait = options.wait || waitForOrderPublishRetry;
   if (typeof fetchImpl !== 'function') throw new TypeError('fetch_unavailable');
@@ -193,7 +357,9 @@ export async function publishCustomerOrderRequest(payload, options = {}) {
       if (!response.ok || !result.ok) {
         const error = new Error(result.error || 'order_sync_failed');
         error.code = result.error || 'order_sync_failed';
-        error.status = response.status;
+        // A successful HTTP response without a valid success envelope is a
+        // malformed gateway response, not a terminal semantic rejection.
+        error.status = response.ok && !result.error ? 502 : response.status;
         throw error;
       }
       return result.order;
@@ -205,6 +371,13 @@ export async function publishCustomerOrderRequest(payload, options = {}) {
       await wait(delay);
     }
   }
+}
+
+export function publishCustomerOrderRequest(payload, options = {}) {
+  return runCentralMutation(
+    () => performCustomerOrderPublish(payload, options),
+    { priority: options.priority },
+  );
 }
 
 export function canQueueReservedGroupOrder(order = {}, error = {}) {

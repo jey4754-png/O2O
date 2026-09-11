@@ -69,9 +69,9 @@ export const GROUP_STATES = Object.freeze([
 
 export const GROUP_STATUS_LABELS = Object.freeze({
   recruiting: '모집 중',
-  recruited: '모집 완료',
-  purchased: '상품 구매 완료',
-  delivered: '전달 완료',
+  recruited: '주문 확인',
+  purchased: '준비 완료',
+  delivered: '픽업 완료',
 });
 
 export function formatGroupQuantityAllocation(quantity = {}, groupStatus = 'recruiting') {
@@ -81,7 +81,7 @@ export function formatGroupQuantityAllocation(quantity = {}, groupStatus = 'recr
 
   return groupStatus === 'recruiting'
     ? `남은 제품 ${remaining}개`
-    : `모집 종료 · 배정 ${ordered}개 / 총 ${total}개 · 미배정 ${remaining}개`;
+    : `주문 확정 · 배정 ${ordered}개 / 총 ${total}개 · 미배정 ${remaining}개`;
 }
 
 export const PAYMENT_STATES = Object.freeze([

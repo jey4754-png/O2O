@@ -19,6 +19,7 @@ export default function SplitCalculator({
   initialSelectedQuantity = 1,
   onBack,
   onCreateGroup,
+  readOnly = false,
 }) {
   useScreenAnalytics('split_calculator');
   const normalizedProductQuantity = Math.min(
@@ -242,30 +243,34 @@ export default function SplitCalculator({
         개당 금액은 총액을 상품 수량으로 나누어 원 단위 내림합니다. 남는 {formatWon(productResult.remainder)}은 호스트가 부담해 전체 합계를 맞춥니다.
       </p>
 
-      <div className="sticky-actions single">
-        <button
-          className="primary-button"
-          disabled={numericTotal <= 0}
-          onClick={() => onCreateGroup({
-            total: result.total,
-            people: result.people,
-            expectedPerPerson: result.perPerson,
-            hostExpectedAmount: result.hostAmount,
-            approximate: result.approximate,
-            totalQuantity: productResult.productQuantity,
-            creatorQuantity: productResult.selectedQuantity,
-            productQuantity: productResult.productQuantity,
-            creatorProductQuantity: productResult.selectedQuantity,
-            unitPrice: productResult.unitPrice,
-            creatorExpectedAmount: productResult.selectedAmount,
-            hostCreatorExpectedAmount: productResult.hostSelectedAmount,
-            productRemainder: productResult.remainder,
-          })}
-        >
-          <Users size={18} />
-          이 조건으로 그룹 만들기
-        </button>
-      </div>
+      {readOnly ? (
+        <p className="evidence-note" role="status">사장님 미리보기에서는 예상 금액만 확인할 수 있습니다.</p>
+      ) : (
+        <div className="sticky-actions single">
+          <button
+            className="primary-button"
+            disabled={numericTotal <= 0}
+            onClick={() => onCreateGroup({
+              total: result.total,
+              people: result.people,
+              expectedPerPerson: result.perPerson,
+              hostExpectedAmount: result.hostAmount,
+              approximate: result.approximate,
+              totalQuantity: productResult.productQuantity,
+              creatorQuantity: productResult.selectedQuantity,
+              productQuantity: productResult.productQuantity,
+              creatorProductQuantity: productResult.selectedQuantity,
+              unitPrice: productResult.unitPrice,
+              creatorExpectedAmount: productResult.selectedAmount,
+              hostCreatorExpectedAmount: productResult.hostSelectedAmount,
+              productRemainder: productResult.remainder,
+            })}
+          >
+            <Users size={18} />
+            이 조건으로 그룹 만들기
+          </button>
+        </div>
+      )}
     </section>
   );
 }

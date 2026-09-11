@@ -5,6 +5,7 @@ import {
   pendingCentralBatch,
   processPendingCentralBatch,
 } from './analyticsRetry';
+import { runCentralMutation } from './centralMutationQueue.js';
 
 const VISITOR_KEY = 'o2o_mvp_visitor_id';
 const PROFILE_KEY = 'o2o_mvp_profile';
@@ -417,12 +418,15 @@ function collectEvent(payload) {
 
   const request = centralQueue.catch(() => undefined).then(async () => {
     try {
-      const response = await fetch('/api/collect', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event: payload }),
-        keepalive: true,
-      });
+      const response = await runCentralMutation(
+        () => fetch('/api/collect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ event: payload }),
+          keepalive: true,
+        }),
+        { priority: 'background' },
+      );
       if (!response.ok) {
         const retryable = [408, 409, 425, 429].includes(response.status) || response.status >= 500;
         if (!retryable && response.status >= 400 && response.status < 500) {

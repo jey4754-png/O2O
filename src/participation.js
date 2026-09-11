@@ -1,3 +1,5 @@
+import { canonicalOrderVersion } from './orderMerge.js';
+
 export function isCancelledOrder(order = {}) {
   return order.status === 'cancelled' || order.paymentStatus === 'cancelled';
 }
@@ -20,14 +22,21 @@ export function cancelledOrderSnapshot(order = {}, {
   timestamp = new Date().toISOString(),
   clientMutationId = '',
 } = {}) {
+  const nextVersion = Math.max(1, canonicalOrderVersion(order)) + 1;
+  // A cancellation changes the publish contract, so it must never reuse the
+  // initial order publish mutation id.
+  const cancellationPublishMutationId = clientMutationId
+    ? `publish-cancel-${clientMutationId}`
+    : `publish-${String(order.id || 'order')}-cancel-v${nextVersion}`;
   return {
     ...order,
     status: 'cancelled',
     paymentStatus: 'cancelled',
     cancelledAt: timestamp,
     statusUpdatedAt: timestamp,
-    version: Math.max(1, Number(order.version || 1)) + 1,
-    paymentVersion: Math.max(1, Number(order.paymentVersion || order.version || 1)) + 1,
+    version: nextVersion,
+    paymentVersion: nextVersion,
+    publishMutationId: cancellationPublishMutationId,
     statusHistory: [
       ...(Array.isArray(order.statusHistory) ? order.statusHistory : []),
       {

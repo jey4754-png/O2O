@@ -140,7 +140,9 @@ test('normalizeCategory preserves canonical values and migrates legacy values', 
 test('group status helpers expose labels and adjacent boundaries', () => {
   assert.deepEqual(GROUP_STATES, ['recruiting', 'recruited', 'purchased', 'delivered']);
   assert.equal(GROUP_STATUS_LABELS.recruiting, '모집 중');
-  assert.equal(GROUP_STATUS_LABELS.delivered, '전달 완료');
+  assert.equal(GROUP_STATUS_LABELS.recruited, '주문 확인');
+  assert.equal(GROUP_STATUS_LABELS.purchased, '준비 완료');
+  assert.equal(GROUP_STATUS_LABELS.delivered, '픽업 완료');
   assert.equal(getNextGroupStatus('recruiting'), 'recruited');
   assert.equal(getNextGroupStatus('delivered'), null);
   assert.equal(getPreviousGroupStatus('delivered'), 'purchased');
@@ -154,11 +156,11 @@ test('group quantity allocation copy changes after recruitment without hiding un
   assert.equal(formatGroupQuantityAllocation(quantity, 'recruiting'), '남은 제품 2개');
   assert.equal(
     formatGroupQuantityAllocation(quantity, 'recruited'),
-    '모집 종료 · 배정 1개 / 총 3개 · 미배정 2개',
+    '주문 확정 · 배정 1개 / 총 3개 · 미배정 2개',
   );
   assert.equal(
     formatGroupQuantityAllocation(quantity, 'delivered'),
-    '모집 종료 · 배정 1개 / 총 3개 · 미배정 2개',
+    '주문 확정 · 배정 1개 / 총 3개 · 미배정 2개',
   );
 });
 

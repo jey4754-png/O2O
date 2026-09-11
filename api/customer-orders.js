@@ -1,4 +1,5 @@
 import { callDataApiJson, fetchUpstreamJson } from './_data-upstream.js';
+import { applyAdminAuthResponseHeaders, verifyAdminPin } from './_admin-auth.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
@@ -17,6 +18,22 @@ function text(value, maxLength = 500) {
 function number(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function positiveInteger(value, fallback = 1) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 1 ? parsed : fallback;
+}
+
+function strictPositiveInteger(value) {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= 999 ? parsed : null;
+}
+
+function optionalNonNegativeInteger(value, fallback = 0) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
 }
 
 function phone(value) {
@@ -123,7 +140,7 @@ function participantProof(body, serviceRequest, order) {
   });
 }
 
-function manageRequest(body, serviceRequest) {
+async function manageRequest(body, serviceRequest, request) {
   const managerType = text(body.managerType, 30);
   const orderId = text(body.orderId, 40);
   const dealId = text(body.dealId, 128);
@@ -166,6 +183,7 @@ function manageRequest(body, serviceRequest) {
   if (!ID_PATTERN.test(payload.actorId)) throw requestError('invalid_actor_id');
   if (serviceRequest) {
     payload.adminAssertion = body.adminAssertion === true;
+    payload.adminCredentialVersion = body.adminCredentialVersion;
     if (!payload.adminAssertion) {
       payload.capabilityHash = capabilityProof(body, true, {
         hashField: 'capabilityHash',
@@ -175,8 +193,9 @@ function manageRequest(body, serviceRequest) {
       });
     }
   } else if (body.adminPin) {
-    verifyAdminPin(body.adminPin);
+    const credential = await verifyAdminPin(body.adminPin, request);
     payload.adminAssertion = true;
+    payload.adminCredentialVersion = credential?.version || 0;
   } else {
     payload.capabilityHash = capabilityProof(body, false, {
       hashField: 'capabilityHash',
@@ -218,10 +237,35 @@ function sanitizeOrder(input) {
   const dealId = text(input.dealId || deal.id, 120);
   const groupId = text(input.groupId, 128);
   const reservationMutationId = text(input.reservationMutationId || input.clientMutationId, 128);
+  const selectedCount = strictPositiveInteger(
+    input.selectedCount !== undefined && input.selectedCount !== null
+      ? input.selectedCount
+      : input.quantity,
+  );
+  const unitPrice = optionalNonNegativeInteger(input.unitPrice);
+  const total = optionalNonNegativeInteger(input.total);
+  const hostRemainderApplied = optionalNonNegativeInteger(input.hostRemainderApplied);
   if (groupId && (!ID_PATTERN.test(groupId) || groupId !== dealId)) return null;
+  if (selectedCount === null || unitPrice === null || total === null || hostRemainderApplied === null) {
+    return null;
+  }
   if (reservationMutationId && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/.test(reservationMutationId)) {
     return null;
   }
+  const canonicalVersion = Math.max(
+    positiveInteger(input.version, 1),
+    positiveInteger(input.paymentVersion, 1),
+  );
+  const publishMutationId = text(input.publishMutationId, 128) || [
+    'publish',
+    text(input.id, 40),
+    canonicalVersion,
+    text(input.status || 'new', 20),
+    text(input.paymentStatus || 'pending', 20),
+    input.customerPickupConfirmedAt ? 'pickup' : 'no-pickup',
+    input.cancelledAt ? 'cancelled' : 'active',
+  ].join('-');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/.test(publishMutationId)) return null;
   return {
     id: text(input.id, 40),
     createdAt: text(input.createdAt, 80),
@@ -243,23 +287,24 @@ function sanitizeOrder(input) {
     reservationMutationId,
     reservationAction: text(input.reservationAction, 30),
     reservationQuantity: number(input.reservationQuantity),
+    publishMutationId,
     type: text(input.type, 30),
     method: text(input.method, 30),
     time: text(input.time, 80),
     deadline: text(input.deadline, 80),
-    selectedCount: number(input.selectedCount),
-    quantity: number(input.quantity),
-    unitPrice: number(input.unitPrice),
-    total: number(input.total),
-    hostRemainderApplied: number(input.hostRemainderApplied),
+    selectedCount,
+    quantity: selectedCount,
+    unitPrice,
+    total,
+    hostRemainderApplied,
     title: text(input.title || deal.title, 200),
     store: text(input.store || deal.store, 120),
     customerPickupConfirmedAt: text(input.customerPickupConfirmedAt, 80),
     paymentRequestedAt: text(input.paymentRequestedAt, 80),
     paymentConfirmedAt: text(input.paymentConfirmedAt, 80),
     cancelledAt: text(input.cancelledAt, 80),
-    version: number(input.version ?? input.paymentVersion, 1),
-    paymentVersion: number(input.paymentVersion ?? input.version, 1),
+    version: canonicalVersion,
+    paymentVersion: canonicalVersion,
     statusHistory: Array.isArray(input.statusHistory)
       ? input.statusHistory.slice(-100).map((item) => ({
           status: text(item?.status, 50),
@@ -285,15 +330,27 @@ function sanitizeOrder(input) {
   };
 }
 
-function normalizedOrders(input) {
+export function normalizedOrders(input) {
   const latest = new Map();
   (Array.isArray(input) ? input : []).forEach((item) => {
     const candidate = sanitizeOrder(item);
     if (!candidate) return;
+    // This collection normalizer is used only for authenticated READ responses.
+    // Keep the server's narrow diagnostic enum here, never in sanitizeOrder:
+    // publication/management inputs must not assert a verified binding state.
+    if (['repair_required', 'verified_history'].includes(item.paymentSyncStatus)) {
+      candidate.paymentSyncStatus = item.paymentSyncStatus;
+    }
     const previous = latest.get(candidate.id);
     const candidateTime = Date.parse(candidate.statusUpdatedAt || candidate.createdAt) || 0;
     const previousTime = previous ? Date.parse(previous.statusUpdatedAt || previous.createdAt) || 0 : -1;
-    if (!previous || candidateTime >= previousTime) latest.set(candidate.id, candidate);
+    if (
+      !previous
+      || candidate.version > previous.version
+      || (candidate.version === previous.version && candidateTime >= previousTime)
+    ) {
+      latest.set(candidate.id, candidate);
+    }
   });
   return [...latest.values()].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
 }
@@ -324,17 +381,22 @@ async function dataApiRequest(body) {
   });
   if (!proxied) return null;
   if (!proxied.upstream.ok || !proxied.result.ok) {
-    throw new Error(proxied.result.error || 'data_api_failed');
+    const code = proxied.result.error || 'data_api_failed';
+    throw requestError(
+      code,
+      proxied.upstream.ok ? statusForOrderError(code) : proxied.upstream.status,
+    );
   }
   return proxied.result;
 }
 
-async function listOrders(customerPhone, proof, allowProxy = true) {
+async function listOrders(customerPhone, proof, allowProxy = true, groupId = '') {
   const request = {
     action: 'list',
     phone: customerPhone,
     visitorId: proof.visitorId,
     customerCapabilityHash: proof.customerCapabilityHash,
+    ...(groupId ? { groupId } : {}),
   };
   const proxied = allowProxy ? await dataApiRequest(request) : null;
   const result = proxied || await directCollector({
@@ -342,6 +404,7 @@ async function listOrders(customerPhone, proof, allowProxy = true) {
     phone: customerPhone,
     visitorId: proof.visitorId,
     customerCapabilityHash: proof.customerCapabilityHash,
+    ...(groupId ? { groupId } : {}),
   });
   return normalizedOrders(result.orders);
 }
@@ -448,13 +511,7 @@ async function publishLegacyOrderEvent(order, customerCapabilityHash) {
   await directCollector({ event: legacyOrderEvent(order, customerCapabilityHash) });
 }
 
-function verifyAdminPin(pin) {
-  const expected = process.env.O2O_ADMIN_PIN;
-  if (!expected) throw new Error('admin_not_configured');
-  if (!safeEqual(pin, expected)) throw new Error('invalid_admin_pin');
-}
-
-async function listGroupOrders(body, serviceRequest) {
+async function listGroupOrders(body, serviceRequest, request) {
   const groupId = text(body.groupId, 128);
   const dealId = text(body.dealId, 128);
   const actorId = text(body.actorId, 128);
@@ -465,10 +522,12 @@ async function listGroupOrders(body, serviceRequest) {
   const payload = { groupId, dealId, actorId };
   if (serviceRequest) {
     payload.adminAssertion = body.adminAssertion === true;
+    payload.adminCredentialVersion = body.adminCredentialVersion;
     payload.capabilityHash = text(body.capabilityHash, 64).toLowerCase();
   } else if (body.adminPin) {
-    verifyAdminPin(body.adminPin);
+    const credential = await verifyAdminPin(body.adminPin, request);
     payload.adminAssertion = true;
+    payload.adminCredentialVersion = credential?.version || 0;
   } else {
     const token = text(body.capabilityToken, 256);
     if (token.length < 32) throw new Error('missing_capability_token');
@@ -509,7 +568,11 @@ function statusForOrderError(code) {
     'client_mutation_conflict',
     'invalid_state_transition',
     'quantity_unavailable',
+    'quantity_reservation_closed',
     'state_conflict',
+    'payment_request_required',
+    'order_payment_link_required',
+    'order_payment_state_conflict',
   ].includes(code)) return 409;
   if (['group_not_found', 'participant_not_found', 'deal_not_found', 'order_not_found'].includes(code)) {
     return 404;
@@ -519,6 +582,15 @@ function statusForOrderError(code) {
   if (code === 'upstream_timeout') return 504;
   if (String(code).startsWith('invalid_')) return 400;
   return 502;
+}
+
+function logOrderFailure(action, code, status, layer = 'handler') {
+  console.warn('[customer-orders] request_failure', JSON.stringify({
+    action: String(action || 'unknown'),
+    code: String(code || 'unknown'),
+    status: Number(status || 500),
+    layer: String(layer || 'handler'),
+  }));
 }
 
 export default async function handler(request, response) {
@@ -547,26 +619,34 @@ export default async function handler(request, response) {
       return response.status(200).json({ ok: true, orders });
     } catch (error) {
       const code = error.code || error.message || 'owner_order_sync_failed';
-      return response.status(error.status || statusForOrderError(code)).json({ ok: false, error: code });
+      const status = error.status || statusForOrderError(code);
+      logOrderFailure(action, code, status);
+      return response.status(status).json({ ok: false, error: code });
     }
   }
   if (action === 'list_group') {
     try {
-      const orders = await listGroupOrders(request.body || {}, serviceRequest);
+      const orders = await listGroupOrders(request.body || {}, serviceRequest, request);
       return response.status(200).json({ ok: true, orders });
     } catch (error) {
+      applyAdminAuthResponseHeaders(response, error);
       const code = error.code || error.message || 'group_order_sync_failed';
-      return response.status(error.status || statusForOrderError(code)).json({ ok: false, error: code });
+      const status = error.status || statusForOrderError(code);
+      logOrderFailure(action, code, status);
+      return response.status(status).json({ ok: false, error: code });
     }
   }
   if (action === 'manage') {
     try {
-      const payload = manageRequest(request.body || {}, serviceRequest);
+      const payload = await manageRequest(request.body || {}, serviceRequest, request);
       const order = await manageOrder(payload, !serviceRequest);
       return response.status(200).json({ ok: true, order });
     } catch (error) {
+      applyAdminAuthResponseHeaders(response, error);
       const code = error.code || error.message || 'order_manage_failed';
-      return response.status(error.status || statusForOrderError(code)).json({ ok: false, error: code });
+      const status = error.status || statusForOrderError(code);
+      logOrderFailure(action, code, status);
+      return response.status(status).json({ ok: false, error: code });
     }
   }
   const customerPhone = phone(request.body?.phone || request.body?.order?.customerPhone);
@@ -582,10 +662,16 @@ export default async function handler(request, response) {
       const published = await publishOrder(order, proof, participantCapabilityHash, !serviceRequest);
       return response.status(202).json({ ok: true, order: published });
     }
-    const orders = await listOrders(customerPhone, proof, !serviceRequest);
+    const groupId = text(request.body?.groupId, 128);
+    if (groupId && !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(groupId)) {
+      throw requestError('invalid_group_id');
+    }
+    const orders = await listOrders(customerPhone, proof, !serviceRequest, groupId);
     return response.status(200).json({ ok: true, orders });
   } catch (error) {
     const code = error.code || error.message || 'order_sync_failed';
-    return response.status(error.status || statusForOrderError(code)).json({ ok: false, error: code });
+    const status = error.status || statusForOrderError(code);
+    logOrderFailure(action, code, status);
+    return response.status(status).json({ ok: false, error: code });
   }
 }

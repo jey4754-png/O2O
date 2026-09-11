@@ -7,7 +7,10 @@ import {
   chunkOwnerCapabilities,
   confirmOwnerRecovery,
   isOwnerDealInScope,
+  legacyOwnerScopeKey,
+  localOwnerScopeCandidates,
   ownerScopeKey,
+  recoverableOwnerCapabilityEntries,
   reconcileOwnerRecovery,
   scopedOwnerCapabilityEntries,
   unscopedOwnerCapabilityEntries,
@@ -26,6 +29,20 @@ test('merchant scope is stable for formatted versions of the same phone number',
   );
   assert.equal(ownerScopeKey({ testerType: '사용자', phone: '010-1234-5678' }), '');
   assert.equal(ownerScopeKey({ testerType: '사장님', phone: '1234' }), '');
+  assert.equal(ownerScopeKey({ testerType: '사장님', phone: '0101234' }), '');
+  assert.equal(ownerScopeKey({ testerType: '사장님', phone: '011-1234-5678' }), '');
+});
+
+test('legacy merchant scope is retained only for an invalid pre-validation phone', () => {
+  assert.equal(
+    legacyOwnerScopeKey({ testerType: '사장님', phone: '010-1234-567' }),
+    'phone:0101234567',
+  );
+  assert.equal(
+    legacyOwnerScopeKey({ testerType: '사장님', phone: '010-1234-5678' }),
+    '',
+  );
+  assert.equal(legacyOwnerScopeKey({ testerType: '사용자', phone: '010-1234-567' }), '');
 });
 
 test('a merchant deal cannot be reassigned to a switched merchant profile', () => {
@@ -66,6 +83,48 @@ test('owner claims expose only the active merchant scope', () => {
   assert.deepEqual(scopedOwnerCapabilityEntries(capabilities, scopes, ''), []);
 });
 
+test('local owner scope candidates find the exact prior merchant without reassigning deals', () => {
+  const capabilities = {
+    'owner-first': token('a'),
+    'owner-second': token('b'),
+    'owner-current': token('c'),
+    'owner-short': 'short',
+    'customer-invalid': token('d'),
+  };
+  const scopeByDeal = {
+    'owner-first': 'phone:01011112222',
+    'owner-second': 'phone:01011112222',
+    'owner-current': 'phone:01033334444',
+    'owner-short': 'phone:01055556666',
+    'customer-invalid': 'phone:01077778888',
+  };
+
+  assert.deepEqual(localOwnerScopeCandidates({
+    capabilities,
+    scopeByDeal,
+    excludeScope: 'phone:01033334444',
+  }), [{
+    scope: 'phone:01011112222',
+    phone: '01011112222',
+    dealIds: ['owner-first', 'owner-second'],
+    count: 2,
+  }]);
+  assert.equal(scopeByDeal['owner-first'], 'phone:01011112222');
+});
+
+test('local owner scope candidates reject malformed phone scopes', () => {
+  assert.deepEqual(localOwnerScopeCandidates({
+    capabilities: {
+      'owner-invalid-phone': token('a'),
+      'owner-not-phone': token('b'),
+    },
+    scopeByDeal: {
+      'owner-invalid-phone': 'phone:0101234',
+      'owner-not-phone': 'merchant:01011112222',
+    },
+  }), []);
+});
+
 test('manual recovery lookup includes valid unscoped browser management keys', () => {
   const currentScope = 'phone:01011112222';
   const capabilities = {
@@ -83,6 +142,27 @@ test('manual recovery lookup includes valid unscoped browser management keys', (
   assert.deepEqual(unscopedOwnerCapabilityEntries(capabilities, scopeByDeal), [
     { dealId: 'owner-server-only', capabilityToken: capabilities['owner-server-only'] },
   ]);
+});
+
+test('legacy recovery lookup is limited to the exact previous invalid-phone scope', () => {
+  const legacyScope = 'phone:0101234567';
+  const capabilities = {
+    'owner-legacy': token('a'),
+    'owner-unscoped': token('b'),
+    'owner-other': token('c'),
+  };
+  const scopeByDeal = {
+    'owner-legacy': legacyScope,
+    'owner-other': 'phone:01099998888',
+  };
+
+  assert.deepEqual(
+    recoverableOwnerCapabilityEntries(capabilities, scopeByDeal, legacyScope),
+    [
+      { dealId: 'owner-legacy', capabilityToken: capabilities['owner-legacy'], sourceScope: legacyScope },
+      { dealId: 'owner-unscoped', capabilityToken: capabilities['owner-unscoped'], sourceScope: '' },
+    ],
+  );
 });
 
 test('manual recovery candidates contain metadata only for keys verified by owner listing', () => {
@@ -106,6 +186,7 @@ test('manual recovery candidates contain metadata only for keys verified by owne
   assert.deepEqual(candidates, [{
     dealId: 'owner-first',
     capabilityToken: capabilities['owner-first'],
+    sourceScope: '',
     recoveryScope,
     title: '오곡 물티슈',
     store: '판교 마트',
@@ -208,6 +289,35 @@ test('manual recovery is idempotent and cannot reassign an existing scope', () =
   assert.equal(repeated.changed, false);
   assert.deepEqual(repeated.recoveredDealIds, []);
   assert.equal(repeated.scopeByDeal['owner-recovered'], firstScope);
+});
+
+test('legacy invalid-phone scope migrates only after server verification and confirmation', () => {
+  const legacyScope = 'phone:0101234567';
+  const ownerScope = 'phone:01012345678';
+  const capabilityToken = token('a');
+  const result = confirmOwnerRecovery({
+    capabilities: { 'owner-legacy-phone': capabilityToken },
+    scopeByDeal: { 'owner-legacy-phone': legacyScope },
+    ownerScope,
+    legacyScope,
+    verifiedRecoveryEntries: [{ dealId: 'owner-legacy-phone', capabilityToken }],
+    confirmedDealIds: ['owner-legacy-phone'],
+  });
+
+  assert.equal(result.changed, true);
+  assert.deepEqual(result.recoveredDealIds, ['owner-legacy-phone']);
+  assert.equal(result.scopeByDeal['owner-legacy-phone'], ownerScope);
+
+  const wrongLegacyScope = confirmOwnerRecovery({
+    capabilities: { 'owner-legacy-phone': capabilityToken },
+    scopeByDeal: { 'owner-legacy-phone': legacyScope },
+    ownerScope,
+    legacyScope: 'phone:0100000000',
+    verifiedRecoveryEntries: [{ dealId: 'owner-legacy-phone', capabilityToken }],
+    confirmedDealIds: ['owner-legacy-phone'],
+  });
+  assert.equal(wrongLegacyScope.changed, false);
+  assert.equal(wrongLegacyScope.scopeByDeal['owner-legacy-phone'], legacyScope);
 });
 
 test('manual recovery rejects a capability changed after owner listing verification', () => {

@@ -1,0 +1,18 @@
+# Deploy application sources only; local verification artifacts and documents
+# must not be uploaded as build inputs.
+.git/
+.vercel/
+node_modules/
+.pnpm-store/
+dist/
+.env*
+.DS_Store
+*.log
+test-results/
+playwright-report/
+tests/
+docs/
+apps-script/
+.github/
+AGENTS.md
+README.md

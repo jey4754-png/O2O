@@ -1,5 +1,6 @@
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 15000;
+const MAX_UPSTREAM_TIMEOUT_MS = 55000;
 
 function normalizedOrigin(value) {
   try {
@@ -24,7 +25,7 @@ function currentDeploymentOrigins() {
 function upstreamTimeoutMs() {
   const configured = Number(process.env.O2O_UPSTREAM_TIMEOUT_MS);
   if (!Number.isFinite(configured)) return DEFAULT_UPSTREAM_TIMEOUT_MS;
-  return Math.max(1000, Math.min(25000, Math.floor(configured)));
+  return Math.max(1000, Math.min(MAX_UPSTREAM_TIMEOUT_MS, Math.floor(configured)));
 }
 
 function timeoutSignal(existingSignal) {
@@ -42,6 +43,13 @@ function normalizeFetchError(error) {
     timeoutError.status = 504;
     return timeoutError;
   }
+  return error;
+}
+
+function upstreamResponseError() {
+  const error = new Error('upstream_invalid_response');
+  error.code = 'upstream_invalid_response';
+  error.status = 502;
   return error;
 }
 
@@ -82,14 +90,34 @@ export async function callDataApiJson(path, options = {}) {
 }
 
 export async function fetchUpstreamJson(url, options = {}) {
+  let upstream;
   try {
-    const upstream = await fetch(url, {
+    upstream = await fetch(url, {
       ...options,
       signal: timeoutSignal(options.signal),
     });
-    const result = await upstream.json();
-    return { upstream, result };
   } catch (error) {
     throw normalizeFetchError(error);
   }
+
+  let result;
+  try {
+    result = await upstream.json();
+  } catch (error) {
+    const normalized = normalizeFetchError(error);
+    if (normalized !== error || error?.name === 'AbortError') throw normalized;
+    throw upstreamResponseError();
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw upstreamResponseError();
+  }
+  // A redirected collector POST can unexpectedly reach doGet. Its health
+  // envelope proves neither a completed write nor an empty read result. Keep
+  // the original operation uncertain so callers retain their existing intent
+  // and use only the established idempotent retry path.
+  if (String(options.method || 'GET').toUpperCase() === 'POST'
+    && result.ok === true && result.service === 'UPTWOYOU collector') {
+    throw upstreamResponseError();
+  }
+  return { upstream, result };
 }

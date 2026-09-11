@@ -1,3 +1,8 @@
+import {
+  isValidKoreanMobilePhone,
+  normalizeKoreanMobilePhone,
+} from './profileValidation.js';
+
 const OWNER_DEAL_ID_PATTERN = /^owner-[a-zA-Z0-9-]{1,100}$/;
 const MIN_CAPABILITY_LENGTH = 32;
 
@@ -5,8 +10,20 @@ export const OWNER_CLAIM_BATCH_SIZE = 50;
 
 export function ownerScopeKey(profile = {}) {
   if (profile?.testerType !== '사장님') return '';
+  const phone = normalizeKoreanMobilePhone(profile?.phone);
+  return isValidKoreanMobilePhone(phone) ? `phone:${phone}` : '';
+}
+
+/**
+ * Reproduces the pre-validation merchant scope only for profiles that the
+ * current 010/11-digit rule rejects. It is used solely to offer an explicit,
+ * capability-verified migration after the merchant corrects their phone.
+ */
+export function legacyOwnerScopeKey(profile = {}) {
+  if (profile?.testerType !== '사장님') return '';
   const phone = String(profile?.phone || '').replace(/\D/g, '');
-  return phone.length >= 8 ? `phone:${phone}` : '';
+  if (phone.length < 8 || isValidKoreanMobilePhone(phone)) return '';
+  return `phone:${phone}`;
 }
 
 export function isOwnerDealId(dealId) {
@@ -56,6 +73,37 @@ export function scopedOwnerCapabilityEntries(
 }
 
 /**
+ * Finds merchant profiles that still have usable management keys in this
+ * browser. This never moves a deal between profiles; it only lets the UI offer
+ * a return to the exact profile scope that already owns those local keys.
+ */
+export function localOwnerScopeCandidates({
+  capabilities = {},
+  scopeByDeal = {},
+  excludeScope = '',
+} = {}) {
+  const candidates = new Map();
+  Object.entries(capabilities).forEach(([dealId, capabilityToken]) => {
+    const scope = String(scopeByDeal?.[dealId] || '');
+    const phone = scope.startsWith('phone:') ? scope.slice(6) : '';
+    if (
+      scope === excludeScope
+      || !isOwnerDealId(dealId)
+      || !isUsableOwnerCapability(capabilityToken)
+      || !isValidKoreanMobilePhone(phone)
+    ) {
+      return;
+    }
+    const current = candidates.get(scope) || { scope, phone, dealIds: [] };
+    current.dealIds.push(dealId);
+    candidates.set(scope, current);
+  });
+  return [...candidates.values()]
+    .map((candidate) => ({ ...candidate, count: candidate.dealIds.length }))
+    .sort((left, right) => right.count - left.count || left.scope.localeCompare(right.scope));
+}
+
+/**
  * Returns valid merchant capabilities that have not yet been assigned to any
  * local merchant profile. These are lookup inputs for the existing owner deal
  * listing endpoint. A returned deal proves that the browser-held management key
@@ -75,6 +123,28 @@ export function unscopedOwnerCapabilityEntries(
     .map(([dealId, capabilityToken]) => ({ dealId, capabilityToken }));
 }
 
+export function recoverableOwnerCapabilityEntries(
+  capabilities = {},
+  scopeByDeal = {},
+  legacyScope = '',
+) {
+  const allowedLegacyScope = /^phone:\d{8,}$/.test(String(legacyScope || ''))
+    ? legacyScope
+    : '';
+  return Object.entries(capabilities)
+    .filter(([dealId, capabilityToken]) => {
+      const assignedScope = scopeByDeal?.[dealId] || '';
+      return isOwnerDealId(dealId)
+        && isUsableOwnerCapability(capabilityToken)
+        && (!assignedScope || (allowedLegacyScope && assignedScope === allowedLegacyScope));
+    })
+    .map(([dealId, capabilityToken]) => ({
+      dealId,
+      capabilityToken,
+      sourceScope: scopeByDeal?.[dealId] || '',
+    }));
+}
+
 /**
  * Builds manual recovery candidates from unscoped management keys that the
  * standard owner listing endpoint verified. Public title/store metadata is
@@ -86,6 +156,7 @@ export function buildOwnerRecoveryCandidates({
   scopeByDeal = {},
   verifiedDeals = [],
   recoveryScope = '',
+  legacyScope = '',
 } = {}) {
   if (!/^phone:\d{8,}$/.test(String(recoveryScope || ''))) return [];
   const verifiedDealById = new Map(
@@ -94,7 +165,7 @@ export function buildOwnerRecoveryCandidates({
       .map((deal) => [String(deal.id), deal]),
   );
 
-  return unscopedOwnerCapabilityEntries(capabilities, scopeByDeal)
+  return recoverableOwnerCapabilityEntries(capabilities, scopeByDeal, legacyScope)
     .flatMap((entry) => {
       const deal = verifiedDealById.get(entry.dealId);
       if (!deal) return [];
@@ -119,11 +190,12 @@ export function confirmOwnerRecovery({
   ownerScope = '',
   verifiedRecoveryEntries = [],
   confirmedDealIds = [],
+  legacyScope = '',
 } = {}) {
   const nextScopeByDeal = { ...scopeByDeal };
-  const candidateIds = new Set(
-    unscopedOwnerCapabilityEntries(capabilities, scopeByDeal)
-      .map(({ dealId }) => dealId),
+  const candidateEntries = new Map(
+    recoverableOwnerCapabilityEntries(capabilities, scopeByDeal, legacyScope)
+      .map((entry) => [entry.dealId, entry]),
   );
   const verifiedCapabilities = new Map();
   (Array.isArray(verifiedRecoveryEntries) ? verifiedRecoveryEntries : [])
@@ -139,14 +211,20 @@ export function confirmOwnerRecovery({
     const dealId = String(value || '');
     if (
       recoveredDealIds.includes(dealId)
-      || !candidateIds.has(dealId)
+      || !candidateEntries.has(dealId)
       || verifiedCapabilities.get(dealId) !== capabilities?.[dealId]
     ) {
       return;
     }
-    const assignment = assignOwnerDealScope(nextScopeByDeal, dealId, ownerScope);
-    if (!assignment.allowed || !assignment.changed) return;
-    Object.assign(nextScopeByDeal, assignment.scopeByDeal);
+    const candidate = candidateEntries.get(dealId);
+    if (candidate.sourceScope) {
+      if (candidate.sourceScope !== legacyScope || nextScopeByDeal[dealId] !== legacyScope) return;
+      nextScopeByDeal[dealId] = ownerScope;
+    } else {
+      const assignment = assignOwnerDealScope(nextScopeByDeal, dealId, ownerScope);
+      if (!assignment.allowed || !assignment.changed) return;
+      Object.assign(nextScopeByDeal, assignment.scopeByDeal);
+    }
     recoveredDealIds.push(dealId);
   });
 
@@ -174,6 +252,7 @@ export function reconcileOwnerRecovery({
   currentOwnerScope = '',
   requestedRecoveryEntries = [],
   verifiedDealIds = [],
+  legacyScope = '',
 } = {}) {
   const unchanged = {
     scopeByDeal: { ...scopeByDeal },
@@ -208,6 +287,7 @@ export function reconcileOwnerRecovery({
     ownerScope: currentOwnerScope,
     verifiedRecoveryEntries,
     confirmedDealIds: verifiedRecoveryEntries.map(({ dealId }) => dealId),
+    legacyScope,
   });
 }
 

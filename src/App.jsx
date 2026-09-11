@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import {
   ArrowLeft,
@@ -37,6 +37,24 @@ import { REGIONS } from './regions';
 import SplitCalculator from './Calculator';
 import GroupRoom from './GroupRoom';
 import { RELEASE_FEATURES } from './releasePhase';
+import { SCOPED_UI_ACTIONS } from './scopeUi';
+import { createClientCapability } from './clientCapability';
+import {
+  customerOrderSyncFingerprint,
+  customerOrderWriteContent,
+  requestCustomerHistory,
+} from './customerHistory';
+import {
+  acknowledgedPublicDealSnapshot,
+  applyObservedPublicDealSync,
+  applyPublicDealSyncResult,
+  fetchPublicDealListRequest,
+  publicDealPublicationState,
+  publicDealSyncFingerprint as dealSyncFingerprint,
+  publicDealSyncIssuesStorageKey,
+  publishPublicDealRequest,
+  shouldPublishPublicDeal,
+} from './publicDealSync';
 import {
   cancelGroupParticipation,
   claimGroupHost,
@@ -45,9 +63,11 @@ import {
   fetchGroupSnapshot,
   fetchUnreadCounts,
   getGroupCredential,
+  hasLegacyCustomerGroupRecoveryState,
   isGroupBackedDeal,
   joinGroupRoom,
   reserveGroupQuantity,
+  rollbackGroupReservation,
   updateGroupTarget,
 } from './groupApi';
 import {
@@ -57,28 +77,56 @@ import {
   isCancelledOrder,
 } from './participation';
 import { buildCommerceStats } from './commerceStats';
-import { mergeDeals } from './dealMerge';
+import { mergeDeals, reconcilePublicDealCache } from './dealMerge';
 import {
+  canonicalOrderVersion,
+  mergeAuthoritativeCustomerOrderRefresh,
   mergeAuthoritativeOwnerOrders,
+  mergeCompletedCustomerOrderSync,
+  mergeCustomerOrderCollections,
   mergeOwnerOrderRefresh,
+  ownerOrderBelongsToWorkspace,
   summarizeOwnerOrderDisplay,
 } from './orderMerge';
 import {
   buildGroupNotifications,
+  canSubmitDealOrder,
   canOpenOrderGroupRoom,
   dealHasGroupRoom,
   hostApplyErrorMessage,
+  isDealRecruiting,
   isDealHostMatched,
   joinSubmitErrorMessage,
+  resolveOrderLinkedDeal,
+  shouldKeepOwnerPreview,
+  shouldNavigateAfterDealDelete,
 } from './customerUi';
 import {
+  assertCustomerMutationAllowed,
+  customerCanOpenGroupRoom,
+  filterCustomerNavigation,
+  normalizeCustomerScreen,
+  resolveCustomerAccess,
+} from './customerAccess';
+import {
+  buildCustomerNavigationState,
+  customerNavigationBackSteps,
+  customerNavigationDepth,
+  readCustomerNavigationState,
+} from './customerNavigationHistory';
+import {
   beginCheckoutAttempt,
-  canQueueReservedGroupOrder,
   checkoutNeedsDurableOrderSync,
   completeCheckoutAttempt,
   isTerminalOrderSyncError,
+  listRecoverableCheckoutAttempts,
+  reconcileGroupCheckoutAttempts,
   publishCustomerOrderRequest,
+  releaseCheckoutAttempt,
+  updateCheckoutAttempt,
 } from './checkoutAttempt';
+import { canUseAcknowledgedCheckout, ensureGroupPaymentOrderSaved } from './paymentOrderPreflight';
+import { orderSyncStateChanged, rejectedOrderSyncIssue, shouldPublishQueuedOrder } from './orderSyncState';
 import {
   calculateProductAllocation,
   calculateSplit,
@@ -95,10 +143,12 @@ import {
   chunkOwnerCapabilities,
   isOwnerDealId,
   isOwnerDealInScope,
+  legacyOwnerScopeKey,
+  localOwnerScopeCandidates,
   ownerScopeKey,
+  recoverableOwnerCapabilityEntries,
   reconcileOwnerRecovery,
   scopedOwnerCapabilityEntries,
-  unscopedOwnerCapabilityEntries,
 } from './ownerCapabilities';
 import {
   clearProfile,
@@ -116,10 +166,185 @@ import {
   trackPageview,
   useScreenAnalytics,
 } from './analytics';
+import { loadLegacyCustomerGroupReceipt } from './legacyGroupReceipt';
+import {
+  callableKoreanMobilePhone,
+  formatKoreanMobilePhoneInput,
+  isValidKoreanMobilePhone,
+  KOREAN_MOBILE_PHONE_ERROR,
+  normalizeKoreanMobilePhone as normalizePhone,
+} from './profileValidation';
+import {
+  clearActiveAppSession,
+  isActiveAppSession,
+  loadActiveAppSession,
+  startActiveAppSession,
+} from './appSession';
+import { cropImageDataUrl, prepareImageForSync, PRODUCT_IMAGE_MAX_SIZE, readImageFile } from './imageCrop';
+import {
+  buildOwnerBackup,
+  mergeVerifiedOwnerBackup,
+  parseOwnerBackup,
+} from './ownerBackup';
 import { clamp, discountedPrice, formatWon } from './utils';
+import AdminConsole from './AdminConsole';
+import { latestPaymentNotice, PAYMENT_NOTICE_SEEN_KEY } from './paymentNotices';
 
 const fallbackImage =
   'https://images.unsplash.com/photo-1555396273-367ea4eb4db5?auto=format&fit=crop&w=900&q=80';
+
+function replaceBrokenImage(event) {
+  const image = event.currentTarget;
+  if (image.src === fallbackImage) return;
+  image.src = fallbackImage;
+}
+
+function ImageCropUploader({
+  className,
+  value,
+  alt,
+  buttonLabel,
+  maxSize = PRODUCT_IMAGE_MAX_SIZE,
+  onChange,
+  onBusyChange,
+  onUploaded,
+}) {
+  const [source, setSource] = useState('');
+  const [crop, setCrop] = useState({ zoom: 1, offsetX: 0, offsetY: 0 });
+  const [processing, setProcessing] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    onBusyChange?.(processing || Boolean(source));
+  }, [onBusyChange, processing, source]);
+
+  const selectFile = async (file) => {
+    if (!file) return;
+    setProcessing(true);
+    setError('');
+    try {
+      const nextSource = await readImageFile(file);
+      setCrop({ zoom: 1, offsetX: 0, offsetY: 0 });
+      setSource(nextSource);
+      onUploaded?.(file);
+    } catch (nextError) {
+      setError(nextError.message);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const applyCrop = async () => {
+    if (!source || processing) return;
+    setProcessing(true);
+    setError('');
+    try {
+      onChange(await cropImageDataUrl(source, crop, { maxSize }));
+      setSource('');
+    } catch (nextError) {
+      setError(nextError.message);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  return (
+    <div className={className}>
+      <img
+        src={value || fallbackImage}
+        alt={alt}
+        onError={replaceBrokenImage}
+      />
+      <label className="secondary-button">
+        <Upload size={18} />
+        {processing ? '이미지 처리 중…' : buttonLabel}
+        <input
+          type="file"
+          accept="image/*"
+          disabled={processing}
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.target.value = '';
+            selectFile(file);
+          }}
+        />
+      </label>
+      {source && (
+        <div className="image-crop-editor" role="group" aria-label="상품 이미지 자르기">
+          <div className="image-crop-stage">
+            <img
+              src={source}
+              alt="선택 영역 미리보기"
+              style={{
+                objectPosition: `${50 + crop.offsetX / 2}% ${50 + crop.offsetY / 2}%`,
+                transform: `scale(${crop.zoom})`,
+              }}
+            />
+          </div>
+          <label>
+            <span>사진 크기 <b>{Math.round(crop.zoom * 100)}%</b></span>
+            <input
+              type="range"
+              min="100"
+              max="300"
+              step="5"
+              value={Math.round(crop.zoom * 100)}
+              onChange={(event) => setCrop((current) => ({
+                ...current,
+                zoom: Number(event.target.value) / 100,
+              }))}
+            />
+          </label>
+          <label>
+            <span>좌우 위치</span>
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              value={crop.offsetX}
+              onChange={(event) => setCrop((current) => ({
+                ...current,
+                offsetX: Number(event.target.value),
+              }))}
+            />
+          </label>
+          <label>
+            <span>상하 위치</span>
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              value={crop.offsetY}
+              onChange={(event) => setCrop((current) => ({
+                ...current,
+                offsetY: Number(event.target.value),
+              }))}
+            />
+          </label>
+          <div className="image-crop-actions">
+            <button
+              type="button"
+              className="secondary-button compact-button"
+              disabled={processing}
+              onClick={() => setSource('')}
+            >
+              취소
+            </button>
+            <button
+              type="button"
+              className="primary-button compact-button"
+              disabled={processing}
+              onClick={applyCrop}
+            >
+              선택 영역 적용
+            </button>
+          </div>
+        </div>
+      )}
+      {error && <p className="form-error" role="alert">{error}</p>}
+    </div>
+  );
+}
 const CREATED_DEALS_KEY = 'o2o_mvp_created_deals';
 const CUSTOMER_GROUPS_KEY = 'o2o_mvp_customer_groups';
 const CUSTOMER_ORDERS_KEY = 'o2o_mvp_customer_orders';
@@ -132,10 +357,12 @@ const CUSTOMER_ORDER_SYNCED_KEY = 'o2o_mvp_customer_order_sync_fingerprints';
 const CUSTOMER_ORDER_SYNC_ISSUES_KEY = 'o2o_mvp_customer_order_sync_issues_v1';
 const PUBLIC_DEAL_CAPABILITIES_KEY = 'o2o_mvp_public_deal_capabilities_v1';
 const OWNER_DEAL_SCOPES_KEY = 'o2o_mvp_owner_deal_scopes_v1';
+const OWNER_LEGACY_RECOVERY_SCOPE_KEY = 'o2o_mvp_owner_legacy_recovery_scope_v1';
+const ROLE_PROFILES_KEY = 'o2o_mvp_role_profiles_v1';
 const CUSTOMER_ORDER_CAPABILITY_KEY = 'o2o_mvp_customer_order_capability_v1';
 const GROUP_STATUS_SEEN_KEY = 'o2o_mvp_group_status_seen_v1';
 const COUNTED_PARTICIPATIONS_KEY = 'o2o_mvp_counted_participations';
-const PUBLIC_DEAL_SYNC_INTERVAL_MS = 10000;
+const PUBLIC_DEAL_SYNC_INTERVAL_MS = 60000;
 const CUSTOMER_ORDER_SYNC_INTERVAL_MS = 30000;
 const EVENT_MIN_RELEASE_PHASE = Object.freeze({
   chat_message_sent: 8,
@@ -149,6 +376,7 @@ const EVENT_MIN_RELEASE_PHASE = Object.freeze({
 const isEventVisibleInRelease = (eventName) => (
   Number(EVENT_MIN_RELEASE_PHASE[eventName] || 1) <= RELEASE_FEATURES.phase
 );
+let memoryCustomerOrderCapability = '';
 const visibleEventDefinitions = eventDefinitions.filter((event) => isEventVisibleInRelease(event.name));
 const DEFAULT_LOCATION = {
   region: '경기도',
@@ -241,11 +469,6 @@ function saveJson(key, value) {
   }
 }
 
-function createClientCapability(prefix) {
-  const random = () => globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2);
-  return `${prefix}-${random()}-${random()}-${random()}`;
-}
-
 function getDealCapability(dealId, { create = false, ownerScope = ownerScopeKey(getProfile()) } = {}) {
   const capabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
   if (isOwnerDealId(dealId)) {
@@ -270,115 +493,29 @@ function getOwnerCapabilityEntries(ownerScope, scopeByDeal) {
 }
 
 function getCustomerOrderCapability() {
-  let capability = '';
+  let capability = memoryCustomerOrderCapability;
   try {
-    capability = localStorage.getItem(CUSTOMER_ORDER_CAPABILITY_KEY) || '';
+    capability = localStorage.getItem(CUSTOMER_ORDER_CAPABILITY_KEY) || capability;
     if (!capability) {
       capability = createClientCapability('customer');
       localStorage.setItem(CUSTOMER_ORDER_CAPABILITY_KEY, capability);
     }
   } catch {
-    capability = createClientCapability('customer');
+    if (!capability) capability = createClientCapability('customer');
   }
+  memoryCustomerOrderCapability = capability;
   return capability;
-}
-
-function compressImage(file, maxSize = 420, quality = 0.72, maxDataUrlLength = 32000) {
-  return new Promise((resolve, reject) => {
-    if (!file.type?.startsWith('image/')) {
-      reject(new Error('JPG, PNG 형식의 이미지를 사용해 주세요.'));
-      return;
-    }
-    const reader = new FileReader();
-    reader.onerror = () => reject(new Error('이미지를 읽을 수 없습니다.'));
-    reader.onload = () => {
-      const image = new Image();
-      image.onerror = () => reject(new Error('JPG, PNG 형식의 이미지를 사용해 주세요.'));
-      image.onload = () => {
-        try {
-          const canvas = document.createElement('canvas');
-          let scale = Math.min(1, maxSize / Math.max(image.width, image.height));
-          let nextQuality = quality;
-
-          for (let attempt = 0; attempt < 7; attempt += 1) {
-            canvas.width = Math.max(1, Math.round(image.width * scale));
-            canvas.height = Math.max(1, Math.round(image.height * scale));
-            const context = canvas.getContext('2d');
-            if (!context) throw new Error('canvas_unavailable');
-            context.clearRect(0, 0, canvas.width, canvas.height);
-            context.drawImage(image, 0, 0, canvas.width, canvas.height);
-            const output = canvas.toDataURL('image/jpeg', nextQuality);
-            if (output.length <= maxDataUrlLength) {
-              resolve(output);
-              return;
-            }
-            scale *= 0.76;
-            nextQuality = Math.max(0.46, nextQuality - 0.07);
-          }
-
-          reject(new Error('이미지 용량이 너무 큽니다. 다른 이미지를 선택해 주세요.'));
-        } catch {
-          reject(new Error('이 이미지는 처리할 수 없습니다. JPG 또는 PNG 이미지를 선택해 주세요.'));
-        }
-      };
-      image.src = reader.result;
-    };
-    reader.readAsDataURL(file);
-  });
-}
-
-function compactImageForSync(source, maxSize = 360, quality = 0.68, maxDataUrlLength = 32000) {
-  if (!source?.startsWith('data:image/')) return Promise.resolve(source || fallbackImage);
-  if (source.startsWith('data:image/jpeg;base64,') && source.length <= maxDataUrlLength) {
-    return Promise.resolve(source);
-  }
-  return new Promise((resolve) => {
-    const image = new Image();
-    image.onerror = () => resolve(fallbackImage);
-    image.onload = () => {
-      try {
-        const canvas = document.createElement('canvas');
-        let scale = Math.min(1, maxSize / Math.max(image.width, image.height));
-        let nextQuality = quality;
-        for (let attempt = 0; attempt < 7; attempt += 1) {
-          canvas.width = Math.max(1, Math.round(image.width * scale));
-          canvas.height = Math.max(1, Math.round(image.height * scale));
-          const context = canvas.getContext('2d');
-          if (!context) break;
-          context.drawImage(image, 0, 0, canvas.width, canvas.height);
-          const output = canvas.toDataURL('image/jpeg', nextQuality);
-          if (output.length <= maxDataUrlLength) {
-            resolve(output);
-            return;
-          }
-          scale *= 0.76;
-          nextQuality = Math.max(0.44, nextQuality - 0.07);
-        }
-      } catch {
-        // Use a stable fallback image when a browser cannot resize the local upload.
-      }
-      resolve(fallbackImage);
-    };
-    image.src = source;
-  });
 }
 
 async function fetchPublicDeals() {
   try {
-    const response = await fetch('/api/public-deals', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'list' }),
-    });
-    const result = await response.json();
-    return response.ok && result.ok && Array.isArray(result.deals)
-      ? result.deals.map((deal) => migrateMerchantSplitDeal({
+    const deals = await fetchPublicDealListRequest();
+    return deals.map((deal) => migrateMerchantSplitDeal({
         ...migrateLocationFields(deal),
         category: normalizeCategory(deal.category),
-      }))
-      : [];
+      }));
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -394,6 +531,7 @@ async function fetchOwnedRecords(endpoint, resultKey, capabilities) {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'list_owner', capabilities: batch }),
+          signal: AbortSignal.timeout(20000),
         });
         const result = await response.json();
         if (response.ok && result.ok && Array.isArray(result[resultKey])) {
@@ -431,55 +569,58 @@ async function fetchOwnedCustomerOrders(capabilities) {
 async function publishPublicDeal(deal, options = {}) {
   try {
     const capabilityToken = getDealCapability(deal.id, { create: true });
+    const {
+      publishMutationId: _previousPublishMutationId,
+      expectedPublishVersion: requestedExpectedPublishVersion,
+      ...dealContent
+    } = deal;
+    const expectedPublishVersion = Math.max(0, Math.floor(Number(
+      options.expectedPublishVersion
+      ?? requestedExpectedPublishVersion
+      ?? deal.publishVersion
+      ?? 0
+    )));
+    const publishMutationId = String(
+      options.publishMutationId || '',
+    );
     const syncedDeal = {
-      ...deal,
+      ...dealContent,
       visibility: 'public',
-      image: await compactImageForSync(deal.image),
+      image: await prepareImageForSync(deal.image || fallbackImage),
+      publishVersion: Math.max(0, Math.floor(Number(deal.publishVersion || 0))),
+      expectedPublishVersion,
+      ...(publishMutationId ? { publishMutationId } : {}),
     };
-    const response = await fetch('/api/public-deals', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'publish', deal: syncedDeal, capabilityToken }),
+    return await publishPublicDealRequest({
+      action: 'publish',
+      deal: syncedDeal,
+      capabilityToken,
+    }, {
+      maxRetries: options.maxRetries,
+      priority: options.priority,
     });
-    let result = {};
-    try {
-      result = await response.json();
-    } catch {
-      result = {};
-    }
-    if (!response.ok || !result.ok) {
-      const error = new Error(result.error || 'public_deal_sync_failed');
-      error.code = result.error || 'public_deal_sync_failed';
-      error.status = response.status;
-      if (options.throwOnError) throw error;
-      return null;
-    }
-    return result.deal;
   } catch (error) {
     if (options.throwOnError) throw error;
     return null;
   }
 }
 
-async function fetchCustomerOrders(phone) {
+async function fetchCustomerOrders(phone, { strict = false, signal, groupId } = {}) {
   const normalizedPhone = normalizePhone(phone);
-  if (!normalizedPhone) return [];
+  if (!normalizedPhone) {
+    if (strict) throw new Error('invalid_customer_phone');
+    return [];
+  }
   try {
-    const response = await fetch('/api/customer-orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'list',
-        phone: normalizedPhone,
-        visitorId: getVisitorId(),
-        customerCapabilityToken: getCustomerOrderCapability(),
-      }),
-    });
-    const result = await response.json();
-    return response.ok && result.ok && Array.isArray(result.orders)
-      ? result.orders.map((order) => migrateLocationFields(order))
-      : [];
-  } catch {
+    const records = await requestCustomerHistory({
+      phone: normalizedPhone,
+      visitorId: getVisitorId(),
+      customerCapabilityToken: getCustomerOrderCapability(),
+      ...(groupId ? { groupId } : {}),
+    }, { signal });
+    return records.map((order) => migrateLocationFields(order));
+  } catch (error) {
+    if (strict) throw error;
     return [];
   }
 }
@@ -494,13 +635,13 @@ async function publishCustomerOrder(order, options = {}) {
       : null;
     return await publishCustomerOrderRequest({
       action: 'publish',
-      order,
+      order: customerOrderWriteContent(order),
       visitorId: order.visitorId || getVisitorId(),
       customerCapabilityToken: getCustomerOrderCapability(),
       ...(order.groupId && participantCredential?.capabilityToken
         ? { participantCapabilityToken: participantCredential.capabilityToken }
         : {}),
-    });
+    }, { priority: options.priority });
   } catch (error) {
     if (options.throwOnError) throw error;
     return null;
@@ -509,6 +650,11 @@ async function publishCustomerOrder(order, options = {}) {
 
 async function manageCustomerOrder(order, deal, { kind, direction }) {
   const managerType = deal?.source === 'customer' ? 'group_manager' : 'merchant_owner';
+  const expectedVersion = Math.max(1, canonicalOrderVersion(order));
+  const clientMutationId = await stableClientMutationId(
+    `manage_${kind}`,
+    `${order.id}|${order.dealId || deal?.id}|${expectedVersion}|${direction}`,
+  );
   const body = {
     action: 'manage',
     orderId: order.id,
@@ -516,8 +662,8 @@ async function manageCustomerOrder(order, deal, { kind, direction }) {
     managerType,
     kind,
     direction,
-    expectedVersion: Number(order.version || order.paymentVersion || 1),
-    clientMutationId: createMutationId(`manage_${kind}`),
+    expectedVersion,
+    clientMutationId,
   };
   if (managerType === 'merchant_owner') {
     const ownerCapabilityToken = getDealCapability(body.dealId);
@@ -532,10 +678,77 @@ async function manageCustomerOrder(order, deal, { kind, direction }) {
     body.actorId = actorId;
     body.capabilityToken = credential.capabilityToken;
   }
-  const response = await fetch('/api/customer-orders', {
+  const serializedBody = JSON.stringify(body);
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch('/api/customer-orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: serializedBody,
+      });
+      let result = {};
+      try {
+        result = await response.json();
+      } catch {
+        result = {};
+      }
+      if (response.ok && result.ok && result.order) return result.order;
+      const error = new Error(result.error || `order_manage_${response.status}`);
+      error.status = response.status;
+      error.code = result.error || '';
+      lastError = error;
+      if (![502, 503, 504].includes(response.status)) throw error;
+    } catch (error) {
+      lastError = error;
+      const networkFailure = error instanceof TypeError;
+      if (attempt >= 1 || (!networkFailure && ![502, 503, 504].includes(error?.status))) throw error;
+    }
+  }
+  throw lastError || new Error('order_manage_failed');
+}
+
+async function stableClientMutationId(prefix, value) {
+  const input = new TextEncoder().encode(String(value || ''));
+  if (globalThis.crypto?.subtle) {
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', input);
+    const hex = Array.from(new Uint8Array(digest))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('');
+    return `${prefix}-${hex.slice(0, 48)}`;
+  }
+  let hash = 2166136261;
+  input.forEach((byte) => {
+    hash ^= byte;
+    hash = Math.imul(hash, 16777619);
+  });
+  return `${prefix}-${(hash >>> 0).toString(36).padStart(8, '0')}`;
+}
+
+async function deletePublicDeal(deal) {
+  const dealId = deal?.id;
+  const expectedPublishVersion = Math.max(0, Math.floor(Number(deal?.publishVersion || 0)));
+  const capabilityToken = getDealCapability(dealId);
+  if (!capabilityToken) {
+    const error = new Error('missing_owner_capability');
+    error.code = 'missing_owner_capability';
+    error.status = 403;
+    throw error;
+  }
+  const clientMutationId = await stableClientMutationId(
+    'delete-deal',
+    `${dealId}:${expectedPublishVersion}`,
+  );
+  const response = await fetch('/api/public-deals', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      action: 'delete',
+      dealId,
+      expectedPublishVersion,
+      clientMutationId,
+      capabilityToken,
+    }),
   });
   let result = {};
   try {
@@ -543,33 +756,24 @@ async function manageCustomerOrder(order, deal, { kind, direction }) {
   } catch {
     result = {};
   }
-  if (!response.ok || !result.ok || !result.order) {
-    const error = new Error(result.error || `order_manage_${response.status}`);
-    error.status = response.status;
-    throw error;
+  if ((response.ok && result.ok) || ['deal_deleted', 'deal_not_found'].includes(result?.error)) {
+    return true;
   }
-  return result.order;
+  const error = new Error(result?.error || `deal_delete_${response.status}`);
+  error.code = result?.error || 'deal_delete_failed';
+  error.status = response.status;
+  throw error;
 }
 
-async function deletePublicDeal(dealId) {
-  try {
-    const capabilityToken = getDealCapability(dealId);
-    if (!capabilityToken) return false;
-    const response = await fetch('/api/public-deals', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'delete', dealId, capabilityToken }),
-    });
-    const result = await response.json();
-    return response.ok && result.ok;
-  } catch {
-    return false;
+function dealDeleteErrorMessage(error, networkNoun = '네트워크 연결') {
+  const code = error?.code || error?.message;
+  if (['missing_owner_capability', 'invalid_owner_capability', 'forbidden'].includes(code)) {
+    return '이 기기에는 해당 상품의 관리 키가 없어 수정·삭제할 수 없습니다.';
   }
-}
-
-function dealSyncFingerprint(deal) {
-  const { syncedAt, ...content } = deal || {};
-  return JSON.stringify({ imageSyncVersion: 2, ...content });
+  if (['state_conflict', 'client_mutation_conflict'].includes(code)) {
+    return '다른 변경이 먼저 반영되었습니다. 최신 목록을 확인한 뒤 다시 시도해 주세요.';
+  }
+  return `상품을 삭제하지 못했습니다. ${networkNoun}을 확인한 뒤 다시 시도해 주세요.`;
 }
 
 function getRegion(regionName) {
@@ -610,6 +814,20 @@ function formatLocation(value = {}, separator = ' · ') {
   return [location.region, location.district, location.neighborhood].join(separator);
 }
 
+function preservePublicDealSyncOnMigration(previous, migrated) {
+  let syncState = {
+    acknowledgements: loadJson(PUBLIC_DEAL_SYNCED_KEY, {}),
+    issues: loadJson(publicDealSyncIssuesStorageKey, {}),
+  };
+  previous.forEach((deal, index) => {
+    if (JSON.stringify(deal) === JSON.stringify(migrated[index])) return;
+    // Normalizing an old cache is not a new user edit or proof of publication.
+    syncState = applyObservedPublicDealSync({ ...syncState, previous: deal, observed: migrated[index] });
+  });
+  saveJson(PUBLIC_DEAL_SYNCED_KEY, syncState.acknowledgements);
+  saveJson(publicDealSyncIssuesStorageKey, syncState.issues);
+}
+
 function loadCreatedDeals() {
   const deals = loadJson(CREATED_DEALS_KEY, []);
   const migrated = deals.map((deal) => migrateMerchantSplitDeal({
@@ -618,6 +836,7 @@ function loadCreatedDeals() {
     visibility: deal.visibility || 'public',
   }));
   if (JSON.stringify(migrated) !== JSON.stringify(deals)) {
+    preservePublicDealSyncOnMigration(deals, migrated);
     saveJson(CREATED_DEALS_KEY, migrated);
   }
   return migrated;
@@ -664,6 +883,7 @@ function loadCustomerGroups() {
     });
   });
   if (JSON.stringify(migrated) !== JSON.stringify(groups)) {
+    preservePublicDealSyncOnMigration(groups, migrated);
     saveJson(CUSTOMER_GROUPS_KEY, migrated);
   }
   return migrated;
@@ -680,17 +900,15 @@ function loadOrders() {
     customerName: order.customerName || profile?.name || '테스트 사용자',
     customerPhone: order.customerPhone || profile?.phone || '미설정',
     status: order.status || 'new',
-    statusHistory: order.statusHistory?.length
+    // An empty central history is valid. Adding a synthetic legacy entry on
+    // every read changes its acknowledged fingerprint and republishes forever.
+    statusHistory: Array.isArray(order.statusHistory)
       ? order.statusHistory
       : [{ status: order.status || 'new', actor: 'legacy', timestamp: order.createdAt || new Date().toISOString() }],
     ...(order.region ? {} : order.deal || {}),
   }));
   if (JSON.stringify(migrated) !== JSON.stringify(orders)) saveJson(CUSTOMER_ORDERS_KEY, migrated);
   return migrated;
-}
-
-function normalizePhone(value) {
-  return String(value || '').replace(/\D/g, '');
 }
 
 function isOrderForProfile(order, profile, visitorId) {
@@ -702,26 +920,44 @@ function isOrderForProfile(order, profile, visitorId) {
 }
 
 function orderSyncFingerprint(order) {
-  const { syncedAt, ...content } = order || {};
-  return JSON.stringify(content);
+  return customerOrderSyncFingerprint(order);
 }
 
-function mergeOrders(...collections) {
-  const merged = new Map();
-  collections.flat().forEach((order) => {
-    if (!order?.id) return;
-    const current = merged.get(order.id);
-    if (!current) {
-      merged.set(order.id, order);
-      return;
-    }
-    const currentTime = new Date(current.statusUpdatedAt || current.syncedAt || current.createdAt || 0).getTime();
-    const nextTime = new Date(order.statusUpdatedAt || order.syncedAt || order.createdAt || 0).getTime();
-    merged.set(order.id, nextTime >= currentTime ? { ...current, ...order } : { ...order, ...current });
-  });
-  return [...merged.values()].sort((left, right) => (
-    new Date(right.createdAt || 0).getTime() - new Date(left.createdAt || 0).getTime()
-  ));
+function buildCustomerOrderRecord(order, {
+  orderId,
+  createdAt,
+  actorId,
+  profile,
+  reservationMutationId = '',
+} = {}) {
+  return {
+    ...order,
+    id: orderId,
+    createdAt,
+    status: 'new',
+    paymentStatus: 'pending',
+    visitorId: actorId,
+    customerNumber: getCustomerNumber(),
+    customerName: profile?.name || '테스트 사용자',
+    customerPhone: profile?.phone || '미설정',
+    region: order.deal?.region || profile?.region || DEFAULT_LOCATION.region,
+    district: order.deal?.district || profile?.district || DEFAULT_LOCATION.district,
+    neighborhood: order.deal?.neighborhood || profile?.neighborhood || '미설정',
+    statusHistory: [{ status: 'new', actor: 'customer', timestamp: createdAt }],
+    ...(reservationMutationId
+      ? {
+          reservationMutationId,
+          clientMutationId: reservationMutationId,
+        }
+      : {}),
+    publishMutationId: `publish-${orderId}-initial`,
+  };
+}
+
+function isCustomerGroupCreatorOrder(order = {}) {
+  return order.type === 'group'
+    && order.deal?.source === 'customer'
+    && Boolean(order.groupId || order.dealId || order.deal?.id);
 }
 
 function participationKey(order) {
@@ -743,6 +979,11 @@ function loadProfile() {
   const profile = getProfile();
   if (!profile) return null;
   const migrated = migrateLocationFields(profile);
+  if (!isValidKoreanMobilePhone(migrated.phone)) {
+    const legacyScope = legacyOwnerScopeKey(migrated);
+    if (legacyScope) saveJson(OWNER_LEGACY_RECOVERY_SCOPE_KEY, legacyScope);
+    return null;
+  }
   if (JSON.stringify(migrated) !== JSON.stringify(profile)) saveProfile(migrated);
   return migrated;
 }
@@ -906,23 +1147,48 @@ function App() {
   const [analyticsReady, setAnalyticsReady] = useState(() => initAnalytics());
   const [route, setRoute] = useState(() => normalizeRoute(window.location.pathname));
   const [profile, setProfile] = useState(() => loadProfile());
+  const [roleProfiles, setRoleProfiles] = useState(() => {
+    const remembered = loadJson(ROLE_PROFILES_KEY, {});
+    return profile?.testerType ? { ...remembered, [profile.testerType]: profile } : remembered;
+  });
+  const [activeAppSessionKey, setActiveAppSessionKey] = useState(() => {
+    if (normalizeRoute(window.location.pathname) === '/') return '';
+    return loadActiveAppSession();
+  });
+  const hasActiveProfileSession = isActiveAppSession(profile, activeAppSessionKey);
   const [ownerLocation, setOwnerLocation] = useState(() => loadOwnerLocation());
   const [ownerPreviewMode, setOwnerPreviewMode] = useState(false);
   const [previewLocation, setPreviewLocation] = useState(DEFAULT_LOCATION);
-  const [customerScreen, setCustomerScreen] = useState(profile ? 'list' : 'onboarding');
+  const [customerScreen, setCustomerScreen] = useState(
+    () => (hasActiveProfileSession ? 'list' : 'onboarding'),
+  );
+  const [adminEntryVersion, setAdminEntryVersion] = useState(0);
   const [ownerScreen, setOwnerScreen] = useState('form');
   const [createdDeals, setCreatedDeals] = useState(() => loadCreatedDeals());
+  const publicDealSyncInFlight = useRef(new Map());
   const [ownerScopeByDeal, setOwnerScopeByDeal] = useState(() => loadJson(OWNER_DEAL_SCOPES_KEY, {}));
+  const [legacyOwnerScope, setLegacyOwnerScope] = useState(() => (
+    loadJson(OWNER_LEGACY_RECOVERY_SCOPE_KEY, '')
+  ));
   const [ownedDeals, setOwnedDeals] = useState([]);
   const [ownerWorkspaceScope, setOwnerWorkspaceScope] = useState('');
+  const [ownerWorkspaceStatus, setOwnerWorkspaceStatus] = useState('loading');
   const [ownerRecoveryCandidates, setOwnerRecoveryCandidates] = useState([]);
   const [ownerRecoveryBusy, setOwnerRecoveryBusy] = useState(false);
   const [ownerRecoveryError, setOwnerRecoveryError] = useState('');
   const [ownerRecoveryLookupVersion, setOwnerRecoveryLookupVersion] = useState(0);
+  const [ownerBackupStatus, setOwnerBackupStatus] = useState('');
   const [customerGroups, setCustomerGroups] = useState(() => loadCustomerGroups());
+  const [publicDealSyncIssues, setPublicDealSyncIssues] = useState(() => loadJson(publicDealSyncIssuesStorageKey, {}));
   const [remoteDeals, setRemoteDeals] = useState([]);
   const [orders, setOrders] = useState(() => loadOrders());
   const [ownerOrders, setOwnerOrders] = useState([]);
+  const [customerHistoryState, setCustomerHistoryState] = useState({ scope: '', status: 'loading' });
+  const customerHistoryRetryRef = useRef(null);
+  const customerHistoryScope = profile?.testerType === '사용자' ? normalizePhone(profile.phone) : '';
+  const customerHistoryScopeRef = useRef(customerHistoryScope);
+  customerHistoryScopeRef.current = customerHistoryScope;
+  const retryCustomerHistory = useCallback(() => customerHistoryRetryRef.current?.(), []);
   const [orderSyncIssues, setOrderSyncIssues] = useState(() => loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {}));
   const [favoriteIds, setFavoriteIds] = useState(() => loadJson(FAVORITES_KEY, []));
   const [hostDealIds, setHostDealIds] = useState(() => loadJson(HOST_DEALS_KEY, []));
@@ -930,25 +1196,263 @@ function App() {
   const [unreadCounts, setUnreadCounts] = useState({});
   const [statusNotices, setStatusNotices] = useState({});
   const [handledDeepLink, setHandledDeepLink] = useState('');
-  const activeOwnerScope = useMemo(() => ownerScopeKey(profile), [profile]);
+  const committedCustomerGroupIdsRef = useRef(new Set(
+    customerGroups.map((group) => group.id).filter(Boolean),
+  ));
+  const activeOwnerScope = useMemo(() => (
+    hasActiveProfileSession && profile?.testerType === '사장님' ? ownerScopeKey(profile) : ''
+  ), [hasActiveProfileSession, profile]);
+  const localOwnerProfiles = useMemo(() => localOwnerScopeCandidates({
+    capabilities: loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {}),
+    scopeByDeal: ownerScopeByDeal,
+    excludeScope: activeOwnerScope,
+  }), [activeOwnerScope, ownerScopeByDeal]);
+  const ownerAccountHint = activeOwnerScope
+    && localOwnerProfiles.length === 1
+    ? localOwnerProfiles[0]
+    : null;
+  const rememberedOwnerProfile = useMemo(() => {
+    if (roleProfiles['사장님']) return roleProfiles['사장님'];
+    if (profile?.testerType === '사장님') return profile;
+    if (localOwnerProfiles.length !== 1) return profile;
+    return {
+      ...(profile || {}),
+      phone: formatKoreanMobilePhoneInput(localOwnerProfiles[0].phone),
+      testerType: '사장님',
+    };
+  }, [localOwnerProfiles, profile, roleProfiles]);
   const scopedCreatedDeals = useMemo(() => createdDeals.filter((deal) => (
     deal?.source === 'merchant'
     && isOwnerDealInScope(deal.id, ownerScopeByDeal, activeOwnerScope)
   )), [activeOwnerScope, createdDeals, ownerScopeByDeal]);
   const scopedOwnedDeals = ownerWorkspaceScope === activeOwnerScope ? ownedDeals : [];
   const scopedOwnerOrders = ownerWorkspaceScope === activeOwnerScope ? ownerOrders : [];
+  const customerAccess = resolveCustomerAccess({
+    route,
+    testerType: hasActiveProfileSession ? profile?.testerType : undefined,
+    ownerPreviewMode,
+  });
+  const customerAdminMode = customerAccess.adminMode;
+  const customerReadOnly = customerAccess.readOnly;
+  const routeRef = useRef(route);
+  routeRef.current = route;
+  const navigateCustomerScreen = useCallback((nextScreen, options = {}) => {
+    const normalizedScreen = normalizeCustomerScreen(nextScreen, {
+      adminMode: customerAdminMode,
+      readOnly: customerReadOnly,
+    });
+    if (!['/customer', '/admin'].includes(route)) {
+      setCustomerScreen(normalizedScreen);
+      return;
+    }
+
+    // Merchant preview is a temporary view layered over the owner workspace.
+    // Keep its historical one-step browser return to `/owner`; the in-app
+    // back control still uses the fallback branch below.
+    if (customerReadOnly && options.historyAction !== 'back') {
+      setCustomerScreen(normalizedScreen);
+      return;
+    }
+
+    const currentDepth = customerNavigationDepth(window.history.state, route);
+    const currentEntry = readCustomerNavigationState(window.history.state, route);
+    if (options.historyAction === 'back') {
+      const backSteps = customerNavigationBackSteps(
+        window.history.state,
+        route,
+        normalizedScreen,
+      );
+      if (backSteps > 0) {
+        window.history.go(-backSteps);
+        return;
+      }
+      window.history.replaceState(
+        buildCustomerNavigationState(window.history.state, {
+          route,
+          screen: normalizedScreen,
+          depth: 0,
+          trail: [],
+        }),
+        '',
+        window.location.pathname,
+      );
+      setCustomerScreen(normalizedScreen);
+      return;
+    }
+
+    if (normalizedScreen !== customerScreen || currentEntry?.screen !== normalizedScreen) {
+      window.history.pushState(
+        buildCustomerNavigationState(window.history.state, {
+          route,
+          screen: normalizedScreen,
+          depth: currentDepth + 1,
+          trail: [...(currentEntry?.trail || []), currentEntry?.screen || customerScreen],
+        }),
+        '',
+        window.location.pathname,
+      );
+      setHandledDeepLink('');
+    }
+    setCustomerScreen(normalizedScreen);
+  }, [customerAdminMode, customerReadOnly, customerScreen, route]);
+  const assertCurrentCustomerMutationAllowed = () => assertCustomerMutationAllowed({
+    adminMode: customerAdminMode,
+    readOnly: customerReadOnly,
+  });
+
+  useLayoutEffect(() => {
+    if (route === '/') clearActiveAppSession();
+  }, [route]);
+
+  useEffect(() => {
+    if (!['/customer', '/admin'].includes(route)) return;
+    const currentEntry = readCustomerNavigationState(window.history.state, route);
+    if (currentEntry?.screen === customerScreen) return;
+    window.history.replaceState(
+      buildCustomerNavigationState(window.history.state, {
+        route,
+        screen: customerScreen,
+        depth: currentEntry?.depth || 0,
+        trail: currentEntry?.trail || [],
+      }),
+      '',
+      window.location.href,
+    );
+  }, [customerScreen, route]);
+
+  useEffect(() => {
+    saveJson(ROLE_PROFILES_KEY, roleProfiles);
+  }, [roleProfiles]);
 
   const updateOrderSyncIssue = useCallback((orderId, issue = null) => {
     if (!orderId) return;
-    setOrderSyncIssues((current) => {
-      const next = { ...current };
-      if (issue) next[orderId] = issue;
-      else delete next[orderId];
-      if (JSON.stringify(next) === JSON.stringify(current)) return current;
-      saveJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, next);
+    // Persist synchronously so another in-flight result sees this decision
+    // before React renders it, and cannot resurrect an obsolete failure.
+    const next = { ...loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {}) };
+    if (issue) next[orderId] = issue;
+    else delete next[orderId];
+    saveJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, next);
+    setOrderSyncIssues(next);
+  }, []);
+
+  const commitCustomerGroup = useCallback((group) => {
+    if (!group?.id || group.source !== 'customer') return group;
+    const firstCommit = !committedCustomerGroupIdsRef.current.has(group.id);
+    committedCustomerGroupIdsRef.current.add(group.id);
+    setCustomerGroups((current) => {
+      const next = [group, ...current.filter((item) => item.id !== group.id)];
+      saveJson(CUSTOMER_GROUPS_KEY, next);
       return next;
     });
+    setSelectedDeal(group);
+    setRemoteDeals((current) => mergeDeals([group], current.filter((item) => item.id !== group.id)));
+    const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
+    fingerprints[group.id] = dealSyncFingerprint(group);
+    saveJson(PUBLIC_DEAL_SYNCED_KEY, fingerprints);
+    if (firstCommit) {
+      track('group_created', {
+        deal_id: group.id,
+        source: 'customer',
+        category: group.category,
+        method: group.methods?.[0] || '',
+        title: group.title,
+        target_people: Number(group.targetPeople || group.targetCount || group.target || 1),
+        total_quantity: Number(group.totalQuantity || group.productQuantity || 1),
+        creator_quantity: Number(group.creatorQuantity || group.creatorProductQuantity || 1),
+        host_mode: group.hostMode || 'self',
+      });
+    }
+    return group;
   }, []);
+
+  const discardCustomerGroup = useCallback((groupId) => {
+    if (!groupId) return;
+    committedCustomerGroupIdsRef.current.delete(groupId);
+    setCustomerGroups((current) => {
+      const next = current.filter((item) => item.id !== groupId);
+      saveJson(CUSTOMER_GROUPS_KEY, next);
+      return next;
+    });
+    setRemoteDeals((current) => current.filter((item) => item.id !== groupId));
+    setSelectedDeal((current) => (current?.id === groupId ? null : current));
+    const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
+    delete fingerprints[groupId];
+    saveJson(PUBLIC_DEAL_SYNCED_KEY, fingerprints);
+  }, []);
+
+  const discardCustomerOrder = useCallback((orderId) => {
+    if (!orderId) return;
+    setOrders((current) => {
+      const next = current.filter((item) => item.id !== orderId);
+      saveJson(CUSTOMER_ORDERS_KEY, next);
+      return next;
+    });
+    const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+    delete fingerprints[orderId];
+    saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+    updateOrderSyncIssue(orderId);
+  }, [updateOrderSyncIssue]);
+
+  const compensateCustomerGroupCreation = useCallback(async (
+    order,
+    { finalize = true, deletePublishedDeal = true } = {},
+  ) => {
+    const groupId = order?.groupId || order?.dealId || order?.deal?.id;
+    const reservationMutationId = order?.reservationMutationId || order?.clientMutationId;
+    const quantity = Math.max(1, Number(order?.selectedCount || order?.quantity || 1));
+    if (!groupId || !order?.deal || !reservationMutationId) {
+      const error = new Error('group_creation_cleanup_pending');
+      error.code = 'group_creation_cleanup_pending';
+      throw error;
+    }
+    if (deletePublishedDeal) {
+      const publicDealDeleted = await deletePublicDeal(order.deal);
+      if (!publicDealDeleted) {
+        const error = new Error('group_creation_cleanup_pending');
+        error.code = 'group_creation_cleanup_pending';
+        throw error;
+      }
+    }
+    try {
+      const rollbackMutationId = await stableClientMutationId(
+        'rollback-reservation',
+        `${groupId}:${reservationMutationId}:${quantity}`,
+      );
+      await rollbackGroupReservation(
+        groupId,
+        quantity,
+        order.visitorId || getVisitorId(),
+        reservationMutationId,
+        rollbackMutationId,
+      );
+    } catch (rollbackError) {
+      const rollbackCode = rollbackError?.code || rollbackError?.message;
+      if (!['group_not_found', 'reservation_not_found'].includes(rollbackCode)) {
+        const error = new Error('group_creation_cleanup_pending');
+        error.code = 'group_creation_cleanup_pending';
+        error.cause = rollbackError;
+        throw error;
+      }
+    }
+    discardCustomerGroup(groupId);
+    if (finalize) {
+      discardCustomerOrder(order.id);
+      completeCheckoutAttempt(order.id);
+    }
+    track('group_creation_compensated', {
+      group_id: groupId,
+      order_id: order.id,
+      reservation_mutation_id: reservationMutationId,
+    });
+    try {
+      window.dispatchEvent(new CustomEvent('o2o-group-creation-compensated', {
+        detail: { groupId, orderId: order.id },
+      }));
+    } catch {
+      // The persisted cleanup is authoritative even if this tab cannot emit a UI event.
+    }
+    return true;
+  }, [discardCustomerGroup, discardCustomerOrder]);
 
   const deals = useMemo(
     () => mergeDeals(
@@ -957,7 +1461,7 @@ function App() {
       remoteDeals,
       sampleDeals.map((deal) => ({ ...deal, category: normalizeCategory(deal.category) })),
       sampleCommunityGroups.map((deal) => ({ ...deal, category: normalizeCategory(deal.category) })),
-    ),
+    ).filter((deal) => deal.visibility !== 'deleted'),
     [createdDeals, customerGroups, remoteDeals],
   );
 
@@ -978,6 +1482,22 @@ function App() {
     });
   }, [deals]);
 
+  const [paymentNotices, setPaymentNotices] = useState({});
+  const paymentNoticeReceipts = useRef({});
+  useEffect(() => {
+    setPaymentNotices({});
+    paymentNoticeReceipts.current = {};
+  }, [profile, route]);
+
+  const acknowledgePayments = (groupId) => {
+    const receipt = paymentNoticeReceipts.current[groupId];
+    if (!receipt) return;
+    const seen = loadJson(PAYMENT_NOTICE_SEEN_KEY, {});
+    seen[receipt.key] = receipt.id;
+    saveJson(PAYMENT_NOTICE_SEEN_KEY, seen);
+    setPaymentNotices((current) => { const next = { ...current }; delete next[groupId]; return next; });
+  };
+
   useEffect(() => {
     if (!profile || !RELEASE_FEATURES.unreadBadges) {
       setUnreadCounts({});
@@ -989,7 +1509,16 @@ function App() {
       if (refreshingUnread || document.visibilityState === 'hidden') return;
       refreshingUnread = true;
       try {
-        const next = await fetchUnreadCounts({ adminMode: route === '/admin' });
+        const next = await fetchUnreadCounts({ adminMode: customerAdminMode, onSnapshot: (groupId, snapshot, actorId) => {
+          if (cancelled) return;
+          const key = `${groupId}::${actorId}`;
+          const seen = loadJson(PAYMENT_NOTICE_SEEN_KEY, {});
+          const notice = latestPaymentNotice(snapshot, actorId, seen[key]);
+          if (notice) {
+            paymentNoticeReceipts.current[groupId] = { key, id: notice.id };
+            setPaymentNotices((current) => current[groupId] === notice.text ? current : { ...current, [groupId]: notice.text });
+          }
+        } });
         if (!cancelled) setUnreadCounts(next);
       } finally {
         refreshingUnread = false;
@@ -999,21 +1528,27 @@ function App() {
     const timer = window.setInterval(refreshUnread, 10000);
     const handleFocus = () => refreshUnread();
     window.addEventListener('focus', handleFocus);
+    window.addEventListener('pageshow', handleFocus);
+    window.addEventListener('online', handleFocus);
+    document.addEventListener('visibilitychange', handleFocus);
     window.addEventListener('o2o-group-fallback-updated', handleFocus);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
       window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('pageshow', handleFocus);
+      window.removeEventListener('online', handleFocus);
+      document.removeEventListener('visibilitychange', handleFocus);
       window.removeEventListener('o2o-group-fallback-updated', handleFocus);
     };
-  }, [profile, route]);
+  }, [customerAdminMode, profile, route]);
 
   useEffect(() => {
     if (!RELEASE_FEATURES.unreadBadges || !profile || !['/customer', '/admin'].includes(route)) {
       setStatusNotices({});
       return;
     }
-    const actorId = route === '/admin' ? `${getVisitorId()}_admin` : getVisitorId();
+    const actorId = customerAdminMode ? `${getVisitorId()}_admin` : getVisitorId();
     const seen = loadJson(GROUP_STATUS_SEEN_KEY, {});
     const next = {};
     deals.forEach((deal) => {
@@ -1024,13 +1559,14 @@ function App() {
       }
     });
     setStatusNotices(next);
-  }, [deals, profile, route]);
+  }, [customerAdminMode, deals, profile, route]);
 
   const acknowledgeGroupStatus = (deal) => {
-    if (!RELEASE_FEATURES.unreadBadges) return;
+    if (customerReadOnly || !RELEASE_FEATURES.unreadBadges) return;
+    acknowledgePayments(deal?.id);
     const status = deal?.groupStatus || 'recruiting';
     if (!deal?.id || status === 'recruiting') return;
-    const actorId = route === '/admin' ? `${getVisitorId()}_admin` : getVisitorId();
+    const actorId = customerAdminMode ? `${getVisitorId()}_admin` : getVisitorId();
     const seen = loadJson(GROUP_STATUS_SEEN_KEY, {});
     seen[`${deal.id}::${actorId}`] = status;
     saveJson(GROUP_STATUS_SEEN_KEY, seen);
@@ -1046,7 +1582,7 @@ function App() {
     if (!deal?.id) return;
     acknowledgeGroupStatus(deal);
     setSelectedDeal(deal);
-    setCustomerScreen(destination === 'room' ? 'room' : 'detail');
+    navigateCustomerScreen(destination === 'room' ? 'room' : 'detail');
     track('group_notification_opened', {
       group_id: deal.id,
       destination: destination === 'room' ? 'room' : 'detail',
@@ -1083,6 +1619,9 @@ function App() {
         if (nextOrders) {
           setOwnerOrders((current) => mergeOwnerOrderRefresh(current, nextOrders));
         }
+        setOwnerWorkspaceStatus(!verifiedOwnerDeals || !nextOrders
+          ? 'error' : !capabilities.length ? 'unlinked'
+            : verifiedOwnerDeals.length || nextOrders.length ? 'ready' : 'unconfirmed');
         setOwnerWorkspaceScope(activeOwnerScope);
       } finally {
         refreshing = false;
@@ -1091,19 +1630,22 @@ function App() {
     const handleVisible = () => {
       if (document.visibilityState === 'visible') refreshOwnerWorkspace();
     };
+    setOwnerWorkspaceStatus('loading');
     refreshOwnerWorkspace();
     const timer = window.setInterval(refreshOwnerWorkspace, CUSTOMER_ORDER_SYNC_INTERVAL_MS);
     window.addEventListener('focus', refreshOwnerWorkspace);
     window.addEventListener('online', refreshOwnerWorkspace);
+    window.addEventListener('pageshow', refreshOwnerWorkspace);
     document.addEventListener('visibilitychange', handleVisible);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
       window.removeEventListener('focus', refreshOwnerWorkspace);
       window.removeEventListener('online', refreshOwnerWorkspace);
+      window.removeEventListener('pageshow', refreshOwnerWorkspace);
       document.removeEventListener('visibilitychange', handleVisible);
     };
-  }, [activeOwnerScope, ownerScopeByDeal, route]);
+  }, [activeOwnerScope, ownerRecoveryLookupVersion, ownerScopeByDeal, route]);
 
   useEffect(() => {
     if (route !== '/owner' || !activeOwnerScope) {
@@ -1116,11 +1658,12 @@ function App() {
     const loadRecoveryCandidates = async () => {
       if (loading || document.visibilityState === 'hidden') return;
       const storedCapabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
-      const unscopedCapabilities = unscopedOwnerCapabilityEntries(
+      const recoveryCapabilities = recoverableOwnerCapabilityEntries(
         storedCapabilities,
         ownerScopeByDeal,
+        legacyOwnerScope,
       );
-      if (!unscopedCapabilities.length) {
+      if (!recoveryCapabilities.length) {
         setOwnerRecoveryCandidates([]);
         setOwnerRecoveryError('');
         return;
@@ -1128,7 +1671,7 @@ function App() {
       loading = true;
       setOwnerRecoveryError('');
       try {
-        const recoverableOwnerDeals = await fetchOwnedPublicDeals(unscopedCapabilities);
+        const recoverableOwnerDeals = await fetchOwnedPublicDeals(recoveryCapabilities);
         if (cancelled) return;
         if (!recoverableOwnerDeals) {
           setOwnerRecoveryError('이 브라우저의 미연결 상품 관리키 확인이 지연되고 있습니다. 다시 확인해 주세요.');
@@ -1140,6 +1683,7 @@ function App() {
             scopeByDeal: ownerScopeByDeal,
             verifiedDeals: recoverableOwnerDeals,
             recoveryScope: activeOwnerScope,
+            legacyScope: legacyOwnerScope,
           }),
         );
       } finally {
@@ -1157,7 +1701,7 @@ function App() {
       window.removeEventListener('online', loadRecoveryCandidates);
       document.removeEventListener('visibilitychange', handleVisible);
     };
-  }, [activeOwnerScope, ownerRecoveryLookupVersion, ownerScopeByDeal, route]);
+  }, [activeOwnerScope, legacyOwnerScope, ownerRecoveryLookupVersion, ownerScopeByDeal, route]);
 
   const recoverOwnerDeals = useCallback(async () => {
     if (!activeOwnerScope || ownerRecoveryBusy || ownerRecoveryCandidates.length === 0) return;
@@ -1213,12 +1757,17 @@ function App() {
         currentOwnerScope,
         requestedRecoveryEntries,
         verifiedDealIds: recoverableOwnerDeals.map((deal) => deal.id),
+        legacyScope: legacyOwnerScope,
       });
       if (!result.changed || !saveJson(OWNER_DEAL_SCOPES_KEY, result.scopeByDeal)) {
         setOwnerRecoveryError('상품 연결 정보를 확인하지 못했습니다. 새로고침 후 다시 시도해 주세요.');
         return;
       }
       setOwnerScopeByDeal(result.scopeByDeal);
+      if (legacyOwnerScope && !Object.values(result.scopeByDeal).includes(legacyOwnerScope)) {
+        saveJson(OWNER_LEGACY_RECOVERY_SCOPE_KEY, '');
+        setLegacyOwnerScope('');
+      }
       setOwnerRecoveryCandidates([]);
       track('owner_products_recovered', { product_count: result.recoveredDealIds.length });
     } finally {
@@ -1228,6 +1777,7 @@ function App() {
     activeOwnerScope,
     ownerRecoveryBusy,
     ownerRecoveryCandidates,
+    legacyOwnerScope,
   ]);
 
   const handleOwnerRecoveryAction = useCallback(() => {
@@ -1238,8 +1788,83 @@ function App() {
     setOwnerRecoveryLookupVersion((current) => current + 1);
   }, [ownerRecoveryCandidates.length, recoverOwnerDeals]);
 
+  const exportOwnerManagementBackup = useCallback(() => {
+    setOwnerBackupStatus('');
+    try {
+      const backup = buildOwnerBackup({
+        ownerScope: activeOwnerScope,
+        capabilities: loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {}),
+        scopeByDeal: loadJson(OWNER_DEAL_SCOPES_KEY, {}),
+      });
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = `o2o-사장님-관리백업-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      setOwnerBackupStatus(`상품 관리키 ${backup.entries.length}개를 백업했습니다. 파일은 안전하게 보관해 주세요.`);
+      track('owner_management_backup_exported', { product_count: backup.entries.length });
+    } catch (error) {
+      setOwnerBackupStatus(
+        error?.message === 'owner_backup_empty'
+          ? '백업할 등록 상품이 없습니다.'
+          : '관리 데이터 백업 파일을 만들지 못했습니다.',
+      );
+    }
+  }, [activeOwnerScope]);
+
+  const importOwnerManagementBackup = useCallback(async (file) => {
+    if (!file || !activeOwnerScope) return;
+    setOwnerBackupStatus('백업 파일을 확인하고 있습니다…');
+    try {
+      if (Number(file.size || 0) > 256 * 1024) throw new Error('owner_backup_invalid');
+      const parsed = parseOwnerBackup(await file.text(), activeOwnerScope);
+      const verifiedDeals = await fetchOwnedPublicDeals(parsed.entries);
+      if (!verifiedDeals) throw new Error('owner_backup_server_unreachable');
+      const previousCapabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
+      const previousScopeByDeal = loadJson(OWNER_DEAL_SCOPES_KEY, {});
+      const result = mergeVerifiedOwnerBackup({
+        ownerScope: activeOwnerScope,
+        entries: parsed.entries,
+        verifiedDealIds: verifiedDeals.map((deal) => deal.id),
+        capabilities: previousCapabilities,
+        scopeByDeal: previousScopeByDeal,
+      });
+      if (!result.restoredDealIds.length) throw new Error('owner_backup_unverified');
+      if (!saveJson(PUBLIC_DEAL_CAPABILITIES_KEY, result.capabilities)) {
+        throw new Error('owner_backup_save_failed');
+      }
+      if (!saveJson(OWNER_DEAL_SCOPES_KEY, result.scopeByDeal)) {
+        saveJson(PUBLIC_DEAL_CAPABILITIES_KEY, previousCapabilities);
+        throw new Error('owner_backup_save_failed');
+      }
+      setOwnerScopeByDeal(result.scopeByDeal);
+      setOwnedDeals(verifiedDeals.filter((deal) => result.restoredDealIds.includes(deal.id)));
+      setOwnerWorkspaceScope(activeOwnerScope);
+      setOwnerRecoveryLookupVersion((current) => current + 1);
+      setOwnerBackupStatus(
+        `상품 ${result.restoredDealIds.length}개를 복원했습니다. 주문·이력은 서버에서 다시 불러옵니다.${result.conflicts.length ? ` 충돌 ${result.conflicts.length}개는 제외했습니다.` : ''}`,
+      );
+      track('owner_management_backup_imported', { product_count: result.restoredDealIds.length });
+    } catch (error) {
+      setOwnerBackupStatus(
+        error?.message === 'owner_backup_server_unreachable'
+          ? '서버에 연결하지 못해 복원을 중단했습니다. 네트워크를 확인해 주세요.'
+          : error?.message === 'owner_backup_unverified'
+            ? '서버에서 확인된 상품 관리키가 없어 복원하지 않았습니다.'
+            : '현재 사장님 번호에서 사용할 수 있는 O2O 관리 백업 파일이 아닙니다.',
+      );
+    }
+  }, [activeOwnerScope]);
+
   useEffect(() => {
-    if (!RELEASE_FEATURES.deepLinks || !profile || !['/customer', '/admin'].includes(route)) return;
+    const routeSessionReady = hasActiveProfileSession && (
+      route === '/customer' || (route === '/admin' && profile?.testerType === '관리자')
+    );
+    if (!RELEASE_FEATURES.deepLinks || !profile || !routeSessionReady) return;
     const groupId = new URLSearchParams(window.location.search).get('group');
     if (!groupId) return;
     const requestedView = new URLSearchParams(window.location.search).get('view');
@@ -1256,20 +1881,73 @@ function App() {
       destination: requestedView === 'room' ? 'room' : 'detail',
       signed_in: true,
     });
-  }, [deals, handledDeepLink, profile, route]);
+  }, [deals, handledDeepLink, hasActiveProfileSession, profile, route]);
 
   useEffect(() => {
     let cancelled = false;
     let refreshing = false;
+    const observedMutations = new Map();
+    const reconcileCaches = (snapshots) => {
+      const reconcileSavedCache = (current, persist) => {
+        const next = reconcilePublicDealCache(current, snapshots);
+        if (next === current) return current;
+        persist(next);
+        const nextById = new Map(next.map((deal) => [deal.id, deal]));
+        const centralById = new Map(snapshots.map((deal) => [deal.id, deal]));
+        let syncState = {
+          acknowledgements: loadJson(PUBLIC_DEAL_SYNCED_KEY, {}),
+          issues: loadJson(publicDealSyncIssuesStorageKey, {}),
+        };
+        current.forEach((deal) => {
+          if (!nextById.has(deal.id)) {
+            delete syncState.acknowledgements[deal.id];
+            delete syncState.issues[deal.id];
+          } else {
+            // This cache was already synced. Updating it from a confirmed read
+            // must not turn the refreshed snapshot into a new publish request.
+            // Keep any genuinely pending local edit pending.
+            syncState = applyObservedPublicDealSync({ ...syncState, previous: deal,
+              observed: nextById.get(deal.id), centralDeal: centralById.get(deal.id) });
+          }
+        });
+        saveJson(PUBLIC_DEAL_SYNCED_KEY, syncState.acknowledgements);
+        saveJson(publicDealSyncIssuesStorageKey, syncState.issues);
+        setPublicDealSyncIssues(syncState.issues);
+        return next;
+      };
+      setCreatedDeals((current) => {
+        return reconcileSavedCache(current, saveCreatedDeals);
+      });
+      setCustomerGroups((current) => {
+        return reconcileSavedCache(current, (next) => saveJson(CUSTOMER_GROUPS_KEY, next));
+      });
+      setOwnedDeals((current) => reconcilePublicDealCache(current, snapshots));
+    };
     const refresh = async () => {
       if (refreshing || document.visibilityState === 'hidden') return;
       refreshing = true;
       try {
         const next = await fetchPublicDeals();
-        if (!cancelled) setRemoteDeals(next);
+        if (!cancelled && Array.isArray(next)) {
+          // An earlier public-list request can finish after an administrator
+          // saves a newer image or deletion. Keep the confirmed mutation until
+          // the list catches up so that response cannot restore the old card.
+          const confirmed = mergeDeals([...observedMutations.values()], next);
+          setRemoteDeals(confirmed);
+          reconcileCaches(confirmed);
+        }
       } finally {
         refreshing = false;
       }
+    };
+    const handlePublishedDeal = (event) => {
+      const deal = event.detail?.deal;
+      if (!deal?.id) return;
+      const confirmed = mergeDeals([deal], [observedMutations.get(deal.id)])[0];
+      observedMutations.set(deal.id, confirmed);
+      setRemoteDeals((current) => mergeDeals([confirmed], current));
+      reconcileCaches([confirmed]);
+      refresh();
     };
     refresh();
     const timer = window.setInterval(refresh, PUBLIC_DEAL_SYNC_INTERVAL_MS);
@@ -1281,6 +1959,7 @@ function App() {
     window.addEventListener('focus', handleFocus);
     window.addEventListener('pageshow', handlePageShow);
     window.addEventListener('online', handleFocus);
+    window.addEventListener('o2o-public-deals-updated', handlePublishedDeal);
     document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       cancelled = true;
@@ -1288,6 +1967,7 @@ function App() {
       window.removeEventListener('focus', handleFocus);
       window.removeEventListener('pageshow', handlePageShow);
       window.removeEventListener('online', handleFocus);
+      window.removeEventListener('o2o-public-deals-updated', handlePublishedDeal);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, []);
@@ -1296,13 +1976,14 @@ function App() {
     let cancelled = false;
     let syncing = false;
     const syncPendingDeals = async () => {
-      if (syncing) return;
+      if (syncing || document.visibilityState === 'hidden') return;
       const localPublicDeals = [...scopedCreatedDeals, ...customerGroups]
-        .filter((deal) => deal.visibility === 'public');
+        .filter((deal) => deal.visibility === 'public' && Boolean(getDealCapability(deal.id)));
       if (!localPublicDeals.length) return;
       const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
+      const issues = loadJson(publicDealSyncIssuesStorageKey, {});
       const pending = localPublicDeals.filter(
-        (deal) => fingerprints[deal.id] !== dealSyncFingerprint(deal),
+        (deal) => shouldPublishPublicDeal(deal, fingerprints, issues),
       );
       if (!pending.length) return;
       syncing = true;
@@ -1312,7 +1993,20 @@ function App() {
         for (const deal of pending) {
           if (cancelled) break;
           try {
-            published.push(await publishPublicDeal(deal, { throwOnError: true }));
+            // Effect restarts and slow image conversion can overlap. Join the
+            // same in-flight snapshot instead of starting a duplicate publish.
+            const requestKey = `${deal.id}:${dealSyncFingerprint(deal)}`;
+            let request = publicDealSyncInFlight.current.get(requestKey);
+            if (!request) {
+              request = publishPublicDeal(deal, {
+                throwOnError: true,
+                maxRetries: 0,
+                priority: 'background',
+              }).finally(() => publicDealSyncInFlight.current.delete(requestKey));
+              publicDealSyncInFlight.current.set(requestKey, request);
+            }
+            const result = await request;
+            published.push(acknowledgedPublicDealSnapshot(deal, result));
             syncErrors.push(null);
           } catch (error) {
             published.push(null);
@@ -1321,14 +2015,74 @@ function App() {
         }
         if (cancelled) return;
         const valid = published.filter(Boolean);
-        const nextFingerprints = { ...loadJson(PUBLIC_DEAL_SYNCED_KEY, {}) };
+        const publishedById = new Map(valid.map((deal) => [deal.id, deal]));
+        let nextSyncState = {
+          acknowledgements: { ...loadJson(PUBLIC_DEAL_SYNCED_KEY, {}) },
+          issues: { ...loadJson(publicDealSyncIssuesStorageKey, {}) },
+        };
+        const centrallyDeletedDealIds = new Set();
         pending.forEach((deal, index) => {
-          if (published[index] || isTerminalOrderSyncError(syncErrors[index])) {
-            nextFingerprints[deal.id] = dealSyncFingerprint(deal);
+          const errorCode = syncErrors[index]?.code || syncErrors[index]?.message;
+          if (errorCode === 'deal_deleted') {
+            centrallyDeletedDealIds.add(deal.id);
+            delete nextSyncState.acknowledgements[deal.id];
+            delete nextSyncState.issues[deal.id];
+          } else {
+            nextSyncState = applyPublicDealSyncResult({
+              ...nextSyncState, deal, published: published[index], error: syncErrors[index],
+            });
           }
         });
-        saveJson(PUBLIC_DEAL_SYNCED_KEY, nextFingerprints);
-        if (valid.length) setRemoteDeals((current) => mergeDeals(valid, current));
+        saveJson(PUBLIC_DEAL_SYNCED_KEY, nextSyncState.acknowledgements);
+        saveJson(publicDealSyncIssuesStorageKey, nextSyncState.issues);
+        setPublicDealSyncIssues(nextSyncState.issues);
+        if (valid.length) {
+          setCustomerGroups((current) => {
+            let changed = false;
+            const next = current.map((deal) => {
+              const publishedDeal = publishedById.get(deal.id);
+              if (!publishedDeal) return deal;
+              changed = true;
+              return { ...deal, ...publishedDeal };
+            });
+            if (changed) saveJson(CUSTOMER_GROUPS_KEY, next);
+            return changed ? next : current;
+          });
+          setCreatedDeals((current) => {
+            let changed = false;
+            const next = current.map((deal) => {
+              const publishedDeal = publishedById.get(deal.id);
+              if (!publishedDeal) return deal;
+              changed = true;
+              return { ...deal, ...publishedDeal };
+            });
+            if (changed) saveCreatedDeals(next);
+            return changed ? next : current;
+          });
+          setSelectedDeal((current) => {
+            const publishedDeal = publishedById.get(current?.id);
+            return publishedDeal ? { ...current, ...publishedDeal } : current;
+          });
+          setRemoteDeals((current) => mergeDeals(valid, current));
+        }
+        if (centrallyDeletedDealIds.size) {
+          setCustomerGroups((current) => {
+            const next = current.filter((deal) => !centrallyDeletedDealIds.has(deal.id));
+            saveJson(CUSTOMER_GROUPS_KEY, next);
+            return next;
+          });
+          setCreatedDeals((current) => {
+            const next = current.filter((deal) => !centrallyDeletedDealIds.has(deal.id));
+            saveCreatedDeals(next);
+            return next;
+          });
+          setOwnedDeals((current) => current.filter((deal) => !centrallyDeletedDealIds.has(deal.id)));
+          setRemoteDeals((current) => current.filter((deal) => !centrallyDeletedDealIds.has(deal.id)));
+          setSelectedDeal((current) => (
+            centrallyDeletedDealIds.has(current?.id) ? null : current
+          ));
+          setCustomerScreen((current) => (current === 'detail' || current === 'room' ? 'list' : current));
+        }
       } finally {
         syncing = false;
       }
@@ -1337,7 +2091,7 @@ function App() {
       if (document.visibilityState === 'visible') syncPendingDeals();
     };
     syncPendingDeals();
-    const timer = window.setInterval(syncPendingDeals, 15000);
+    const timer = window.setInterval(syncPendingDeals, 30000);
     window.addEventListener('online', syncPendingDeals);
     window.addEventListener('pageshow', syncPendingDeals);
     document.addEventListener('visibilitychange', handleVisibility);
@@ -1351,9 +2105,20 @@ function App() {
   }, [customerGroups, scopedCreatedDeals]);
 
   useEffect(() => {
-    const handlePopState = () => {
-      setRoute(normalizeRoute(window.location.pathname));
-      setHandledDeepLink('');
+    const handlePopState = (event) => {
+      const nextRoute = normalizeRoute(window.location.pathname);
+      if (!shouldKeepOwnerPreview(nextRoute)) setOwnerPreviewMode(false);
+      const previousRoute = routeRef.current;
+      const customerNavigation = readCustomerNavigationState(event.state, nextRoute);
+      if (nextRoute === '/') {
+        clearActiveAppSession();
+        setActiveAppSessionKey('');
+        setCustomerScreen('onboarding');
+      } else if (customerNavigation) {
+        setCustomerScreen(customerNavigation.screen);
+      }
+      setRoute(nextRoute);
+      if (nextRoute !== previousRoute) setHandledDeepLink('');
     };
     const handleStorage = (event) => {
       if (event.key === CREATED_DEALS_KEY) setCreatedDeals(loadCreatedDeals());
@@ -1361,7 +2126,11 @@ function App() {
         setOwnerScopeByDeal(loadJson(OWNER_DEAL_SCOPES_KEY, {}));
       }
       if (event.key === CUSTOMER_GROUPS_KEY) setCustomerGroups(loadCustomerGroups());
+      if (event.key === publicDealSyncIssuesStorageKey) {
+        setPublicDealSyncIssues(loadJson(publicDealSyncIssuesStorageKey, {}));
+      }
       if (event.key === CUSTOMER_ORDERS_KEY) setOrders(loadOrders());
+      if (event.key === ROLE_PROFILES_KEY) setRoleProfiles(loadJson(ROLE_PROFILES_KEY, {}));
       if ([OWNER_LOCATION_KEY, OWNER_NEIGHBORHOOD_KEY].includes(event.key)) {
         setOwnerLocation(loadOwnerLocation());
       }
@@ -1376,10 +2145,12 @@ function App() {
 
   useEffect(() => {
     if (!profile) return undefined;
-    const retry = () => flushPendingEvents(profile);
+    const retry = () => {
+      if (document.visibilityState !== 'hidden') flushPendingEvents(profile);
+    };
     retry();
     window.addEventListener('online', retry);
-    const timer = window.setInterval(retry, 15000);
+    const timer = window.setInterval(retry, 30000);
     return () => {
       window.removeEventListener('online', retry);
       window.clearInterval(timer);
@@ -1387,49 +2158,323 @@ function App() {
   }, [profile]);
 
   useEffect(() => {
+    if (!profile || profile.testerType !== '사용자') return undefined;
+    let cancelled = false;
+    let recovering = false;
+
+    const recoverInterruptedReservations = async () => {
+      if (recovering || document.visibilityState === 'hidden') return;
+      recovering = true;
+      try {
+        const persistedOrders = new Map(loadOrders().map((order) => [order.id, order]));
+        const attempts = listRecoverableCheckoutAttempts();
+        for (const attempt of attempts) {
+          if (cancelled) break;
+          let persistedOrder = persistedOrders.get(attempt.orderId);
+          if (!persistedOrder
+            && attempt.reservationAction === 'create'
+            && attempt.workflowDeal
+            && attempt.orderPayload) {
+            try {
+              const recoveredGroup = await initializeGroupRoom({
+                deal: attempt.workflowDeal,
+                actorId: attempt.actorId,
+                nickname: attempt.nickname || profile.name || '테스트 호스트',
+                clientMutationId: attempt.reservationMutationId,
+                allowLocalFallback: false,
+              });
+              if (recoveredGroup?.localOnly) throw new Error('group_backend_required');
+              updateCheckoutAttempt(attempt.orderId, { stage: 'publishing_deal' });
+              const publishedDeal = await publishPublicDeal(attempt.workflowDeal, {
+                throwOnError: true,
+                maxRetries: 0,
+                priority: 'background',
+                expectedPublishVersion: 0,
+                publishMutationId: attempt.workflowDeal.publishMutationId
+                  || `publish-${attempt.groupId}-initial`,
+              });
+              const recoveredOrder = {
+                ...attempt.orderPayload,
+                deal: publishedDeal || attempt.workflowDeal,
+              };
+              updateCheckoutAttempt(attempt.orderId, {
+                stage: 'publishing_order',
+                workflowDeal: publishedDeal || attempt.workflowDeal,
+                orderPayload: recoveredOrder,
+              });
+              const nextOrders = mergeCustomerOrderCollections(loadOrders(), [recoveredOrder]);
+              saveJson(CUSTOMER_ORDERS_KEY, nextOrders);
+              setOrders((current) => mergeCustomerOrderCollections(current, [recoveredOrder]));
+              persistedOrders.set(recoveredOrder.id, recoveredOrder);
+              persistedOrder = recoveredOrder;
+              releaseCheckoutAttempt(recoveredOrder.id);
+              window.dispatchEvent(new Event('o2o-customer-orders-updated'));
+            } catch (error) {
+              const recoveryCode = error?.code || error?.message || 'group_creation_recovery_pending';
+              if (isTerminalOrderSyncError(error)) {
+                track('group_creation_recovery_rejected', {
+                  group_id: attempt.groupId,
+                  order_id: attempt.orderId,
+                  error_code: recoveryCode,
+                });
+              }
+              continue;
+            }
+          }
+          if (persistedOrder) {
+            // Legacy fingerprints also marked rejected writes. Only a matching
+            // authenticated central receipt may retire this reservation; the
+            // order sync below and payment preflight perform that reconciliation.
+            continue;
+          }
+          try {
+            if (attempt.reservationAction === 'reserve_quantity') {
+              try {
+                await rollbackGroupReservation(
+                  attempt.groupId,
+                  attempt.reservationQuantity,
+                  attempt.actorId,
+                  attempt.reservationMutationId,
+                );
+                completeCheckoutAttempt(attempt.orderId);
+                track('checkout_interruption_recovered', {
+                  order_id: attempt.orderId,
+                  deal_id: attempt.dealId,
+                  reservation_action: attempt.reservationAction,
+                });
+                continue;
+              } catch (rollbackError) {
+                const rollbackCode = rollbackError.code || rollbackError.message;
+                if (rollbackCode !== 'reservation_not_found') throw rollbackError;
+              }
+              await reserveGroupQuantity(
+                attempt.groupId,
+                attempt.reservationQuantity,
+                attempt.actorId,
+                attempt.reservationMutationId,
+                { allowLocalFallback: false },
+              );
+            } else if (attempt.reservationAction === 'join') {
+              await joinGroupRoom({
+                deal: { id: attempt.groupId },
+                actorId: attempt.actorId,
+                nickname: attempt.nickname || profile.name || '테스트 참여자',
+                role: 'member',
+                selectedQuantity: attempt.reservationQuantity,
+                clientMutationId: attempt.reservationMutationId,
+                allowLocalFallback: false,
+              });
+            } else {
+              completeCheckoutAttempt(attempt.orderId);
+              continue;
+            }
+            await rollbackGroupReservation(
+              attempt.groupId,
+              attempt.reservationQuantity,
+              attempt.actorId,
+              attempt.reservationMutationId,
+            );
+            completeCheckoutAttempt(attempt.orderId);
+            track('checkout_interruption_recovered', {
+              order_id: attempt.orderId,
+              deal_id: attempt.dealId,
+              reservation_action: attempt.reservationAction,
+            });
+          } catch (error) {
+            const recoveryCode = error.code || error.message;
+            if (['reservation_already_bound', 'group_not_found', 'deal_not_found'].includes(recoveryCode)) {
+              completeCheckoutAttempt(attempt.orderId);
+              track('checkout_interruption_recovery_rejected', {
+                order_id: attempt.orderId,
+                deal_id: attempt.dealId,
+                error_code: recoveryCode || 'terminal_request_error',
+              });
+            }
+          }
+        }
+      } finally {
+        recovering = false;
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') recoverInterruptedReservations();
+    };
+    recoverInterruptedReservations();
+    const timer = window.setInterval(recoverInterruptedReservations, 30000);
+    window.addEventListener('online', recoverInterruptedReservations);
+    window.addEventListener('pageshow', recoverInterruptedReservations);
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      window.removeEventListener('online', recoverInterruptedReservations);
+      window.removeEventListener('pageshow', recoverInterruptedReservations);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [profile]);
+
+  useEffect(() => {
     const profilePhone = normalizePhone(profile?.phone);
-    if (!profilePhone) return undefined;
+    if (!profilePhone || profile?.testerType !== '사용자') return undefined;
     let cancelled = false;
     let syncing = false;
+    let refreshQueued = false;
+    let readController = null;
+    const isCurrent = () => !cancelled && customerHistoryScopeRef.current === profilePhone;
 
-    const syncOrders = async () => {
-      if (syncing) return;
+    const syncOrders = async (queueIfBusy = false) => {
+      if (!isCurrent() || document.visibilityState === 'hidden') return;
+      if (syncing) {
+        if (queueIfBusy === true) refreshQueued = true;
+        return;
+      }
       syncing = true;
+      refreshQueued = false;
+      readController = new AbortController();
+      setCustomerHistoryState({ scope: profilePhone, status: 'loading' });
       try {
         const visitorId = getVisitorId();
         const matchingLocalOrders = loadOrders()
           .filter((order) => isOrderForProfile(order, profile, visitorId))
           .map((order) => ({ ...order, customerPhone: profilePhone }));
         const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+        const issues = loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {});
         const pending = matchingLocalOrders.filter(
-          (order) => fingerprints[order.id] !== orderSyncFingerprint(order),
+          (order) => shouldPublishQueuedOrder(order, fingerprints, issues),
         );
         const published = [];
         const syncErrors = [];
+        const rollbackResults = [];
         for (const order of pending) {
-          if (cancelled) break;
+          if (!isCurrent()) return;
           try {
-            published.push(await publishCustomerOrder(order, { throwOnError: true }));
+            published.push(await publishCustomerOrder(order, {
+              throwOnError: true,
+              priority: 'background',
+            }));
             syncErrors.push(null);
+            rollbackResults.push(null);
           } catch (error) {
+            if (!isCurrent()) return;
+            let reconciledOrder = null;
+            let reconciliationReadError = null;
+            try {
+              const centralOrders = await fetchCustomerOrders(profilePhone, { strict: true, signal: readController.signal });
+              reconciledOrder = centralOrders.find((item) => item.id === order.id) || null;
+            } catch (readError) {
+              reconciliationReadError = readError;
+            }
+            if (!isCurrent()) return;
+            if (reconciledOrder) {
+              published.push(reconciledOrder);
+              syncErrors.push(null);
+              rollbackResults.push(null);
+              continue;
+            }
             published.push(null);
-            syncErrors.push(error);
+            syncErrors.push(isTerminalOrderSyncError(error)
+              ? error
+              : (reconciliationReadError || error));
+            let rollbackResult = null;
+            const reservationMutationId = order.reservationMutationId || order.clientMutationId;
+            if (isTerminalOrderSyncError(error)
+              && order.groupId
+              && reservationMutationId) {
+              try {
+                if (isCustomerGroupCreatorOrder(order)) {
+                  await compensateCustomerGroupCreation(order, { finalize: false });
+                  rollbackResult = { ok: true, groupCreationCompensated: true };
+                } else {
+                  await rollbackGroupReservation(
+                    order.groupId,
+                    Math.max(1, Number(order.selectedCount || order.quantity || 1)),
+                    order.visitorId || visitorId,
+                    reservationMutationId,
+                  );
+                  rollbackResult = { ok: true };
+                }
+              } catch (rollbackError) {
+                rollbackResult = { ok: false, error: rollbackError };
+              }
+            }
+            rollbackResults.push(rollbackResult);
           }
         }
-        const nextFingerprints = { ...fingerprints };
+        if (!isCurrent()) return;
+        let centralOrders = [];
+        let historyReadFailed = false;
+        try {
+          centralOrders = await fetchCustomerOrders(profilePhone, { strict: true, signal: readController.signal });
+        } catch {
+          historyReadFailed = true;
+        }
+        if (!isCurrent()) return;
+        // Another action can finish while either request above is awaiting.
+        // Commit only results whose local input/ack/issue has not moved on.
+        const currentFingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+        const currentIssues = loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {});
+        const currentOrders = new Map(loadOrders().map((order) => [order.id, order]));
+        const previousOrders = new Map(matchingLocalOrders.map((order) => [order.id, order]));
+        const candidateIds = new Set([...previousOrders.keys(), ...centralOrders.map((order) => order.id),
+          ...published.filter(Boolean).map((order) => order.id)]);
+        const supersededOrderIds = new Set([...candidateIds].filter((id) => {
+          const current = currentOrders.get(id);
+          return orderSyncStateChanged({
+            previousOrder: previousOrders.get(id),
+            currentOrder: current ? { ...current, customerPhone: profilePhone } : undefined,
+            previousAcknowledgement: fingerprints[id], currentAcknowledgement: currentFingerprints[id],
+            previousIssue: issues[id], currentIssue: currentIssues[id],
+          });
+        }));
+        const nextFingerprints = { ...currentFingerprints };
+        const rolledBackOrderIds = new Set();
         pending.forEach((order, index) => {
+          if (supersededOrderIds.has(order.id)) {
+            published[index] = null;
+            return;
+          }
           if (published[index]) {
-            nextFingerprints[order.id] = orderSyncFingerprint(order);
+            nextFingerprints[order.id] = orderSyncFingerprint(published[index]);
+            reconcileGroupCheckoutAttempts(order.groupId, order.participantActorId || order.visitorId,
+              [published[index]]);
+            updateOrderSyncIssue(order.id);
+            if (isCustomerGroupCreatorOrder(order)) {
+              commitCustomerGroup(published[index]?.deal || order.deal);
+            }
+          }
+          if (rollbackResults[index]?.ok) {
+            rolledBackOrderIds.add(order.id);
+            delete nextFingerprints[order.id];
             completeCheckoutAttempt(order.id);
             updateOrderSyncIssue(order.id);
+            track('order_reservation_rolled_back', {
+              order_id: order.id,
+              deal_id: order.dealId,
+              error_code: syncErrors[index]?.code || syncErrors[index]?.message || 'terminal_request_error',
+            });
+            return;
           }
-          if (isTerminalOrderSyncError(syncErrors[index])) {
-            nextFingerprints[order.id] = orderSyncFingerprint(order);
+          if (rollbackResults[index]?.error) {
             updateOrderSyncIssue(order.id, {
-              state: 'failed',
-              code: syncErrors[index]?.code || syncErrors[index]?.message || 'terminal_request_error',
+              state: 'pending',
+              code: rollbackResults[index].error?.code
+                || rollbackResults[index].error?.message
+                || 'reservation_rollback_pending',
               updatedAt: new Date().toISOString(),
             });
+            track('order_reservation_rollback_pending', {
+              order_id: order.id,
+              deal_id: order.dealId,
+              error_code: rollbackResults[index].error?.code
+                || rollbackResults[index].error?.message
+                || 'reservation_rollback_pending',
+            });
+            return;
+          }
+          if (isTerminalOrderSyncError(syncErrors[index])) {
+            delete nextFingerprints[order.id];
+            updateOrderSyncIssue(order.id, rejectedOrderSyncIssue(order, syncErrors[index]));
             track('order_sync_rejected', {
               order_id: order.id,
               deal_id: order.dealId,
@@ -1444,40 +2489,65 @@ function App() {
           }
         });
 
-        const centralOrders = await fetchCustomerOrders(profilePhone);
-        if (cancelled) return;
-        centralOrders.forEach((order) => {
+        const acceptedCentralOrders = centralOrders.filter((order) => (
+          !rolledBackOrderIds.has(order.id) && !supersededOrderIds.has(order.id)
+        ));
+        acceptedCentralOrders.forEach((order) => {
           nextFingerprints[order.id] = orderSyncFingerprint(order);
-          completeCheckoutAttempt(order.id);
+          reconcileGroupCheckoutAttempts(order.groupId, order.participantActorId || order.visitorId,
+            acceptedCentralOrders);
           updateOrderSyncIssue(order.id);
+          if (isCustomerGroupCreatorOrder(order)) {
+            commitCustomerGroup(order.deal);
+          }
         });
         saveJson(CUSTOMER_ORDER_SYNCED_KEY, nextFingerprints);
         setOrders((current) => {
-          const merged = mergeOrders(current, centralOrders);
+          if (!isCurrent()) return current;
+          const merged = mergeCompletedCustomerOrderSync(
+            current,
+            published,
+            acceptedCentralOrders,
+            rolledBackOrderIds,
+          );
           saveJson(CUSTOMER_ORDERS_KEY, merged);
           return JSON.stringify(merged) === JSON.stringify(current) ? current : merged;
         });
+        setCustomerHistoryState({ scope: profilePhone, status: historyReadFailed ? 'error' : 'ready' });
+      } catch {
+        if (isCurrent()) setCustomerHistoryState({ scope: profilePhone, status: 'error' });
       } finally {
         syncing = false;
+        readController = null;
+        // A room snapshot or completed payment may arrive while the previous
+        // read is still returning an older order. Keep one follow-up request
+        // instead of dropping that change until the next periodic poll.
+        if (refreshQueued && isCurrent()) void syncOrders();
       }
     };
+    customerHistoryRetryRef.current = syncOrders;
+    const refreshChangedOrders = () => syncOrders(true);
 
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible') syncOrders();
+      if (document.visibilityState === 'visible') refreshChangedOrders();
     };
     syncOrders();
     const timer = window.setInterval(syncOrders, CUSTOMER_ORDER_SYNC_INTERVAL_MS);
-    window.addEventListener('online', syncOrders);
-    window.addEventListener('pageshow', syncOrders);
+    window.addEventListener('online', refreshChangedOrders);
+    window.addEventListener('pageshow', refreshChangedOrders);
+    window.addEventListener('o2o-customer-orders-updated', refreshChangedOrders);
     document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       cancelled = true;
+      readController?.abort();
+      if (customerHistoryRetryRef.current === syncOrders) customerHistoryRetryRef.current = null;
       window.clearInterval(timer);
-      window.removeEventListener('online', syncOrders);
-      window.removeEventListener('pageshow', syncOrders);
+      window.removeEventListener('online', refreshChangedOrders);
+      window.removeEventListener('pageshow', refreshChangedOrders);
+      window.removeEventListener('o2o-customer-orders-updated', refreshChangedOrders);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [profile, orders, updateOrderSyncIssue]);
+  }, [commitCustomerGroup, compensateCustomerGroupCreation, profile, updateOrderSyncIssue]);
 
   useEffect(() => {
     if (analyticsReady) trackPageview();
@@ -1485,15 +2555,40 @@ function App() {
 
   const navigateTo = (nextRoute) => {
     const normalizedRoute = normalizeRoute(nextRoute);
+    if (normalizedRoute === '/admin') {
+      setCustomerScreen('list');
+      setAdminEntryVersion((current) => current + 1);
+    }
+    const switchingOwnerToCustomerApp = normalizedRoute === '/customer'
+      && route === '/owner'
+      && hasActiveProfileSession
+      && profile?.testerType === '사장님'
+      && !ownerPreviewMode;
+    if (switchingOwnerToCustomerApp) {
+      clearActiveAppSession();
+      setActiveAppSessionKey('');
+      setCustomerScreen('onboarding');
+    }
+    if (normalizedRoute === '/') {
+      clearActiveAppSession();
+      setActiveAppSessionKey('');
+      setCustomerScreen('onboarding');
+    }
     window.history.pushState({}, '', normalizedRoute);
     setHandledDeepLink('');
-    if (normalizedRoute !== '/customer') setOwnerPreviewMode(false);
+    if (!shouldKeepOwnerPreview(normalizedRoute)) setOwnerPreviewMode(false);
     setRoute(normalizedRoute);
     track('app_opened', { app: normalizedRoute.replace('/', '') || 'launcher' });
   };
 
   const handleProfileSubmit = (nextProfile) => {
     saveProfile(nextProfile);
+    setRoleProfiles((current) => {
+      const next = { ...current, [nextProfile.testerType]: nextProfile };
+      saveJson(ROLE_PROFILES_KEY, next);
+      return next;
+    });
+    setActiveAppSessionKey(startActiveAppSession(nextProfile));
     setAnalyticsReady(initAnalytics(nextProfile));
     setProfile(nextProfile);
     const nextVisitorId = getVisitorId();
@@ -1522,8 +2617,10 @@ function App() {
       setOwnerLocation(nextLocation);
       saveJson(OWNER_LOCATION_KEY, nextLocation);
     }
-    const linkedGroupId = new URLSearchParams(window.location.search).get('group');
-    setCustomerScreen(linkedGroupId ? 'detail' : 'list');
+    // A valid deep link is resolved by the dedicated URL effect. Stay on the
+    // list until that resolution succeeds so a missing/stale id cannot open an
+    // unrelated sample deal after onboarding.
+    setCustomerScreen('list');
     track('profile_submitted', {
       region: nextProfile.region,
       district: nextProfile.district,
@@ -1534,7 +2631,9 @@ function App() {
 
   const handleLogout = () => {
     track('profile_logged_out', { neighborhood: profile?.neighborhood || '미설정' });
+    clearActiveAppSession();
     clearProfile();
+    setActiveAppSessionKey('');
     setAnalyticsReady(false);
     setProfile(null);
     setCustomerScreen('onboarding');
@@ -1543,9 +2642,11 @@ function App() {
   const handleNeighborhoodChange = (location) => {
     if (!location) return;
     const nextLocation = normalizeLocation(location);
-    if (!profile && ownerPreviewMode) {
-      if (sameLocation(nextLocation, previewLocation)) return;
-      const previousLocation = previewLocation;
+    if (customerReadOnly) {
+      const currentPreviewLocation = ownerPreviewMode ? previewLocation : ownerLocation;
+      if (sameLocation(nextLocation, currentPreviewLocation)) return;
+      const previousLocation = currentPreviewLocation;
+      setOwnerPreviewMode(true);
       setPreviewLocation(nextLocation);
       track('neighborhood_changed', {
         from_region: previousLocation.region,
@@ -1564,6 +2665,11 @@ function App() {
     };
     saveProfile(nextProfile);
     setProfile(nextProfile);
+    setRoleProfiles((current) => {
+      const next = { ...current, [nextProfile.testerType]: nextProfile };
+      saveJson(ROLE_PROFILES_KEY, next);
+      return next;
+    });
     track('neighborhood_changed', {
       from_region: previousLocation.region,
       from_district: previousLocation.district,
@@ -1598,6 +2704,11 @@ function App() {
       const nextProfile = { ...profile, ...nextLocation };
       saveProfile(nextProfile);
       setProfile(nextProfile);
+      setRoleProfiles((current) => {
+        const next = { ...current, '사장님': nextProfile };
+        saveJson(ROLE_PROFILES_KEY, next);
+        return next;
+      });
     }
     track('owner_neighborhood_changed', {
       from_region: previousLocation.region,
@@ -1607,7 +2718,37 @@ function App() {
     });
   };
 
-  const addOwnerDeal = (ownerProduct, editingId = null) => {
+  const switchToStoredOwnerProfile = () => {
+    if (!ownerAccountHint || profile?.testerType !== '사장님') return;
+    const formattedPhone = formatKoreanMobilePhoneInput(ownerAccountHint.phone);
+    const maskedPhone = formattedPhone.replace(/^(010)-\d{3,4}-(\d{4})$/, '$1-****-$2');
+    if (!window.confirm(
+      `이 브라우저에 ${maskedPhone} 번호로 연결된 기존 상품 ${ownerAccountHint.count}개가 있습니다. 해당 사장님 번호로 다시 연결할까요?`,
+    )) return;
+    const latestCandidate = localOwnerScopeCandidates({
+      capabilities: loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {}),
+      scopeByDeal: loadJson(OWNER_DEAL_SCOPES_KEY, {}),
+      excludeScope: activeOwnerScope,
+    }).find((candidate) => candidate.scope === ownerAccountHint.scope);
+    if (!latestCandidate) return;
+    const nextProfile = {
+      ...profile,
+      phone: formatKoreanMobilePhoneInput(latestCandidate.phone),
+      testerType: '사장님',
+    };
+    saveProfile(nextProfile);
+    setRoleProfiles((current) => {
+      const next = { ...current, '사장님': nextProfile };
+      saveJson(ROLE_PROFILES_KEY, next);
+      return next;
+    });
+    setActiveAppSessionKey(startActiveAppSession(nextProfile));
+    setProfile(nextProfile);
+    setOwnerScreen('form');
+    track('owner_profile_reconnected', { product_count: latestCandidate.count });
+  };
+
+  const addOwnerDeal = async (ownerProduct, editingId = null, editingSnapshot = null) => {
     if (!activeOwnerScope || (editingId && !isOwnerDealInScope(
       editingId,
       ownerScopeByDeal,
@@ -1616,8 +2757,8 @@ function App() {
       return false;
     }
     const previous = editingId
-      ? scopedCreatedDeals.find((deal) => deal.id === editingId)
-        || scopedOwnedDeals.find((deal) => deal.id === editingId)
+      ? editingSnapshot || mergeDeals(scopedCreatedDeals, scopedOwnedDeals, remoteDeals)
+        .find((deal) => deal.id === editingId)
       : null;
     const centralVersion = editingId
       ? remoteDeals.find((deal) => deal.id === editingId)
@@ -1648,7 +2789,9 @@ function App() {
     });
     const splitPricing = isGroupSale && groupPricing.splitPricing;
     const orderedQuantity = editingId ? previousOrderedQuantity : 0;
-    const dealId = editingId || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`;
+    const dealId = editingId
+      || ownerProduct.draftDealId
+      || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`;
     const capabilityToken = getDealCapability(dealId, {
       create: true,
       ownerScope: activeOwnerScope,
@@ -1658,6 +2801,9 @@ function App() {
     const deal = {
       id: dealId,
       createdAt: previous?.createdAt || new Date().toISOString(),
+      publishVersion: Math.max(0, Math.floor(Number(
+        previous?.publishVersion ?? centralVersion?.publishVersion ?? 0,
+      ))),
       visibility: 'public',
       source: 'merchant',
       saleType: isGroupSale ? 'group' : ownerProduct.saleType,
@@ -1720,45 +2866,82 @@ function App() {
       ],
       updatedAt: new Date().toISOString(),
     };
+    const publishedDeal = await publishPublicDeal(deal, { throwOnError: true });
+    if (!publishedDeal) throw new Error('public_deal_sync_failed');
+    const savedDeal = migrateMerchantSplitDeal({ ...deal, ...publishedDeal });
     setCreatedDeals((current) => {
       const next = editingId
-        ? [deal, ...current.filter((item) => item.id !== editingId)]
-        : [deal, ...current];
+        ? [savedDeal, ...current.filter((item) => item.id !== editingId)]
+        : [savedDeal, ...current.filter((item) => item.id !== savedDeal.id)];
       saveCreatedDeals(next);
       return next;
     });
+    const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
+    fingerprints[savedDeal.id] = dealSyncFingerprint(savedDeal);
+    saveJson(PUBLIC_DEAL_SYNCED_KEY, fingerprints);
+    const syncIssues = loadJson(publicDealSyncIssuesStorageKey, {});
+    delete syncIssues[savedDeal.id];
+    saveJson(publicDealSyncIssuesStorageKey, syncIssues);
+    setPublicDealSyncIssues(syncIssues);
     setOwnerWorkspaceScope(activeOwnerScope);
-    setOwnedDeals((current) => mergeDeals([deal], current.filter((item) => item.id !== deal.id)));
-    setSelectedDeal(deal);
+    setOwnerWorkspaceStatus((current) => current === 'unconfirmed' ? 'ready' : current);
+    setOwnedDeals((current) => mergeDeals([savedDeal], current.filter((item) => item.id !== savedDeal.id)));
+    setRemoteDeals((current) => mergeDeals([savedDeal], current.filter((item) => item.id !== savedDeal.id)));
+    setSelectedDeal(savedDeal);
     setOwnerScreen('done');
-    return deal;
+    return savedDeal;
   };
 
   const updateCustomerDeal = async (deal, options = {}) => {
+    const isAdminObservation = customerAdminMode
+      && options.observed === true
+      && options.sync === false;
+    if (!isAdminObservation) assertCurrentCustomerMutationAllowed();
     const updated = {
       ...deal,
       category: normalizeCategory(deal.category),
       visibility: 'public',
       updatedAt: deal.updatedAt || new Date().toISOString(),
     };
+    let committed = updated;
+    if (options.sync !== false) {
+      const published = await publishPublicDeal(updated, { throwOnError: true });
+      if (!published) throw new Error('public_deal_sync_failed');
+      committed = { ...updated, ...published };
+    }
     const isLocallyOwned = customerGroups.some((item) => item.id === updated.id);
     if (!options.observed || isLocallyOwned) {
       setCustomerGroups((current) => {
-        const next = [updated, ...current.filter((item) => item.id !== updated.id)];
+        if (options.observed && options.sync === false) {
+          const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
+          const issues = loadJson(publicDealSyncIssuesStorageKey, {});
+          const nextSyncState = applyObservedPublicDealSync({
+            previous: current.find((item) => item.id === committed.id), observed: committed,
+            acknowledgements: fingerprints, issues,
+            centralDeal: remoteDeals.find((item) => item.id === committed.id),
+          });
+          if (nextSyncState.acknowledgements !== fingerprints) saveJson(PUBLIC_DEAL_SYNCED_KEY, nextSyncState.acknowledgements);
+          if (nextSyncState.issues !== issues) {
+            saveJson(publicDealSyncIssuesStorageKey, nextSyncState.issues);
+            setPublicDealSyncIssues(nextSyncState.issues);
+          }
+        }
+        const next = [committed, ...current.filter((item) => item.id !== committed.id)];
         saveJson(CUSTOMER_GROUPS_KEY, next);
         return next;
       });
     } else {
-      setRemoteDeals((current) => mergeDeals([updated], current.filter((item) => item.id !== updated.id)));
+      setRemoteDeals((current) => mergeDeals([committed], current.filter((item) => item.id !== committed.id)));
     }
-    setSelectedDeal(updated);
-    if (!options.observed) track('customer_deal_updated', { deal_id: updated.id });
+    setSelectedDeal(committed);
+    if (!options.observed) track('customer_deal_updated', { deal_id: committed.id });
     if (options.sync !== false) {
-      const published = await publishPublicDeal(updated);
-      if (published) setRemoteDeals((current) => mergeDeals([published], current));
-      return published || updated;
+      const fingerprints = loadJson(PUBLIC_DEAL_SYNCED_KEY, {});
+      fingerprints[committed.id] = dealSyncFingerprint(committed);
+      saveJson(PUBLIC_DEAL_SYNCED_KEY, fingerprints);
+      setRemoteDeals((current) => mergeDeals([committed], current));
     }
-    return updated;
+    return committed;
   };
 
   const updateCustomerGroupTarget = async (
@@ -1766,6 +2949,7 @@ function App() {
     targetCount,
     { mutate = true, expectedVersion } = {},
   ) => {
+    assertCurrentCustomerMutationAllowed();
     const actorId = getVisitorId();
     const result = mutate
       ? await updateGroupTarget(deal.id, targetCount, actorId, expectedVersion)
@@ -1791,7 +2975,7 @@ function App() {
 
   const removeDeal = async (deal) => {
     if (!deal?.id) return false;
-    const deleted = await deletePublicDeal(deal.id);
+    const deleted = await deletePublicDeal(deal);
     if (!deleted) {
       track('deal_delete_failed', { deal_id: deal.id, source: deal.source });
       return false;
@@ -1819,6 +3003,7 @@ function App() {
   };
 
   const createCustomerGroup = async (draft) => {
+    assertCurrentCustomerMutationAllowed();
     const targetPeople = Math.min(20, Math.max(1, Number(draft.quantity || draft.targetPeople || 1)));
     const totalQuantity = Math.min(999, Math.max(1, Number(
       draft.totalQuantity
@@ -1840,7 +3025,9 @@ function App() {
     const productAllocation = calculateProductAllocation(totalPrice, totalQuantity, creatorQuantity);
     const hostMode = draft.hostMode === 'recruiting' ? 'recruiting' : 'self';
     const creatorActorId = getVisitorId();
-    const now = new Date().toISOString();
+    // Keep the initial publish body stable when the server commits but its
+    // response is lost and the user retries the same submission.
+    const now = draft.creationAttemptAt || new Date().toISOString();
     const groupId = draft.groupId || `customer-${globalThis.crypto?.randomUUID?.() || Date.now()}`;
     const group = {
       id: groupId,
@@ -1892,110 +3079,213 @@ function App() {
       hostMatched: hostMode === 'self',
       hostActorId: hostMode === 'self' ? creatorActorId : '',
       version: 1,
+      publishVersion: 0,
+      expectedPublishVersion: 0,
+      publishMutationId: `publish-${groupId}-initial`,
       stateHistory: [],
       likes: 0,
       image: draft.image || draft.baseDeal.image || fallbackImage,
       menu: [
         {
-          id: `customer-menu-${Date.now()}`,
+          id: `customer-menu-${String(groupId).slice(0, 96)}`,
           name: draft.title,
           price: productAllocation.unitPrice,
           option: `${draft.category} · 1개 기준`,
         },
       ],
     };
-    setCustomerGroups((current) => {
-      const next = [group, ...current.filter((item) => item.id !== group.id)];
-      saveJson(CUSTOMER_GROUPS_KEY, next);
-      return next;
-    });
-    setSelectedDeal(group);
-    track('group_created', {
-      deal_id: group.id,
-      source: 'customer',
-      category: group.category,
-      method: draft.method,
-      title: group.title,
-      target_people: targetPeople,
-      total_quantity: totalQuantity,
-      creator_quantity: creatorQuantity,
-      host_mode: hostMode,
-    });
-    await initializeGroupRoom({
+    const creatorOrderInput = {
+      type: 'group',
+      dealId: group.id,
+      groupId: group.id,
       deal: group,
+      title: group.title,
+      store: group.store,
+      total: hostMode === 'self'
+        ? productAllocation.hostSelectedAmount
+        : productAllocation.selectedAmount,
+      method: draft.method,
+      deadline: `${draft.deadlineDate} ${draft.deadlineTime}`,
+      quantity: productAllocation.selectedQuantity,
+      selectedCount: productAllocation.selectedQuantity,
+      hostRemainderApplied: hostMode === 'self' ? productAllocation.remainder : 0,
+      clientMutationId: `create-${groupId}`,
+    };
+    const creationAttempt = beginCheckoutAttempt({
+      ...creatorOrderInput,
       actorId: creatorActorId,
+      groupId,
+      reservationMutationId: creatorOrderInput.clientMutationId,
+      reservationAction: 'create',
+      reservationQuantity: productAllocation.selectedQuantity,
       nickname: profile?.name || '테스트 호스트',
+      workflowDeal: group,
     });
-    const published = await publishPublicDeal(group);
-    if (published) setRemoteDeals((current) => mergeDeals([published], current));
-    return group;
+    const preparedCreatorOrder = creationAttempt.orderPayload || buildCustomerOrderRecord(
+      creatorOrderInput,
+      {
+        orderId: creationAttempt.orderId,
+        createdAt: creationAttempt.createdAt,
+        actorId: creatorActorId,
+        profile,
+        reservationMutationId: creationAttempt.reservationMutationId,
+      },
+    );
+    updateCheckoutAttempt(creationAttempt.orderId, {
+      stage: 'creating_group',
+      reservationAction: 'create',
+      reservationQuantity: productAllocation.selectedQuantity,
+      workflowDeal: group,
+      orderPayload: preparedCreatorOrder,
+    });
+    let publicDealPublished = false;
+    try {
+      const initializedGroup = await initializeGroupRoom({
+        deal: group,
+        actorId: creatorActorId,
+        nickname: profile?.name || '테스트 호스트',
+        clientMutationId: creationAttempt.reservationMutationId,
+        allowLocalFallback: false,
+      });
+      if (initializedGroup?.localOnly) {
+        const error = new Error('group_backend_required');
+        error.code = 'group_backend_required';
+        error.status = 503;
+        throw error;
+      }
+      updateCheckoutAttempt(creationAttempt.orderId, { stage: 'publishing_deal' });
+      const published = await publishPublicDeal(group, {
+        throwOnError: true,
+        expectedPublishVersion: 0,
+        publishMutationId: `publish-${groupId}-initial`,
+      });
+      publicDealPublished = true;
+      const committedGroup = published || group;
+      const queuedCreatorOrder = {
+        ...preparedCreatorOrder,
+        deal: committedGroup,
+      };
+      updateCheckoutAttempt(creationAttempt.orderId, {
+        stage: 'publishing_order',
+        workflowDeal: committedGroup,
+        orderPayload: queuedCreatorOrder,
+      });
+      const nextOrders = mergeCustomerOrderCollections(loadOrders(), [queuedCreatorOrder]);
+      saveJson(CUSTOMER_ORDERS_KEY, nextOrders);
+      setOrders((current) => mergeCustomerOrderCollections(current, [queuedCreatorOrder]));
+      return committedGroup;
+    } catch (error) {
+      if (isTerminalOrderSyncError(error)) {
+        try {
+          await compensateCustomerGroupCreation(preparedCreatorOrder, {
+            deletePublishedDeal: publicDealPublished,
+          });
+          error.groupCreationCompensated = true;
+        } catch (cleanupError) {
+          error.cleanupError = cleanupError;
+          releaseCheckoutAttempt(creationAttempt.orderId);
+        }
+      } else {
+        releaseCheckoutAttempt(creationAttempt.orderId);
+      }
+      throw error;
+    }
   };
 
   const saveCustomerOrder = async (order) => {
+    assertCurrentCustomerMutationAllowed();
     const isPurchase = order.type === 'purchase';
     const isGroupPurchase = isPurchase && isGroupBackedDeal(order.deal);
+    const isGroupCreator = isCustomerGroupCreatorOrder(order);
+    const needsDurableOrderSync = checkoutNeedsDurableOrderSync(order);
     const actorId = getVisitorId();
     const requestedReservationMutationId = order.reservationMutationId
       || order.clientMutationId
-      || (isPurchase ? createMutationId('checkout_quantity') : '');
-    const reconciledOrder = isPurchase
-      ? orders.find((candidate) => (
+      || (needsDurableOrderSync ? createMutationId('checkout_quantity') : '');
+    const localOrders = needsDurableOrderSync ? loadOrders() : orders;
+    const matchingLocalOrder = needsDurableOrderSync
+      ? localOrders.find((candidate) => (
           candidate.dealId === order.dealId
           && candidate.visitorId === actorId
           && [candidate.reservationMutationId, candidate.clientMutationId]
             .includes(requestedReservationMutationId)
         ))
       : null;
-    if (reconciledOrder) {
-      completeCheckoutAttempt(reconciledOrder.id);
-      return reconciledOrder;
+    const syncedOrderFingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+    if (canUseAcknowledgedCheckout(matchingLocalOrder, syncedOrderFingerprints,
+      loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {}))) {
+      // An acknowledgement can skip an already finished checkout, but must
+      // never erase an unresolved reservation or a recorded sync rejection.
+      if (isGroupCreator) commitCustomerGroup(matchingLocalOrder.deal || order.deal);
+      return matchingLocalOrder;
     }
-    const checkoutAttempt = isPurchase
+    const selectedReservationQuantity = isGroupPurchase || isGroupCreator
+      ? Math.max(1, Number(order.selectedCount || order.quantity || 1))
+      : 0;
+    const existingGroupCredential = isGroupPurchase
+      ? getGroupCredential(order.deal.id, actorId)
+      : null;
+    const initialReservationAction = isGroupCreator
+      ? 'create'
+      : isGroupPurchase
+        ? (existingGroupCredential ? 'reserve_quantity' : 'join')
+        : '';
+    const checkoutAttempt = needsDurableOrderSync
       ? beginCheckoutAttempt({
           ...order,
           actorId,
-          groupId: isGroupPurchase ? (order.groupId || order.deal?.groupId || order.deal?.id) : '',
+          groupId: isGroupPurchase || isGroupCreator
+            ? (order.groupId || order.deal?.groupId || order.deal?.id)
+            : '',
           reservationMutationId: requestedReservationMutationId,
+          reservationAction: initialReservationAction,
+          reservationQuantity: selectedReservationQuantity,
+          nickname: profile?.name || '테스트 참여자',
         })
       : null;
     const reservationMutationId = checkoutAttempt?.reservationMutationId
       || requestedReservationMutationId;
+    const reservationAction = checkoutAttempt?.reservationAction || initialReservationAction;
+    const frozenPendingOrder = checkoutAttempt
+      ? checkoutAttempt.orderPayload
+        || localOrders.find((candidate) => candidate.id === checkoutAttempt.orderId)
+        || null
+      : null;
     let groupSnapshot = null;
     if (isGroupPurchase) {
-      const selectedQuantity = Math.max(1, Number(order.selectedCount || order.quantity || 1));
-      const existingCredential = getGroupCredential(order.deal.id, actorId);
-      if (
-        existingCredential?.reservationAction === 'join'
-        && existingCredential.reservationMutationId === reservationMutationId
-        && Number(existingCredential.reservationQuantity) === selectedQuantity
-      ) {
-        const joined = await joinGroupRoom({
-          deal: order.deal,
-          actorId,
-          nickname: profile?.name || '테스트 참여자',
-          role: 'member',
-          selectedQuantity,
-          clientMutationId: reservationMutationId,
-        });
-        groupSnapshot = joined?.snapshot || null;
-      } else if (existingCredential) {
-        const reserved = await reserveGroupQuantity(
-          order.deal.id,
-          selectedQuantity,
-          actorId,
-          reservationMutationId,
-        );
-        groupSnapshot = reserved?.snapshot || null;
-      } else {
-        const joined = await joinGroupRoom({
-          deal: order.deal,
-          actorId,
-          nickname: profile?.name || '테스트 참여자',
-          role: 'member',
-          selectedQuantity,
-          clientMutationId: reservationMutationId,
-        });
-        groupSnapshot = joined?.snapshot || null;
+      updateCheckoutAttempt(checkoutAttempt.orderId, {
+        stage: 'reserving',
+        reservationAction,
+        reservationQuantity: selectedReservationQuantity,
+        nickname: profile?.name || '테스트 참여자',
+      });
+      try {
+        if (reservationAction === 'reserve_quantity') {
+          const reserved = await reserveGroupQuantity(
+            order.deal.id,
+            selectedReservationQuantity,
+            actorId,
+            reservationMutationId,
+            { allowLocalFallback: false },
+          );
+          groupSnapshot = reserved?.snapshot || null;
+        } else {
+          const joined = await joinGroupRoom({
+            deal: order.deal,
+            actorId,
+            nickname: profile?.name || '테스트 참여자',
+            role: 'member',
+            selectedQuantity: selectedReservationQuantity,
+            clientMutationId: reservationMutationId,
+            allowLocalFallback: false,
+          });
+          groupSnapshot = joined?.snapshot || null;
+        }
+        updateCheckoutAttempt(checkoutAttempt.orderId, { stage: 'reserved' });
+      } catch (error) {
+        if (isTerminalOrderSyncError(error)) completeCheckoutAttempt(checkoutAttempt.orderId);
+        else releaseCheckoutAttempt(checkoutAttempt.orderId);
+        throw error;
       }
     }
     const createdAt = checkoutAttempt?.createdAt || new Date().toISOString();
@@ -2014,30 +3304,25 @@ function App() {
     });
     const countedParticipations = loadJson(COUNTED_PARTICIPATIONS_KEY, {});
     const isNewDealParticipant = isPurchase && !countedParticipations[participantKey];
-    const newOrder = {
-      ...order,
-      id: orderId,
+    const newOrder = frozenPendingOrder || buildCustomerOrderRecord(order, {
+      orderId,
       createdAt,
-      status: 'new',
-      paymentStatus: 'pending',
-      visitorId: actorId,
-      customerNumber: getCustomerNumber(),
-      customerName: profile?.name || '테스트 사용자',
-      customerPhone: profile?.phone || '미설정',
-      region: order.deal?.region || profile?.region || DEFAULT_LOCATION.region,
-      district: order.deal?.district || profile?.district || DEFAULT_LOCATION.district,
-      neighborhood: order.deal?.neighborhood || profile?.neighborhood || '미설정',
-      statusHistory: [{ status: 'new', actor: 'customer', timestamp: createdAt }],
-      ...(checkoutAttempt
-        ? {
-            reservationMutationId,
-            clientMutationId: reservationMutationId,
-          }
-        : {}),
-    };
+      actorId,
+      profile,
+      reservationMutationId: checkoutAttempt ? reservationMutationId : '',
+    });
+    if (checkoutAttempt) {
+      updateCheckoutAttempt(orderId, {
+        stage: 'publishing_order',
+        reservationAction,
+        reservationQuantity: selectedReservationQuantity,
+        workflowDeal: newOrder.deal,
+        orderPayload: newOrder,
+      });
+    }
     let storedOrder = newOrder;
-    const needsDurableOrderSync = checkoutNeedsDurableOrderSync(newOrder);
     let orderSyncQueued = false;
+    let pendingSyncError = null;
     if (needsDurableOrderSync) {
       try {
         const published = await publishCustomerOrder(newOrder, { throwOnError: true });
@@ -2052,26 +3337,91 @@ function App() {
         saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
         updateOrderSyncIssue(newOrder.id);
       } catch (error) {
-        if (!canQueueReservedGroupOrder(newOrder, error)) throw error;
-        orderSyncQueued = true;
-        updateOrderSyncIssue(newOrder.id, {
-          state: 'pending',
-          code: error.code || error.message || 'network_error',
-          updatedAt: new Date().toISOString(),
-        });
-        track('order_sync_queued', {
-          order_id: newOrder.id,
-          deal_id: newOrder.dealId,
-          error_code: error.code || error.message || 'network_error',
-        });
+        let reconciledPublishedOrder = null;
+        let reconciliationReadError = null;
+        try {
+          const centralOrders = await fetchCustomerOrders(newOrder.customerPhone, { strict: true });
+          reconciledPublishedOrder = centralOrders.find((item) => item.id === newOrder.id) || null;
+        } catch (readError) {
+          reconciliationReadError = readError;
+        }
+        if (reconciledPublishedOrder) {
+          storedOrder = {
+            ...newOrder,
+            ...reconciledPublishedOrder,
+            deal: { ...newOrder.deal, ...(reconciledPublishedOrder.deal || {}) },
+          };
+          const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+          fingerprints[newOrder.id] = orderSyncFingerprint(storedOrder);
+          saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+          updateOrderSyncIssue(newOrder.id);
+        } else if (isTerminalOrderSyncError(error)) {
+          if (isGroupCreator && reservationMutationId) {
+            try {
+              await compensateCustomerGroupCreation(newOrder);
+              error.groupCreationCompensated = true;
+            } catch (cleanupError) {
+              error.cleanupError = cleanupError;
+              releaseCheckoutAttempt(orderId);
+            }
+          } else if (isGroupPurchase && reservationMutationId && groupSnapshot) {
+            try {
+              await rollbackGroupReservation(
+                order.deal.id,
+                Math.max(1, Number(order.selectedCount || order.quantity || 1)),
+                actorId,
+                reservationMutationId,
+              );
+              completeCheckoutAttempt(orderId);
+              error.reservationRolledBack = true;
+            } catch (rollbackError) {
+              error.rollbackError = rollbackError;
+              releaseCheckoutAttempt(orderId);
+            }
+          } else if (checkoutAttempt) {
+            completeCheckoutAttempt(orderId);
+          }
+          throw error;
+        }
+        if (!reconciledPublishedOrder) {
+          orderSyncQueued = true;
+          if (checkoutAttempt) releaseCheckoutAttempt(orderId);
+          pendingSyncError = new Error('order_sync_pending');
+          pendingSyncError.code = 'order_sync_pending';
+          pendingSyncError.orderId = newOrder.id;
+          pendingSyncError.cause = reconciliationReadError || error;
+          updateOrderSyncIssue(newOrder.id, {
+            state: 'pending',
+            code: reconciliationReadError?.code
+              || reconciliationReadError?.message
+              || error.code
+              || error.message
+              || 'network_error',
+            updatedAt: new Date().toISOString(),
+          });
+          track('order_sync_queued', {
+            order_id: newOrder.id,
+            deal_id: newOrder.dealId,
+            error_code: reconciliationReadError?.code
+              || reconciliationReadError?.message
+              || error.code
+              || error.message
+              || 'network_error',
+          });
+        }
       }
     }
+    const persistedOrders = mergeCustomerOrderCollections(loadOrders(), [storedOrder]);
+    saveJson(CUSTOMER_ORDERS_KEY, persistedOrders);
     setOrders((current) => {
-      const next = mergeOrders(current, [storedOrder]);
-      saveJson(CUSTOMER_ORDERS_KEY, next);
+      const next = mergeCustomerOrderCollections(current, [storedOrder]);
       return next;
     });
+    if (pendingSyncError) throw pendingSyncError;
     if (checkoutAttempt && !orderSyncQueued) completeCheckoutAttempt(orderId);
+    if (isGroupCreator && !orderSyncQueued) {
+      commitCustomerGroup(storedOrder.deal || newOrder.deal);
+    }
     if (!needsDurableOrderSync) {
       publishCustomerOrder(newOrder).then((published) => {
         if (!published) return;
@@ -2188,6 +3538,7 @@ function App() {
   };
 
   const cancelParticipation = async (order) => {
+    assertCurrentCustomerMutationAllowed();
     const deal = deals.find((item) => item.id === order.dealId) || order.deal;
     if (!deal) throw new Error('deal_not_found');
     const actorId = getVisitorId();
@@ -2326,7 +3677,7 @@ function App() {
       return next;
     });
     setOwnerWorkspaceScope(expectedOwnerScope);
-    setOwnerOrders((current) => mergeOrders(current, [mergedManagedOrder]));
+    setOwnerOrders((current) => mergeCustomerOrderCollections(current, [mergedManagedOrder]));
     const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
     fingerprints[managedOrder.id] = orderSyncFingerprint(mergedManagedOrder);
     saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
@@ -2361,25 +3712,33 @@ function App() {
     return managedOrder;
   };
 
-  const confirmCustomerPickup = (orderId) => {
+  const confirmCustomerPickup = async (orderId) => {
+    assertCurrentCustomerMutationAllowed();
     const order = orders.find((item) => item.id === orderId);
     if (!order || isCancelledOrder(order) || order.type !== 'purchase' || order.customerPickupConfirmedAt) return;
     if (!['pickup_waiting', 'completed'].includes(getOrderStage(order).id)) return;
     const confirmedAt = new Date().toISOString();
-    const next = orders.map((item) => (
-      item.id === orderId
-        ? {
-          ...item,
-          customerPickupConfirmedAt: confirmedAt,
-          statusHistory: [
-            ...(item.statusHistory || []),
-            { status: 'customer_pickup_confirmed', actor: 'customer', timestamp: confirmedAt },
-          ],
-        }
-        : item
-    ));
-    setOrders(next);
-    saveJson(CUSTOMER_ORDERS_KEY, next);
+    const requestedOrder = {
+      ...order,
+      customerPickupConfirmedAt: confirmedAt,
+      publishMutationId: `publish-${order.id}-customer-pickup`,
+      statusHistory: [
+        ...(order.statusHistory || []),
+        { status: 'customer_pickup_confirmed', actor: 'customer', timestamp: confirmedAt },
+      ],
+    };
+    const published = await publishCustomerOrder(requestedOrder, { throwOnError: true });
+    if (!published) throw new Error('pickup_confirmation_failed');
+    const confirmedOrder = {
+      ...requestedOrder,
+      ...published,
+      deal: { ...requestedOrder.deal, ...(published.deal || {}) },
+    };
+    setOrders((current) => {
+      const next = mergeCustomerOrderCollections(current, [confirmedOrder]);
+      saveJson(CUSTOMER_ORDERS_KEY, next);
+      return next;
+    });
     track('customer_pickup_confirmed', {
       order_id: orderId,
       deal_id: order.dealId,
@@ -2388,6 +3747,7 @@ function App() {
       confirmed_at: confirmedAt,
       neighborhood: order.neighborhood || order.deal?.neighborhood,
     });
+    return confirmedOrder;
   };
 
   const confirmManualPayment = async (orderId, direction = 'next') => {
@@ -2417,6 +3777,7 @@ function App() {
   };
 
   const toggleFavorite = (deal) => {
+    assertCurrentCustomerMutationAllowed();
     setFavoriteIds((current) => {
       const active = current.includes(deal.id);
       const next = active ? current.filter((id) => id !== deal.id) : [deal.id, ...current];
@@ -2426,7 +3787,51 @@ function App() {
     });
   };
 
+  const persistCustomerOrderSnapshot = (order) => {
+    if (!order?.id) return;
+    setOrders((current) => {
+      const next = mergeCustomerOrderCollections(current, [order]);
+      saveJson(CUSTOMER_ORDERS_KEY, next);
+      return next;
+    });
+    const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+    fingerprints[order.id] = orderSyncFingerprint(order);
+    saveJson(CUSTOMER_ORDER_SYNCED_KEY, fingerprints);
+    updateOrderSyncIssue(order.id);
+  };
+
+  const ensurePaymentOrderSaved = async (groupId, actorId) => {
+    const profilePhone = normalizePhone(profile?.phone);
+    const assertSameCustomer = () => {
+      assertCurrentCustomerMutationAllowed();
+      if (!profilePhone || customerHistoryScopeRef.current !== profilePhone
+        || actorId !== getVisitorId()) throw new Error('forbidden');
+    };
+    assertSameCustomer();
+    await ensureGroupPaymentOrderSaved({
+      groupId, actorId,
+      readLocalOrders: loadOrders,
+      readFingerprints: () => loadJson(CUSTOMER_ORDER_SYNCED_KEY, {}),
+      readSyncIssues: () => loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {}),
+      fetchOrders: async () => {
+        assertSameCustomer();
+        const result = await fetchCustomerOrders(profilePhone, { strict: true, groupId });
+        assertSameCustomer();
+        return result;
+      },
+      publishOrder: async (order) => {
+        assertSameCustomer();
+        const result = await publishCustomerOrder(order, { throwOnError: true });
+        assertSameCustomer();
+        return result;
+      },
+      persistOrder: (order) => { assertSameCustomer(); persistCustomerOrderSnapshot(order); },
+    });
+    assertSameCustomer();
+  };
+
   const applyHost = async (deal) => {
+    assertCurrentCustomerMutationAllowed();
     const properties = { deal_id: deal.id, method: deal.methods?.join(', ') };
     track('host_apply_clicked', properties);
     if (isGroupBackedDeal(deal)) {
@@ -2435,6 +3840,7 @@ function App() {
         deal,
         actorId,
       });
+      if (result?.order) persistCustomerOrderSnapshot(result.order);
       const group = result?.snapshot?.group || {};
       const updatedDeal = {
         ...deal,
@@ -2464,17 +3870,18 @@ function App() {
     track('host_apply_completed', properties);
   };
 
-  const customerProfile = ownerPreviewMode
+  const customerProfile = customerReadOnly
     ? {
       ...(profile || {}),
       name: profile?.name || '사장님 미리보기',
-      ...previewLocation,
+      ...(ownerPreviewMode ? previewLocation : ownerLocation),
       testerType: '사장님',
       consent: true,
     }
     : profile?.testerType === '사장님'
       ? { ...profile, ...ownerLocation }
       : profile;
+  const activeCustomerProfile = hasActiveProfileSession ? customerProfile : null;
 
   if (route === '/') {
     return <AppLauncher onNavigate={navigateTo} />;
@@ -2501,34 +3908,50 @@ function App() {
     <main className="app individual-app">
       <section className="workspace">
         <StandaloneHeader
-          eyebrow={route === '/customer' ? '사용자 테스트' : route === '/admin' ? '운영 테스트' : '사장님 등록'}
-          title={route === '/customer' ? '사용자 앱' : route === '/admin' ? '관리자 앱' : '사장님 앱'}
+          eyebrow={route === '/customer'
+            ? customerReadOnly ? '사장님 읽기 전용' : '사용자 테스트'
+            : route === '/admin' ? '운영 테스트' : '사장님 등록'}
+          title={route === '/customer'
+            ? customerReadOnly ? '사용자 화면 미리보기' : '사용자 앱'
+            : route === '/admin' ? '관리자 앱' : '사장님 앱'}
           active={route.replace('/', '')}
           onNavigate={navigateTo}
+          customerPreview={route === '/customer' && customerReadOnly}
         />
 
         <PhoneFrame>
           {['/customer', '/admin'].includes(route) && (
-            route === '/admin' && profile?.testerType !== '관리자' ? (
-              <Onboarding onSubmit={handleProfileSubmit} defaultTesterType="관리자" lockTesterType />
+            route === '/admin' && (!hasActiveProfileSession || profile?.testerType !== '관리자') ? (
+              <Onboarding
+                key="admin-onboarding"
+                onSubmit={handleProfileSubmit}
+                defaultTesterType="관리자"
+                lockTesterType
+                initialProfile={roleProfiles['관리자'] || profile}
+              />
             ) : (
               <CustomerApp
+                key={customerAdminMode ? `admin-workspace-${adminEntryVersion}` : 'customer-workspace'}
                 deals={deals}
-                profile={route === '/admin' ? profile : customerProfile}
+                profile={route === '/admin' ? profile : activeCustomerProfile}
+                rememberedProfile={roleProfiles['사용자'] || profile}
                 orders={orders}
                 orderSyncIssues={orderSyncIssues}
+                historyStatus={customerHistoryState.scope === customerHistoryScope ? customerHistoryState.status : 'loading'}
+                onRetryHistory={retryCustomerHistory}
                 favoriteIds={favoriteIds}
                 hostDealIds={hostDealIds}
                 selectedDeal={selectedDeal}
                 screen={customerScreen}
-                adminMode={route === '/admin'}
+                adminMode={customerAdminMode}
+                readOnly={customerReadOnly}
                 unreadCounts={unreadCounts}
-                statusNotices={statusNotices}
+                statusNotices={{ ...statusNotices, ...paymentNotices }}
                 onProfileSubmit={handleProfileSubmit}
                 onSelectDeal={(deal) => {
                   acknowledgeGroupStatus(deal);
                   setSelectedDeal(deal);
-                  setCustomerScreen('detail');
+                  navigateCustomerScreen('detail');
                   track('open_listing', {
                     deal_id: deal.id,
                     category: deal.category,
@@ -2536,9 +3959,9 @@ function App() {
                     title: deal.title,
                   });
                 }}
-                onScreen={setCustomerScreen}
+                onScreen={navigateCustomerScreen}
                 onOpenNotifications={() => {
-                  setCustomerScreen('notifications');
+                  navigateCustomerScreen('notifications');
                   track('notification_center_opened', {
                     notification_count: buildGroupNotifications(deals, unreadCounts, statusNotices).length,
                   });
@@ -2549,10 +3972,19 @@ function App() {
                 onGroupCreate={createCustomerGroup}
                 onToggleFavorite={toggleFavorite}
                 onHostApply={applyHost}
-                editableDealIds={customerGroups.map((deal) => deal.id)}
+                onOrderUpdate={persistCustomerOrderSnapshot}
+                onBeforePaymentRequest={ensurePaymentOrderSaved}
+                editableDealIds={customerAdminMode || customerReadOnly
+                  ? []
+                  : customerGroups
+                    .filter((deal) => Boolean(getDealCapability(deal.id)))
+                    .map((deal) => deal.id)}
                 onUpdateDeal={updateCustomerDeal}
                 onUpdateTarget={updateCustomerGroupTarget}
-                onDeleteDeal={removeDeal}
+                onDeleteDeal={async (deal) => {
+                  assertCurrentCustomerMutationAllowed();
+                  return removeDeal(deal);
+                }}
                 onConfirmPickup={confirmCustomerPickup}
                 onCancelParticipation={cancelParticipation}
                 onNeighborhoodChange={handleNeighborhoodChange}
@@ -2560,14 +3992,22 @@ function App() {
               />
             )
           )}
-          {route === '/owner' && (profile?.testerType !== '사장님' ? (
-            <Onboarding onSubmit={handleProfileSubmit} defaultTesterType="사장님" lockTesterType />
+          {route === '/owner' && (!hasActiveProfileSession || profile?.testerType !== '사장님' ? (
+            <Onboarding
+              key="owner-onboarding"
+              onSubmit={handleProfileSubmit}
+              defaultTesterType="사장님"
+              lockTesterType
+              initialProfile={rememberedOwnerProfile}
+            />
           ) : (
             <OwnerApp
               key={activeOwnerScope}
               screen={ownerWorkspaceScope === activeOwnerScope ? ownerScreen : 'form'}
               selectedDeal={selectedDeal}
               deals={deals}
+              centralDeals={remoteDeals}
+              syncIssues={publicDealSyncIssues}
               onScreen={setOwnerScreen}
               onCreate={addOwnerDeal}
               createdDeals={scopedCreatedDeals}
@@ -2578,7 +4018,14 @@ function App() {
               ownerRecoveryCount={ownerRecoveryCandidates.length}
               ownerRecoveryBusy={ownerRecoveryBusy}
               ownerRecoveryError={ownerRecoveryError}
+              workspaceStatus={ownerWorkspaceStatus}
+              onRetryWorkspace={() => setOwnerRecoveryLookupVersion((value) => value + 1)}
+              ownerAccountHint={ownerAccountHint}
               onRecoverOwnerProducts={handleOwnerRecoveryAction}
+              onSwitchOwnerAccount={switchToStoredOwnerProfile}
+              ownerBackupStatus={ownerBackupStatus}
+              onExportOwnerBackup={exportOwnerManagementBackup}
+              onImportOwnerBackup={importOwnerManagementBackup}
               onOrderStatusChange={updateOrderStatus}
               onPaymentConfirm={confirmManualPayment}
               onPreviewCustomer={openOwnerCustomerPreview}
@@ -2645,9 +4092,14 @@ function AppLauncher({ onNavigate }) {
   );
 }
 
-function StandaloneHeader({ eyebrow, title, active, onNavigate }) {
+function StandaloneHeader({ eyebrow, title, active, onNavigate, customerPreview = false }) {
   const links = [
-    { id: 'customer', label: '사용자 앱', path: '/customer', icon: Users },
+    {
+      id: 'customer',
+      label: customerPreview ? '사용자 미리보기' : '사용자 앱',
+      path: '/customer',
+      icon: Users,
+    },
     { id: 'owner', label: '사장님 앱', path: '/owner', icon: Store },
     { id: 'admin', label: '관리자 앱', path: '/admin', icon: ShieldCheck },
     { id: 'dashboard', label: '대시보드', path: '/dashboard', icon: BarChart3 },
@@ -2697,16 +4149,32 @@ function StatusBar() {
   );
 }
 
+function CustomerPreviewNotice() {
+  return (
+    <aside className="customer-preview-notice" role="status">
+      <ShieldCheck size={18} aria-hidden="true" />
+      <div>
+        <strong>사장님 계정의 사용자 화면 미리보기</strong>
+        <span>읽기 전용이라 홈·탐색·계산만 표시됩니다. 사용자 로그인에서는 전체 6개 메뉴를 이용할 수 있습니다.</span>
+      </div>
+    </aside>
+  );
+}
+
 function CustomerApp({
   deals,
   profile,
+  rememberedProfile,
   orders,
   orderSyncIssues = {},
+  historyStatus = 'ready',
+  onRetryHistory,
   favoriteIds,
   hostDealIds,
   selectedDeal,
   screen,
   adminMode = false,
+  readOnly = false,
   unreadCounts = {},
   statusNotices = {},
   onProfileSubmit,
@@ -2719,6 +4187,8 @@ function CustomerApp({
   onGroupCreate,
   onToggleFavorite,
   onHostApply,
+  onOrderUpdate,
+  onBeforePaymentRequest,
   editableDealIds,
   onUpdateDeal,
   onUpdateTarget,
@@ -2728,151 +4198,254 @@ function CustomerApp({
   onNeighborhoodChange,
   onLogout,
 }) {
-  const visitorId = profile ? getVisitorId() : null;
-  const neighborhoodDeals = deals.filter(
-    (deal) => deal.visibility === 'public' || !deal.neighborhood || sameLocation(deal, profile),
+  const [completionMessage, setCompletionMessage] = useState('');
+  const [adminConsolePin, setAdminConsolePin] = useState('');
+  const [adminManagement, setAdminManagement] = useState(adminMode);
+  const accessOptions = { adminMode, readOnly };
+  const visitorId = profile ? getVisitorId() : '';
+  const selectedGroupCredential = visitorId && selectedDeal?.id
+    ? getGroupCredential(selectedDeal.id, visitorId)
+    : null;
+  const selectedGroupOwnerCapability = selectedDeal?.source === 'customer'
+    && editableDealIds.includes(selectedDeal.id)
+    ? getDealCapability(selectedDeal.id)
+    : '';
+  const selectedGroupIsLocalCreator = Boolean(
+    selectedDeal?.source === 'customer'
+    && editableDealIds.includes(selectedDeal.id)
+    && selectedGroupOwnerCapability
+    && selectedGroupCredential?.capabilityToken
+    && String(selectedGroupCredential.capabilityToken).length >= 32,
   );
+  const selectedGroupLegacyReceipt = selectedDeal?.source === 'customer' && visitorId
+    ? loadLegacyCustomerGroupReceipt({ groupId: selectedDeal.id, actorId: visitorId })
+    : null;
+  const selectedGroupCanRecoverLegacy = Boolean(
+    !adminMode
+    && !readOnly
+    && selectedGroupLegacyReceipt?.eventId
+    && hasLegacyCustomerGroupRecoveryState(selectedDeal, visitorId),
+  );
+  const selectedGroupCanRestore = selectedGroupIsLocalCreator || selectedGroupCanRecoverLegacy;
+  const requestedScreen = normalizeCustomerScreen(screen, accessOptions);
+  const activeScreen = requestedScreen === 'room' && !(
+    dealHasGroupRoom(selectedDeal)
+    && customerCanOpenGroupRoom({
+      adminMode,
+      readOnly,
+      credential: selectedGroupCredential,
+      localCreator: selectedGroupCanRestore,
+    })
+  )
+    ? 'detail'
+    : requestedScreen;
+  const navigateCustomer = (nextScreen, options) => onScreen(
+    normalizeCustomerScreen(nextScreen, accessOptions),
+    options,
+  );
+  const navigateCustomerBack = (fallbackScreen) => navigateCustomer(
+    fallbackScreen,
+    { historyAction: 'back' },
+  );
+  const publicDeals = deals.filter((deal) => deal.visibility !== 'private');
   const customerOrders = orders.filter(
     (order) => isOrderForProfile(order, profile, visitorId),
   );
 
-  if (!profile || screen === 'onboarding') {
-    return <Onboarding onSubmit={onProfileSubmit} />;
+  if (!profile || activeScreen === 'onboarding') {
+    return (
+      <Onboarding
+        onSubmit={onProfileSubmit}
+        initialProfile={rememberedProfile}
+        defaultTesterType="사용자"
+        lockTesterType
+      />
+    );
   }
 
-  if (screen === 'detail') {
+  if (adminMode && adminManagement) {
+    const roomOpen = activeScreen === 'room';
+    return <>
+      <div hidden={roomOpen} style={{ height: '100%' }}>
+        <AdminConsole pin={adminConsolePin} onPinChange={setAdminConsolePin}
+          onBack={() => { setAdminManagement(false); onScreen('list'); }} ImageUploader={ImageCropUploader}
+          onOpenRoom={(deal) => { onSelectDeal(deal); onScreen('room'); }} />
+      </div>
+      {roomOpen && <GroupRoom
+        deal={selectedDeal} profile={profile} adminMode initialAdminPin={adminConsolePin}
+        isCreator={selectedGroupIsLocalCreator} ownerCapabilityToken={selectedGroupOwnerCapability}
+        onBack={() => navigateCustomerBack('list')} onDealUpdate={onUpdateDeal} onRead={onRoomRead}
+        orders={customerOrders} onOrderUpdate={onOrderUpdate} onCancelParticipation={onCancelParticipation}
+        onBeforePaymentRequest={onBeforePaymentRequest}
+        withBottomNavigation={false}
+      />}
+    </>;
+  }
+
+  const renderCustomerScreen = () => {
+  if (activeScreen === 'detail') {
     return (
       <DealDetail
         deal={selectedDeal}
-        onBack={() => onScreen('list')}
-        onScreen={onScreen}
+        onBack={() => navigateCustomerBack('list')}
+        onScreen={navigateCustomer}
         isFavorite={favoriteIds.includes(selectedDeal.id)}
         onToggleFavorite={onToggleFavorite}
         hostMatched={isDealHostMatched(selectedDeal, hostDealIds)}
         onHostApply={onHostApply}
         editable={editableDealIds.includes(selectedDeal.id)}
+        canRepairLegacyGroup={selectedGroupCanRestore}
         onUpdateDeal={onUpdateDeal}
         onUpdateTarget={onUpdateTarget}
         onDeleteDeal={async (deal) => {
-          await onDeleteDeal(deal);
-          onScreen('list');
+          const deleted = await onDeleteDeal(deal);
+          if (shouldNavigateAfterDealDelete(deleted)) onScreen('list');
+          return deleted;
         }}
         adminMode={adminMode}
+        readOnly={readOnly}
         unreadCount={unreadCounts[selectedDeal.id] || 0}
         onOpenRoom={() => onScreen('room')}
       />
     );
   }
 
-  if (screen === 'room') {
+  if (activeScreen === 'room') {
+    const showBottomNavigation = !adminMode && !readOnly;
     return (
-      <GroupRoom
-        deal={selectedDeal}
-        profile={profile}
-        adminMode={adminMode}
-        isCreator={editableDealIds.includes(selectedDeal.id)}
-        onBack={() => onScreen('detail')}
-        onDealUpdate={onUpdateDeal}
-        onRead={onRoomRead}
-      />
+      <>
+        <GroupRoom
+          deal={selectedDeal}
+          profile={profile}
+          adminMode={adminMode}
+          initialAdminPin={adminConsolePin}
+          isCreator={selectedGroupIsLocalCreator}
+          ownerCapabilityToken={selectedGroupOwnerCapability}
+          canRecoverLegacyGroup={selectedGroupCanRecoverLegacy}
+          legacyEventId={selectedGroupLegacyReceipt?.eventId || ''}
+          onBack={() => navigateCustomerBack('detail')}
+          onDealUpdate={onUpdateDeal}
+          onRead={onRoomRead}
+          orders={customerOrders}
+          onOrderUpdate={onOrderUpdate}
+          onBeforePaymentRequest={onBeforePaymentRequest}
+          onCancelParticipation={onCancelParticipation}
+          withBottomNavigation={showBottomNavigation}
+        />
+        {showBottomNavigation ? <BottomNav active="" onSelect={navigateCustomer} /> : null}
+      </>
     );
   }
 
-  if (screen === 'notifications') {
+  if (activeScreen === 'notifications') {
     return (
       <NotificationsTab
         notifications={buildGroupNotifications(deals, unreadCounts, statusNotices)}
-        onBack={() => onScreen('list')}
+        onBack={() => navigateCustomerBack('list')}
         onOpen={onOpenNotification}
       />
     );
   }
 
-  if (screen === 'calculator') {
+  if (activeScreen === 'calculator') {
     return (
-      <SplitCalculator
-        initialTotal={selectedDeal?.simulation?.total || 39000}
-        initialPeople={selectedDeal?.simulation?.people || 3}
-        initialProductQuantity={selectedDeal?.simulation?.totalQuantity || selectedDeal?.simulation?.productQuantity || 3}
-        initialSelectedQuantity={selectedDeal?.simulation?.creatorQuantity || selectedDeal?.simulation?.creatorProductQuantity || 1}
-        onBack={() => onScreen('list')}
-        onCreateGroup={(simulation) => {
-          onSelectDeal({
-            ...NEW_CUSTOMER_GROUP_DEAL,
-            originalPrice: simulation.total,
-            target: simulation.people,
-            targetPeople: simulation.people,
-            totalQuantity: simulation.totalQuantity || simulation.productQuantity,
-            creatorQuantity: simulation.creatorQuantity || simulation.creatorProductQuantity,
-            simulation,
-          });
-          onScreen('group');
-        }}
-      />
+      <>
+        <SplitCalculator
+          initialTotal={selectedDeal?.simulation?.total || 39000}
+          initialPeople={selectedDeal?.simulation?.people || 3}
+          initialProductQuantity={selectedDeal?.simulation?.totalQuantity || selectedDeal?.simulation?.productQuantity || 3}
+          initialSelectedQuantity={selectedDeal?.simulation?.creatorQuantity || selectedDeal?.simulation?.creatorProductQuantity || 1}
+          onBack={() => navigateCustomerBack('list')}
+          readOnly={readOnly}
+          onCreateGroup={(simulation) => {
+            onSelectDeal({
+              ...NEW_CUSTOMER_GROUP_DEAL,
+              originalPrice: simulation.total,
+              target: simulation.people,
+              targetPeople: simulation.people,
+              totalQuantity: simulation.totalQuantity || simulation.productQuantity,
+              creatorQuantity: simulation.creatorQuantity || simulation.creatorProductQuantity,
+              simulation,
+            });
+            navigateCustomer('group');
+          }}
+        />
+        <BottomNav active="calculator" onSelect={navigateCustomer} readOnly={readOnly} />
+      </>
     );
   }
 
-  if (screen === 'join') {
+  if (activeScreen === 'join') {
     return (
       <JoinFlow
         deal={selectedDeal}
         orders={customerOrders}
-        onBack={() => onScreen('detail')}
-        onScreen={onScreen}
+        onBack={() => navigateCustomerBack('detail')}
+        onScreen={navigateCustomer}
         onOrderCreate={onOrderCreate}
-        onGroupCreate={onGroupCreate}
+        onHostApply={onHostApply}
+        onCompletionMessage={setCompletionMessage}
       />
     );
   }
 
-  if (screen === 'group') {
+  if (activeScreen === 'group') {
     return (
       <GroupCreator
         deal={selectedDeal}
-        onBack={() => onScreen(selectedDeal.isNewGroup ? 'explore' : 'detail')}
-        onScreen={onScreen}
+        onBack={() => navigateCustomerBack(selectedDeal.isNewGroup ? 'explore' : 'detail')}
+        onScreen={navigateCustomer}
         onOrderCreate={onOrderCreate}
         onGroupCreate={onGroupCreate}
       />
     );
   }
 
-  if (screen === 'complete') {
-    return <Completion deal={selectedDeal} onScreen={onScreen} />;
+  if (activeScreen === 'complete') {
+    return (
+      <Completion
+        deal={selectedDeal}
+        message={completionMessage}
+        onScreen={navigateCustomer}
+      />
+    );
   }
 
-  if (screen === 'survey') {
-    return <Survey onScreen={onScreen} />;
+  if (activeScreen === 'survey') {
+    return <Survey onScreen={navigateCustomer} />;
   }
 
-  if (screen === 'explore') {
+  if (activeScreen === 'explore') {
     return (
       <ExploreTab
-        deals={neighborhoodDeals}
+        deals={publicDeals}
         hostDealIds={hostDealIds}
         unreadCounts={unreadCounts}
         statusNotices={statusNotices}
         onSelectDeal={onSelectDeal}
-        onScreen={onScreen}
+        onScreen={navigateCustomer}
+        readOnly={readOnly}
       />
     );
   }
 
-  if (screen === 'orders') {
+  if (activeScreen === 'orders') {
     return (
       <OrdersTab
         orders={customerOrders}
         orderSyncIssues={orderSyncIssues}
+        historyStatus={historyStatus}
+        onRetryHistory={onRetryHistory}
         deals={deals}
         onSelectDeal={onSelectDeal}
         onConfirmPickup={onConfirmPickup}
         onCancelParticipation={onCancelParticipation}
-        onScreen={onScreen}
+        onScreen={navigateCustomer}
       />
     );
   }
 
-  if (screen === 'favorites') {
+  if (activeScreen === 'favorites') {
     return (
       <FavoritesTab
         favoriteDeals={deals.filter((deal) => favoriteIds.includes(deal.id))}
@@ -2880,53 +4453,90 @@ function CustomerApp({
         unreadCounts={unreadCounts}
         statusNotices={statusNotices}
         onSelectDeal={onSelectDeal}
-        onScreen={onScreen}
+        onScreen={navigateCustomer}
       />
     );
   }
 
-  if (screen === 'profile') {
+  if (activeScreen === 'profile') {
     return (
       <ProfileTab
         profile={profile}
         orders={customerOrders}
         favoriteCount={favoriteIds.length}
-        onScreen={onScreen}
+        onScreen={navigateCustomer}
         onLogout={onLogout}
       />
     );
   }
 
   return (
+    <div className="customer-browser-wrapper" style={adminMode ? { height: 'auto', flex: 1, minHeight: 0 } : undefined}>
     <DealList
-      deals={neighborhoodDeals}
+      deals={publicDeals}
       profile={profile}
       hostDealIds={hostDealIds}
       unreadCounts={unreadCounts}
       statusNotices={statusNotices}
       onSelectDeal={onSelectDeal}
-      onScreen={onScreen}
+      onScreen={navigateCustomer}
       onOpenNotifications={onOpenNotifications}
       onNeighborhoodChange={onNeighborhoodChange}
+      adminMode={adminMode}
+      readOnly={readOnly}
     />
+    </div>
   );
+  };
+
+  return adminMode ? <div className="admin-browser-wrapper">
+    <button className="primary-button" onClick={() => { setAdminManagement(true); onScreen('list'); }}>상품·주문 관리자 운영 관리</button>
+    {renderCustomerScreen()}
+  </div> : renderCustomerScreen();
 }
 
-function Onboarding({ onSubmit, defaultTesterType = '사용자', lockTesterType = false }) {
+function Onboarding({
+  onSubmit,
+  defaultTesterType = '사용자',
+  lockTesterType = false,
+  initialProfile = null,
+}) {
   useScreenAnalytics('onboarding');
-  const [form, setForm] = useState({
-    name: '',
-    phone: '',
-    ...DEFAULT_LOCATION,
-    testerType: defaultTesterType,
-    consent: false,
+  const screenRef = useRef(null);
+  const [form, setForm] = useState(() => {
+    const rememberedProfile = initialProfile ? migrateLocationFields(initialProfile) : null;
+    return {
+      name: String(rememberedProfile?.name || ''),
+      phone: formatKoreanMobilePhoneInput(rememberedProfile?.phone || ''),
+      ...normalizeLocation(rememberedProfile || DEFAULT_LOCATION),
+      testerType: lockTesterType
+        ? defaultTesterType
+        : rememberedProfile?.testerType || defaultTesterType,
+      consent: rememberedProfile?.consent === true,
+    };
   });
   const selectedRegion = getRegion(form.region);
   const selectedDistrict = getDistrict(selectedRegion, form.district);
-  const disabled = !form.name.trim() || !form.phone.trim() || !form.consent;
+  const phoneValid = isValidKoreanMobilePhone(form.phone);
+  const phoneErrorVisible = Boolean(form.phone) && !phoneValid;
+  const disabled = !form.name.trim() || !phoneValid || !form.consent;
+
+  useLayoutEffect(() => {
+    const resetScroll = () => {
+      if (screenRef.current) screenRef.current.scrollTop = 0;
+      window.scrollTo?.(0, 0);
+    };
+    resetScroll();
+    const frame = window.requestAnimationFrame(resetScroll);
+    window.addEventListener('pageshow', resetScroll);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener('pageshow', resetScroll);
+    };
+  }, [defaultTesterType]);
 
   return (
-    <section className="screen onboarding-screen">
+    <section ref={screenRef} className="screen onboarding-screen">
       <div className="brand-block">
         <ShoppingBag size={30} />
         <p className="eyebrow">위치기반 공동구매</p>
@@ -2938,7 +4548,11 @@ function Onboarding({ onSubmit, defaultTesterType = '사용자', lockTesterType 
         className="form-stack"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!disabled) onSubmit({ ...form, name: form.name.trim(), phone: form.phone.trim() });
+          if (!disabled) onSubmit({
+            ...form,
+            name: form.name.trim(),
+            phone: formatKoreanMobilePhoneInput(form.phone),
+          });
         }}
       >
         <label>
@@ -2952,11 +4566,21 @@ function Onboarding({ onSubmit, defaultTesterType = '사용자', lockTesterType 
         <label>
           연락처
           <input
+            type="tel"
             value={form.phone}
-            onChange={(event) => setForm({ ...form, phone: event.target.value })}
+            onChange={(event) => setForm({ ...form, phone: formatKoreanMobilePhoneInput(event.target.value) })}
             placeholder="010-0000-0000"
             inputMode="tel"
+            autoComplete="tel"
+            maxLength={24}
+            aria-invalid={phoneErrorVisible}
+            aria-describedby={phoneErrorVisible ? 'onboarding-phone-error' : undefined}
           />
+          {phoneErrorVisible && (
+            <span id="onboarding-phone-error" className="form-error" role="alert">
+              {KOREAN_MOBILE_PHONE_ERROR}
+            </span>
+          )}
         </label>
         <div className="region-neighborhood-fields">
           <label>
@@ -3005,10 +4629,20 @@ function Onboarding({ onSubmit, defaultTesterType = '사용자', lockTesterType 
         </div>
         {lockTesterType ? (
           <div className="neighborhood-link-preview">
-            {defaultTesterType === '관리자' ? <ShieldCheck size={18} /> : <Store size={18} />}
+            {defaultTesterType === '관리자'
+              ? <ShieldCheck size={18} />
+              : defaultTesterType === '사장님'
+                ? <Store size={18} />
+                : <User size={18} />}
             <div>
               <strong>{defaultTesterType} 테스트 계정 등록</strong>
-              <span>{defaultTesterType === '관리자' ? '관리자 PIN은 그룹 입장 시 별도로 확인합니다.' : '입력한 정보로 상품과 주문을 구분합니다.'}</span>
+              <span>
+                {defaultTesterType === '관리자'
+                  ? '관리자 PIN은 그룹 입장 시 별도로 확인합니다.'
+                  : defaultTesterType === '사장님'
+                    ? '입력한 정보로 상품과 주문을 구분합니다.'
+                    : '입력한 정보로 참여 내역과 주문을 구분합니다.'}
+              </span>
             </div>
           </div>
         ) : (
@@ -3040,7 +4674,7 @@ function Onboarding({ onSubmit, defaultTesterType = '사용자', lockTesterType 
           <MapPin size={18} />
           <div>
             <strong>{formatLocation(form)} 화면으로 연결</strong>
-            <span>같은 동네의 사장님 상품과 주문 상태만 표시됩니다.</span>
+            <span>지역은 픽업 안내와 이용 통계에 사용되며, 공개 상품은 전국에서 확인할 수 있습니다.</span>
           </div>
         </div>
         <button className="primary-button" type="submit" disabled={disabled}>
@@ -3052,7 +4686,19 @@ function Onboarding({ onSubmit, defaultTesterType = '사용자', lockTesterType 
   );
 }
 
-function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotices = {}, onSelectDeal, onScreen, onOpenNotifications, onNeighborhoodChange }) {
+function DealList({
+  deals,
+  profile,
+  hostDealIds,
+  unreadCounts = {},
+  statusNotices = {},
+  onSelectDeal,
+  onScreen,
+  onOpenNotifications,
+  onNeighborhoodChange,
+  adminMode = false,
+  readOnly = false,
+}) {
   useScreenAnalytics('deal_list', {
     region: profile.region,
     district: profile.district,
@@ -3094,10 +4740,12 @@ function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotice
           </button>
         </div>
         <div className="inline-actions">
-          <button className="icon-button" aria-label="예상 부담금 계산기" onClick={() => onScreen('calculator')}>
-            <Calculator size={20} />
-          </button>
-          {RELEASE_FEATURES.unreadBadges && (
+          {!adminMode && (
+            <button className="icon-button" aria-label="예상 부담금 계산기" onClick={() => onScreen('calculator')}>
+              <Calculator size={20} />
+            </button>
+          )}
+          {RELEASE_FEATURES.unreadBadges && !readOnly && (
             <button
               className="icon-button notification-button"
               aria-label={`그룹 알림 ${totalUnread + totalStatusNotices}건`}
@@ -3112,11 +4760,13 @@ function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotice
         </div>
       </header>
 
+      {readOnly && <CustomerPreviewNotice />}
+
       <div className="neighborhood-sync-banner">
         <MapPin size={16} />
         <div>
-          <strong>{profile.neighborhood} 동네 연동 중</strong>
-          <span>동네 상품과 전체 공개 테스트 상품을 함께 표시합니다.</span>
+          <strong>{profile.neighborhood} 픽업 기준 지역</strong>
+          <span>지역과 관계없이 모든 공개 테스트 상품을 표시합니다.</span>
         </div>
       </div>
 
@@ -3125,11 +4775,13 @@ function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotice
         <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="매장 또는 상품 검색" />
       </div>
 
-      <button className="calculator-entry-card" onClick={() => onScreen('calculator')}>
-        <Calculator size={22} />
-        <div><strong>나눠 사면 1인당 얼마일까요?</strong><span>그룹 참여 없이 판매가와 인원만으로 바로 계산</span></div>
-        <ChevronRight size={18} />
-      </button>
+      {!adminMode && (
+        <button className="calculator-entry-card" onClick={() => onScreen('calculator')}>
+          <Calculator size={22} />
+          <div><strong>나눠 사면 1인당 얼마일까요?</strong><span>그룹 참여 없이 판매가와 인원만으로 바로 계산</span></div>
+          <ChevronRight size={18} />
+        </button>
+      )}
 
       <div className="source-filter">
         {[
@@ -3170,8 +4822,8 @@ function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotice
         {filtered.length === 0 && (
           <div className="inline-empty-state">
             <MapPin size={26} />
-            <strong>{profile.neighborhood}에 표시할 공동구매가 없어요</strong>
-            <span>다른 지역을 선택하거나 첫 그룹을 만들어보세요.</span>
+            <strong>현재 공개된 공동구매가 없어요</strong>
+            <span>첫 그룹을 만들어 공개 모집을 시작해 보세요.</span>
           </div>
         )}
         {filtered.map((deal) => (
@@ -3186,7 +4838,7 @@ function DealList({ deals, profile, hostDealIds, unreadCounts = {}, statusNotice
         ))}
       </div>
 
-      <BottomNav active="home" onSelect={onScreen} />
+      <BottomNav active="home" onSelect={onScreen} adminMode={adminMode} readOnly={readOnly} />
       {selectingNeighborhood && (
         <NeighborhoodPicker
           current={profile}
@@ -3235,7 +4887,7 @@ function NotificationsTab({ notifications, onBack, onOpen }) {
               <div>
                 <strong>{deal.title}</strong>
                 {unreadCount > 0 && <span>확인하지 않은 새 메시지 {unreadCount}개</span>}
-                {status && <span>거래 상태 · {GROUP_STATUS_LABELS[status] || status}</span>}
+                {status && <span>{status.startsWith('입금 알림') ? status : `거래 상태 · ${GROUP_STATUS_LABELS[status] || status}`}</span>}
               </div>
               <ChevronRight size={18} />
             </button>
@@ -3252,12 +4904,12 @@ function NeighborhoodPicker({ current, onSelect, onClose }) {
   const selectedDistrict = getDistrict(selectedRegion, location.district);
 
   return (
-    <div className="sheet-backdrop" role="dialog" aria-modal="true">
+    <div className="sheet-backdrop" role="dialog" aria-modal="true" aria-labelledby="neighborhood-picker-title">
       <div className="bottom-sheet neighborhood-sheet">
         <div className="sheet-header">
           <div>
-            <p className="eyebrow">지역별 공동구매</p>
-            <h2>지역 설정</h2>
+            <p className="eyebrow">픽업·통계 기준</p>
+            <h2 id="neighborhood-picker-title">지역 설정</h2>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="닫기">
             <X size={20} />
@@ -3311,7 +4963,7 @@ function NeighborhoodPicker({ current, onSelect, onClose }) {
           <MapPin size={17} />
           {location.neighborhood} 적용
         </button>
-        <p className="neighborhood-help">같은 동네로 설정된 사장님 상품, 사용자 그룹, 주문 상태만 서로 연결됩니다.</p>
+        <p className="neighborhood-help">지역은 픽업 위치 안내와 이용 통계에 사용되며, 공개 상품과 그룹의 노출을 제한하지 않습니다.</p>
       </div>
     </div>
   );
@@ -3327,7 +4979,11 @@ function DealCard({ deal, hostMatched, unreadCount = 0, statusNotice = '', onCli
 
   return (
     <button className="deal-card" onClick={onClick}>
-      <img src={deal.image} alt="" />
+      <img
+        src={deal.image || fallbackImage}
+        alt={`${deal.title} 상품 이미지`}
+        onError={replaceBrokenImage}
+      />
       <div className="deal-content">
         <div className="deal-title-row">
           <strong>{deal.title}</strong>
@@ -3371,7 +5027,7 @@ function DealCard({ deal, hostMatched, unreadCount = 0, statusNotice = '', onCli
   );
 }
 
-function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {}, onSelectDeal, onScreen }) {
+function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {}, onSelectDeal, onScreen, readOnly = false }) {
   useScreenAnalytics('customer_explore');
   const urgentDeals = [...deals].sort((a, b) => b.discountRate - a.discountRate);
 
@@ -3382,22 +5038,26 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
           <p className="eyebrow">탐색</p>
           <h1>지금 모이는 공구</h1>
         </div>
-        <button
-          className="icon-button"
-          aria-label="그룹 만들기"
-          onClick={() => {
-            track('bottom_tab_action_clicked', { action: 'create_group' });
-            onSelectDeal(NEW_CUSTOMER_GROUP_DEAL);
-            onScreen('group');
-          }}
-        >
-          <Plus size={20} />
-        </button>
+        {!readOnly && (
+          <button
+            className="icon-button"
+            aria-label="그룹 만들기"
+            onClick={() => {
+              track('bottom_tab_action_clicked', { action: 'create_group' });
+              onSelectDeal(NEW_CUSTOMER_GROUP_DEAL);
+              onScreen('group');
+            }}
+          >
+            <Plus size={20} />
+          </button>
+        )}
       </header>
+
+      {readOnly && <CustomerPreviewNotice />}
 
       <div className="insight-strip">
         <div>
-          <span>근처 진행중</span>
+          <span>공개 진행중</span>
           <strong>{deals.length}개</strong>
         </div>
         <div>
@@ -3419,7 +5079,7 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
         {deals.length === 0 && (
           <div className="inline-empty-state">
             <MapPin size={26} />
-            <strong>이 지역에 진행 중인 공구가 없어요</strong>
+            <strong>현재 공개된 공구가 없어요</strong>
           </div>
         )}
         {urgentDeals.map((deal) => (
@@ -3434,19 +5094,54 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
         ))}
       </div>
 
-      <BottomNav active="explore" onSelect={onScreen} />
+      <BottomNav active="explore" onSelect={onScreen} readOnly={readOnly} />
     </section>
   );
 }
 
-function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfirmPickup, onCancelParticipation, onScreen }) {
+function CustomerHistoryNotice({ status, onRetry }) {
+  return (
+    <div className={`customer-history-notice${status === 'error' ? ' has-error' : ''}`} aria-live="polite">
+      {status === 'loading' ? <p role="status">이전 주문·참여 이력을 확인하고 있습니다.</p>
+        : status === 'error' ? <p role="alert">이전 이력을 불러오지 못했습니다. 현재 표시된 목록은 유지되며, 이전 주문이 없는 것으로 확정된 것은 아닙니다.</p>
+          : <p>조회 가능한 주문 이력을 확인했습니다.</p>}
+      <button type="button" className="secondary-button compact-button" disabled={status === 'loading'} onClick={onRetry}>
+        {status === 'loading' ? '이력 확인 중…' : '주문 이력 다시 불러오기'}
+      </button>
+      <details>
+        <summary>이전 주문이 보이지 않나요?</summary>
+        <p>이 브라우저와 현재 프로필에서 조회 권한이 확인된 이력만 표시합니다. 주문했던 같은 브라우저와 전화번호인지 확인해 주세요. 이전 주문의 권한키가 없거나 연결되지 않은 기록은 여기서 자동 복구할 수 없습니다. 브라우저 데이터를 지우지 말고 관리자에게 해당 주문 확인을 요청해 주세요.</p>
+      </details>
+    </div>
+  );
+}
+
+function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRetryHistory, deals, onSelectDeal, onConfirmPickup, onCancelParticipation, onScreen }) {
   useScreenAnalytics('customer_orders', { order_count: orders.length });
   const dealById = new Map(deals.map((deal) => [deal.id, deal]));
   const [cancellingId, setCancellingId] = useState('');
   const [cancelError, setCancelError] = useState(null);
+  const [confirmingPickupId, setConfirmingPickupId] = useState('');
+  const [pickupError, setPickupError] = useState(null);
+
+  const handlePickupConfirmation = async (order) => {
+    if (confirmingPickupId) return;
+    setConfirmingPickupId(order.id);
+    setPickupError(null);
+    try {
+      await onConfirmPickup(order.id);
+    } catch {
+      setPickupError({
+        orderId: order.id,
+        message: '픽업 완료를 서버에 반영하지 못했습니다. 연결을 확인한 뒤 다시 눌러 주세요.',
+      });
+    } finally {
+      setConfirmingPickupId('');
+    }
+  };
 
   const handleCancellation = async (order, deal) => {
-    if (cancellingId) return;
+    if (!SCOPED_UI_ACTIONS.participationCancellation || cancellingId) return;
     const confirmed = window.confirm(
       `“${deal?.title || order.title}” 참여를 취소할까요?\n배정된 수량이 다시 모집 가능 수량으로 돌아갑니다.`,
     );
@@ -3481,27 +5176,38 @@ function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfir
         <ShoppingBag size={22} />
       </header>
 
-      {orders.length === 0 ? (
+      <CustomerHistoryNotice status={historyStatus} onRetry={onRetryHistory} />
+      {orders.length === 0 && historyStatus === 'ready' ? (
         <EmptyCustomerState
           icon={ShoppingBag}
-          title="아직 참여 내역이 없습니다"
-          body="공동구매에 참여하면 마감 시간과 수령 방식이 여기에 저장됩니다."
+          title="조회 가능한 참여 내역이 없습니다"
+          body="현재 브라우저에서 확인할 수 있는 기록이 없습니다. 이전 주문이 있었다면 위 안내를 확인해 주세요."
           actionLabel="공구 보러가기"
           onAction={() => onScreen('list')}
         />
       ) : (
         <div className="order-card-list">
           {orders.map((order) => {
-            const deal = dealById.get(order.dealId) || order.deal;
+            const deal = resolveOrderLinkedDeal(order, dealById.get(order.dealId));
             const syncIssue = orderSyncIssues[order.id] || null;
             const cancelled = isCancelledOrder(order);
             const orderStage = getOrderStage(order);
             const paymentStatus = getOrderPaymentStatus(order);
+            const paymentStatusLabel = paymentStatus === 'confirmed'
+              ? '입금완료'
+              : paymentStatus === 'requested' ? '입금확인요청 전송 완료' : '입금대기';
+            const paymentHistoryUnconfirmed = historyStatus !== 'ready';
+            const paymentNeedsRepair = order.paymentSyncStatus === 'repair_required';
+            const tracksPayment = order.type === 'purchase' || Boolean(order.groupId);
             const orderStageIndex = ORDER_STAGES.findIndex((stage) => stage.id === orderStage.id);
             const groupRole = dealHasGroupRoom(deal)
-              ? getGroupCredential(deal.id, order.visitorId)?.role || ''
+              ? getGroupCredential(
+                  order.groupId || deal.id,
+                  order.participantActorId || order.visitorId,
+                )?.role || ''
               : '';
-            const canCancel = canCancelParticipation(order, deal, groupRole);
+            const canCancel = SCOPED_UI_ACTIONS.participationCancellation
+              && canCancelParticipation(order, deal, groupRole);
             const canOpenRoom = RELEASE_FEATURES.chat && canOpenOrderGroupRoom({
               order,
               deal,
@@ -3511,6 +5217,7 @@ function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfir
               && ['pickup_waiting', 'completed'].includes(orderStage.id)
               && !order.customerPickupConfirmedAt;
             const verificationComplete = !cancelled && order.type === 'purchase'
+              && !paymentNeedsRepair
               && orderStage.id === 'completed'
               && Boolean(order.customerPickupConfirmedAt)
               && paymentStatus === 'confirmed';
@@ -3544,16 +5251,27 @@ function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfir
                       : '참여 수량은 예약되었으며 연결이 복구되면 주문 정보가 자동으로 전송됩니다.'}</span>
                   </div>
                 ) : null}
-                {order.type === 'purchase' && cancelled ? (
+                {paymentNeedsRepair && (
+                  <div className="customer-payment-state sync-failed" role="status">
+                    <strong>과거 주문 연결 확인 필요 · 관리자 점검 요청</strong>
+                    <span>이 주문과 참여 기록의 연결을 확인하지 못했습니다. 실제 입금 여부를 이 표시만으로 판단하지 말고 관리자에게 확인을 요청해 주세요.</span>
+                  </div>
+                )}
+                {tracksPayment && !paymentNeedsRepair && cancelled ? (
                   <div className="customer-payment-state cancelled">
                     <strong>참여 취소 완료</strong>
                     <span>선택했던 수량이 공동구매의 남은 수량에 다시 반영되었습니다.</span>
                   </div>
-                ) : order.type === 'purchase' && (
+                ) : tracksPayment && !paymentNeedsRepair && paymentHistoryUnconfirmed ? (
+                  <div className={`customer-payment-state sync-${historyStatus === 'error' ? 'failed' : 'pending'}`} role="status">
+                    <strong>{historyStatus === 'error' ? '입금 상태 확인 필요' : '입금 상태 확인 중'}</strong>
+                    <span>마지막 확인 상태: {paymentStatusLabel}. {historyStatus === 'error'
+                      ? '최신 상태를 확인하지 못했습니다. 위의 “주문 이력 다시 불러오기”를 눌러 주세요.'
+                      : '최신 주문 상태를 불러오고 있습니다.'}</span>
+                  </div>
+                ) : tracksPayment && !paymentNeedsRepair && (
                   <div className={`customer-payment-state ${paymentStatus}`}>
-                    <strong>{paymentStatus === 'confirmed'
-                      ? '입금완료'
-                      : paymentStatus === 'requested' ? '입금확인요청 전송 완료' : '입금대기'}</strong>
+                    <strong>{paymentStatusLabel}</strong>
                     <span>{paymentStatus === 'confirmed'
                       ? '사장님이 입금 완료 상태를 반영했습니다.'
                       : paymentStatus === 'requested'
@@ -3574,6 +5292,9 @@ function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfir
                 )}
                 {cancelError?.orderId === order.id && (
                   <p className="form-error order-cancel-error" role="alert">{cancelError.message}</p>
+                )}
+                {pickupError?.orderId === order.id && (
+                  <p className="form-error order-cancel-error" role="alert">{pickupError.message}</p>
                 )}
                 <div className="order-card-actions">
                   <button className="secondary-button compact-button" onClick={() => deal && onSelectDeal(deal)}>
@@ -3602,9 +5323,13 @@ function OrdersTab({ orders, orderSyncIssues = {}, deals, onSelectDeal, onConfir
                     </button>
                   )}
                   {canConfirmPickup && (
-                    <button className="primary-button compact-button" onClick={() => onConfirmPickup(order.id)}>
+                    <button
+                      className="primary-button compact-button"
+                      disabled={Boolean(confirmingPickupId)}
+                      onClick={() => handlePickupConfirmation(order)}
+                    >
                       <Check size={15} />
-                      픽업 완료 확인
+                      {confirmingPickupId === order.id ? '픽업 확인 반영 중…' : '픽업 완료 확인'}
                     </button>
                   )}
                 </div>
@@ -3744,10 +5469,12 @@ function DealDetail({
   hostMatched,
   onHostApply,
   editable = false,
+  canRepairLegacyGroup = false,
   onUpdateDeal,
   onUpdateTarget,
   onDeleteDeal,
   adminMode = false,
+  readOnly = false,
   unreadCount = 0,
   onOpenRoom,
 }) {
@@ -3756,6 +5483,8 @@ function DealDetail({
   const [editing, setEditing] = useState(false);
   const [editSaving, setEditSaving] = useState(false);
   const [editError, setEditError] = useState('');
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
   const [hostApplying, setHostApplying] = useState(false);
   const [hostApplyError, setHostApplyError] = useState('');
   const [editForm, setEditForm] = useState({
@@ -3771,6 +5500,7 @@ function DealDetail({
   const isSplitMerchant = isSplitMerchantDeal(deal);
   const isMerchantGroup = deal.source === 'merchant' && deal.saleType === 'group';
   const isGroupDeal = isCustomerGroup || isMerchantGroup;
+  const writeBlocked = adminMode || readOnly;
   const dealQuantity = getDealQuantity(deal);
   const split = isCustomerGroup
     ? calculateSplit(
@@ -3801,15 +5531,23 @@ function DealDetail({
     ? Number(deal.unitPrice ?? deal.expectedPerPerson ?? deal.menu?.[0]?.price ?? productSplit.unitPrice)
     : getDealPrice(deal);
   const customerHostRecruiting = isCustomerGroup && deal.hostMode === 'recruiting';
-  const recruitmentOpen = (deal.groupStatus || 'recruiting') === 'recruiting';
+  const recruitmentOpen = isDealRecruiting(deal);
+  const merchantPurchaseClosed = dealQuantity.remaining <= 0
+    || (isMerchantGroup && !recruitmentOpen);
   const existingGroupCredential = isGroupDeal
     ? getGroupCredential(deal.id, getVisitorId())
     : null;
-  const showMerchantRoom = isMerchantGroup && (adminMode || Boolean(existingGroupCredential));
+  const canOpenGroupRoom = customerCanOpenGroupRoom({
+    adminMode,
+    readOnly,
+    credential: existingGroupCredential,
+    localCreator: isCustomerGroup && canRepairLegacyGroup,
+  });
+  const showMerchantRoom = isMerchantGroup && canOpenGroupRoom;
   const newParticipantCapacityReached = isCustomerGroup
     && !existingGroupCredential
     && split.current >= split.people;
-  const canHostApply = !hostMatched && (
+  const canHostApply = !writeBlocked && !hostMatched && (
     (customerHostRecruiting && recruitmentOpen)
     || (isMerchantGroup && recruitmentOpen
       && (deal.methods || []).some((method) => ['그룹배달', '픽업'].includes(method)))
@@ -3899,6 +5637,23 @@ function DealDetail({
     }
   };
 
+  const handleDelete = async () => {
+    if (!SCOPED_UI_ACTIONS.productDeletion || deleting || editSaving) return;
+    if (!window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) return;
+    setDeleting(true);
+    setDeleteError('');
+    try {
+      const deleted = await onDeleteDeal(deal);
+      if (!shouldNavigateAfterDealDelete(deleted)) {
+        setDeleteError('상품을 삭제하지 못했습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요.');
+      }
+    } catch (error) {
+      setDeleteError(dealDeleteErrorMessage(error, '네트워크 상태'));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   return (
     <section className="screen detail-screen">
       <header className="top-nav compact">
@@ -3912,19 +5667,29 @@ function DealDetail({
               <Share2 size={20} />
             </button>
           )}
-          <button
-            className={isFavorite ? 'icon-button liked' : 'icon-button'}
-            onClick={() => {
-              onToggleFavorite(deal);
-            }}
-            aria-label="좋아요"
-          >
-            <Heart size={20} />
-          </button>
+          {!writeBlocked && (
+            <button
+              className={isFavorite ? 'icon-button liked' : 'icon-button'}
+              onClick={() => {
+                onToggleFavorite(deal);
+              }}
+              aria-label={isFavorite ? '좋아요 취소' : '좋아요'}
+              aria-pressed={isFavorite}
+            >
+              <Heart size={20} />
+            </button>
+          )}
         </div>
       </header>
 
-      <img className="hero-image" src={deal.image} alt="" />
+      {readOnly && <CustomerPreviewNotice />}
+
+      <img
+        className="hero-image"
+        src={deal.image || fallbackImage}
+        alt={`${deal.title} 상품 이미지`}
+        onError={replaceBrokenImage}
+      />
 
       {customerHostRecruiting && (
         <div className={hostMatched ? 'host-apply-box matched' : 'host-apply-box recruiting'}>
@@ -3938,15 +5703,17 @@ function DealDetail({
                 ? '이 그룹은 생성자와 별도로 상품 구매·픽업을 맡을 호스트를 찾고 있습니다.'
                 : '거래 모집이 종료되어 더 이상 호스트 지원을 받지 않습니다.'}</p>
           </div>
-          <button
-            className={hostMatched ? 'secondary-button compact-button' : 'primary-button compact-button'}
-            onClick={handleHostApply}
-            disabled={hostMatched || hostApplying || !canHostApply}
-          >
-            <Users size={16} />
-            {hostMatched ? '확정됨' : !recruitmentOpen ? '모집 종료' : hostApplying ? '지원 중…' : '호스트 지원하기'}
-          </button>
-          {hostApplyError && <p className="form-error host-apply-error" role="alert" aria-live="assertive">{hostApplyError}</p>}
+          {!adminMode && (
+            <button
+              className={hostMatched ? 'secondary-button compact-button' : 'primary-button compact-button'}
+              onClick={handleHostApply}
+              disabled={hostMatched || hostApplying || !canHostApply}
+            >
+              <Users size={16} />
+              {hostMatched ? '확정됨' : !recruitmentOpen ? '모집 종료' : hostApplying ? '지원 중…' : '호스트 지원하기'}
+            </button>
+          )}
+          {!adminMode && hostApplyError && <p className="form-error host-apply-error" role="alert" aria-live="assertive">{hostApplyError}</p>}
         </div>
       )}
 
@@ -4021,16 +5788,16 @@ function DealDetail({
         )}
       </div>
 
-      {editable && (
+      {editable && !writeBlocked && (
         <div className="content-block deal-management">
           <div className="deal-management-heading">
             <div>
               <strong>내가 등록한 상품</strong>
-              <p>이 기기에서 등록한 상품만 수정하거나 삭제할 수 있습니다.</p>
+              <p>이 기기에서 등록한 상품만 수정할 수 있습니다.</p>
             </div>
             <button
               className="secondary-button compact-button"
-              disabled={editSaving}
+              disabled={editSaving || deleting}
               onClick={() => {
                 setEditing((value) => !value);
                 setEditError('');
@@ -4100,16 +5867,17 @@ function DealDetail({
               </button>
             </div>
           )}
-          <button
-            className="danger-button"
-            disabled={editSaving}
-            onClick={() => {
-              if (window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) onDeleteDeal(deal);
-            }}
-          >
-            <Trash2 size={16} />
-            상품 삭제
-          </button>
+          {SCOPED_UI_ACTIONS.productDeletion && (
+            <button
+              className="danger-button"
+              disabled={editSaving || deleting}
+              onClick={handleDelete}
+            >
+              <Trash2 size={16} />
+              {deleting ? '삭제 중…' : '상품 삭제'}
+            </button>
+          )}
+          {deleteError && <p className="form-error" role="alert" aria-live="assertive">{deleteError}</p>}
         </div>
       )}
 
@@ -4149,11 +5917,11 @@ function DealDetail({
       <div className={isMerchantGroup && !showMerchantRoom ? 'sticky-actions single' : 'sticky-actions'}>
         {isCustomerGroup ? (
           <>
-            <button className="secondary-button room-entry-button" onClick={onOpenRoom}>
+            {canOpenGroupRoom && <button className="secondary-button room-entry-button" onClick={onOpenRoom}>
               {RELEASE_FEATURES.chat ? <MessageCircle size={18} /> : <Check size={18} />}
               {RELEASE_FEATURES.chat ? `그룹 채팅${unreadCount > 0 ? ` · ${Math.min(99, unreadCount)}` : ''}` : '거래 상태 관리'}
-            </button>
-            {!adminMode && (
+            </button>}
+            {!writeBlocked && (
               <button
                 className="primary-button"
                 disabled={!recruitmentOpen || dealQuantity.remaining <= 0 || newParticipantCapacityReached}
@@ -4176,7 +5944,7 @@ function DealDetail({
                 {RELEASE_FEATURES.chat ? `그룹 채팅${unreadCount > 0 ? ` · ${Math.min(99, unreadCount)}` : ''}` : '거래 상태 관리'}
               </button>
             )}
-            {!isMerchantGroup && (
+            {!writeBlocked && !isMerchantGroup && (
               <button
                 className="secondary-button"
                 onClick={() => {
@@ -4187,16 +5955,19 @@ function DealDetail({
                 <Users size={18} /> 그룹방 만들기
               </button>
             )}
-            {!adminMode && (
+            {!writeBlocked && (
               <button
                 className="primary-button"
+                disabled={merchantPurchaseClosed}
                 onClick={() => {
                   onScreen('join');
                   track(isInstant ? 'instant_checkout_started' : 'join_started', { deal_id: deal.id });
                 }}
               >
                 <ShoppingBag size={18} />
-                {isInstant ? '선착순 할인 받기' : '참여하기'}
+                {merchantPurchaseClosed
+                  ? isInstant ? '재고 소진' : '모집 종료'
+                  : isInstant ? '선착순 할인 받기' : '참여하기'}
               </button>
             )}
           </>
@@ -4209,6 +5980,8 @@ function DealDetail({
 }
 
 function ShareSheet({ deal, onClose }) {
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareError, setShareError] = useState('');
   const channels = [
     { id: 'native', label: '카카오·SNS', icon: Share2 },
     { id: 'message', label: '문자', icon: Send },
@@ -4227,27 +6000,35 @@ function ShareSheet({ deal, onClose }) {
       }
     }
     const input = document.createElement('textarea');
-    input.value = shareUrl;
-    input.style.position = 'fixed';
-    input.style.opacity = '0';
-    document.body.appendChild(input);
-    input.select();
-    const copied = document.execCommand('copy');
-    input.remove();
-    return copied;
+    try {
+      input.value = shareUrl;
+      input.style.position = 'fixed';
+      input.style.opacity = '0';
+      document.body.appendChild(input);
+      input.select();
+      return document.execCommand('copy');
+    } catch {
+      return false;
+    } finally {
+      input.remove();
+    }
   };
 
   return (
-    <div className="sheet-backdrop" role="dialog" aria-modal="true">
+    <div className="sheet-backdrop" role="dialog" aria-modal="true" aria-labelledby="share-sheet-title">
       <div className="bottom-sheet">
         <div className="sheet-header">
-          <h2>공동구매 링크 공유</h2>
+          <h2 id="share-sheet-title">공동구매 링크 공유</h2>
           <button className="icon-button" onClick={onClose} aria-label="닫기">
             <X size={20} />
           </button>
         </div>
         <div className="share-summary">
-          <img src={deal.image} alt="" />
+          <img
+            src={deal.image || fallbackImage}
+            alt={`${deal.title} 상품 이미지`}
+            onError={replaceBrokenImage}
+          />
           <div>
             <strong>{deal.title}</strong>
             <p>{deal.store}</p>
@@ -4257,28 +6038,41 @@ function ShareSheet({ deal, onClose }) {
           {channels.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
+              disabled={shareBusy}
               onClick={async () => {
-                let completed = true;
-                if (id === 'native') {
-                  if (navigator.share) {
-                    try {
-                      await navigator.share({ title: deal.title, text: shareText, url: shareUrl });
-                    } catch (shareError) {
-                      if (shareError?.name === 'AbortError') return;
+                if (shareBusy) return;
+                setShareBusy(true);
+                setShareError('');
+                try {
+                  let completed = true;
+                  if (id === 'native') {
+                    if (navigator.share) {
+                      try {
+                        await navigator.share({ title: deal.title, text: shareText, url: shareUrl });
+                      } catch (error) {
+                        if (error?.name === 'AbortError') return;
+                        completed = await copyLink();
+                      }
+                    } else {
                       completed = await copyLink();
                     }
-                  } else {
-                    completed = await copyLink();
                   }
+                  if (id === 'copy') completed = await copyLink();
+                  if (!completed) {
+                    setShareError('링크를 복사하지 못했습니다. 브라우저 권한을 확인한 뒤 다시 시도해 주세요.');
+                    return;
+                  }
+                  track('share_clicked', { channel: id, deal_id: deal.id });
+                  track('group_shared', { channel: id, group_id: deal.id, deep_link: true });
+                  if (id === 'message') {
+                    window.location.href = `sms:?&body=${encodeURIComponent(`${shareText}\n${shareUrl}`)}`;
+                  }
+                  onClose();
+                } catch {
+                  setShareError('공유를 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+                } finally {
+                  setShareBusy(false);
                 }
-                if (id === 'copy') completed = await copyLink();
-                if (!completed) return;
-                track('share_clicked', { channel: id, deal_id: deal.id });
-                track('group_shared', { channel: id, group_id: deal.id, deep_link: true });
-                if (id === 'message') {
-                  window.location.href = `sms:?&body=${encodeURIComponent(`${shareText}\n${shareUrl}`)}`;
-                }
-                onClose();
               }}
             >
               <Icon size={20} />
@@ -4286,12 +6080,21 @@ function ShareSheet({ deal, onClose }) {
             </button>
           ))}
         </div>
+        {shareError && <p className="form-error" role="alert" aria-live="assertive">{shareError}</p>}
       </div>
     </div>
   );
 }
 
-function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
+function JoinFlow({
+  deal,
+  orders = [],
+  onBack,
+  onScreen,
+  onOrderCreate,
+  onHostApply,
+  onCompletionMessage,
+}) {
   useScreenAnalytics('join_flow', { deal_id: deal.id });
   const { target, remaining } = getDealQuantity(deal);
   const initialQuantities = useMemo(
@@ -4305,11 +6108,27 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
+  const [applyAsHost, setApplyAsHost] = useState(false);
   const reservationMutationIdRef = useRef(createMutationId('checkout_quantity'));
   const isInstant = deal.saleType === 'instant';
   const isCustomerGroup = deal.source === 'customer';
+  const recruitmentOpen = isDealRecruiting(deal);
+  const hostApplicationAvailable = Boolean(
+    isGroupBackedDeal(deal)
+    && deal.hostMode === 'recruiting'
+    && !deal.hostActorId
+    && recruitmentOpen
+    && (deal.source === 'customer'
+      || (deal.methods || []).some((item) => ['픽업', '그룹배달'].includes(item))),
+  );
 
   const selectedCount = Object.values(quantities).reduce((sum, value) => sum + value, 0);
+  const checkoutAvailable = canSubmitDealOrder({
+    deal,
+    selectedCount,
+    remaining,
+    submitting,
+  });
   const baseTotal = deal.menu.reduce((sum, item) => sum + item.price * quantities[item.id], 0);
   const isCurrentHost = isGroupBackedDeal(deal) && deal.hostActorId === getVisitorId();
   const hostRemainderAlreadyApplied = isCurrentHost && (
@@ -4358,14 +6177,14 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
               <p>{item.option}</p>
               <span>{formatWon(item.price)}</span>
             </div>
-            <Counter value={quantities[item.id]} onMinus={() => changeQuantity(item.id, -1)} onPlus={() => changeQuantity(item.id, 1)} />
+            <Counter label={item.name} value={quantities[item.id]} onMinus={() => changeQuantity(item.id, -1)} onPlus={() => changeQuantity(item.id, 1)} />
           </div>
         ))}
       </div>
 
       <div className="quantity-status-panel">
         <span>총 수량 {target}개</span>
-        <strong>{deal.groupStatus && deal.groupStatus !== 'recruiting'
+        <strong>{!recruitmentOpen
           ? `모집 종료 · 배정 ${target - remaining}개`
           : `남은 수량 ${remaining}개`}</strong>
       </div>
@@ -4420,6 +6239,21 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
         </div>
       </div>
 
+      {hostApplicationAvailable && (
+        <label className="host-apply-check">
+          <input
+            type="checkbox"
+            checked={applyAsHost}
+            disabled={submitting}
+            onChange={(event) => setApplyAsHost(event.target.checked)}
+          />
+          <span>
+            <strong>주문과 함께 호스트 지원</strong>
+            <small>참여 완료 후 별도로 다시 누르지 않아도 호스트 지원까지 이어집니다.</small>
+          </span>
+        </label>
+      )}
+
       <div className={submitError ? 'sticky-actions single has-message' : 'sticky-actions single'}>
         {submitError && (
           <p className="form-error join-submit-error sticky-action-message" role="alert" aria-live="assertive">
@@ -4428,10 +6262,12 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
         )}
         <button
           className="primary-button"
-          disabled={submitting || selectedCount === 0 || remaining === 0 || (isCustomerGroup && deal.groupStatus !== 'recruiting')}
+          disabled={!checkoutAvailable}
           onClick={async () => {
+            if (!checkoutAvailable) return;
             setSubmitting(true);
             setSubmitError('');
+            onCompletionMessage?.('');
             track('checkout_started', { deal_id: deal.id, total, method, time });
             try {
               await onOrderCreate({
@@ -4449,9 +6285,27 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
                 hostRemainderApplied: hostRemainder,
                 clientMutationId: reservationMutationIdRef.current,
               });
+              if (applyAsHost && hostApplicationAvailable) {
+                try {
+                  await onHostApply?.(deal);
+                  onCompletionMessage?.('주문 참여와 호스트 지원이 함께 완료되었습니다.');
+                  track('checkout_host_apply_completed', { deal_id: deal.id });
+                } catch (hostError) {
+                  onCompletionMessage?.(
+                    `주문 참여는 완료되었습니다. 호스트 지원만 반영되지 않아 상품 상세에서 다시 지원해 주세요. (${hostApplyErrorMessage(hostError)})`,
+                  );
+                  track('checkout_host_apply_failed', {
+                    deal_id: deal.id,
+                    error_code: hostError?.code || hostError?.message || 'host_apply_failed',
+                  });
+                }
+              }
               track('purchase_completed', { deal_id: deal.id, total, method, time, note, selected_count: selectedCount });
               onScreen('complete');
             } catch (orderError) {
+              if (orderError?.reservationRolledBack) {
+                reservationMutationIdRef.current = createMutationId('checkout_quantity');
+              }
               setSubmitError(joinSubmitErrorMessage(orderError));
             } finally {
               setSubmitting(false);
@@ -4459,7 +6313,11 @@ function JoinFlow({ deal, orders = [], onBack, onScreen, onOrderCreate }) {
           }}
         >
           <Check size={18} />
-          {submitting ? '처리 중…' : isInstant ? '구매 신청 완료' : '참여 완료하기'}
+          {submitting
+            ? '처리 중…'
+            : !recruitmentOpen && isGroupBackedDeal(deal)
+              ? '모집 종료'
+              : isInstant ? '구매 신청 완료' : '참여 완료하기'}
         </button>
       </div>
     </section>
@@ -4501,9 +6359,10 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
     memo: '',
   });
   const [imageProcessing, setImageProcessing] = useState(false);
-  const [imageError, setImageError] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
+  const [submissionLocked, setSubmissionLocked] = useState(false);
+  const submissionAttemptRef = useRef(null);
   const splitPreview = calculateSplit(
     Math.max(0, Math.floor(Number(form.totalPrice || 0))),
     Math.max(1, Math.min(20, Number(form.quantity || 1))),
@@ -4514,6 +6373,27 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
     Math.max(1, Math.min(999, Number(form.totalQuantity || 1))),
     Math.max(1, Math.min(Number(form.totalQuantity || 1), Number(form.creatorQuantity || 1))),
   );
+
+  const resetSubmissionAttempt = useCallback((expectedGroupId = '') => {
+    const currentGroupId = submissionAttemptRef.current?.draft?.groupId || '';
+    if (expectedGroupId && currentGroupId && expectedGroupId !== currentGroupId) return false;
+    submissionAttemptRef.current = null;
+    draftGroupIdRef.current = `customer-${globalThis.crypto?.randomUUID?.() || Date.now()}`;
+    setSubmissionLocked(false);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    const handleCompensation = (event) => {
+      const compensatedGroupId = String(event?.detail?.groupId || '');
+      if (!compensatedGroupId
+        || submissionAttemptRef.current?.draft?.groupId !== compensatedGroupId) return;
+      resetSubmissionAttempt(compensatedGroupId);
+      setSubmitError('그룹방을 생성하지 못했습니다. 주문 저장이 거절되어 생성 내용을 안전하게 되돌렸습니다. 다시 누르면 새 그룹으로 생성합니다.');
+    };
+    window.addEventListener('o2o-group-creation-compensated', handleCompensation);
+    return () => window.removeEventListener('o2o-group-creation-compensated', handleCompensation);
+  }, [resetSubmissionAttempt]);
 
   const updateNumber = (key, delta, min, max) => {
     setForm((current) => {
@@ -4535,23 +6415,8 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
     });
   };
 
-  const handleImage = async (file) => {
-    if (!file) return;
-    setImageProcessing(true);
-    setImageError('');
-    try {
-      const image = await compressImage(file, 900, 0.7);
-      setForm((current) => ({ ...current, image }));
-      track('group_image_uploaded', { file_type: file.type, size: file.size, compressed: true });
-    } catch (error) {
-      setImageError(error.message);
-    } finally {
-      setImageProcessing(false);
-    }
-  };
-
   return (
-    <section className="screen">
+    <section className="screen group-creator-screen">
       <header className="top-nav compact">
         <button className="icon-button" onClick={onBack} aria-label="뒤로">
           <ArrowLeft size={22} />
@@ -4560,11 +6425,21 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
         <Heart size={19} />
       </header>
 
+      <fieldset
+        disabled={submissionLocked}
+        aria-label="공동구매 그룹 입력"
+        style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}
+      >
+
       {!isStandaloneGroup && (
         <div className="content-block">
           <h2>참고 상품</h2>
           <div className="selected-store">
-            <img src={deal.image} alt="" />
+            <img
+              src={deal.image || fallbackImage}
+              alt={`${deal.title} 상품 이미지`}
+              onError={replaceBrokenImage}
+            />
             <div>
               <strong>{deal.store}</strong>
               <p>{deal.address}</p>
@@ -4573,15 +6448,20 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
         </div>
       )}
 
-      <div className="group-image-uploader">
-        <img src={form.image || deal.image} alt="" />
-        <label className="secondary-button">
-          <Upload size={18} />
-          {imageProcessing ? '이미지 처리 중…' : '그룹 이미지 변경'}
-          <input type="file" accept="image/*" onChange={(event) => handleImage(event.target.files?.[0])} />
-        </label>
-        {imageError && <p className="form-error">{imageError}</p>}
-      </div>
+      <ImageCropUploader
+        className="group-image-uploader"
+        value={form.image || deal.image}
+        alt="등록할 공동구매 이미지 미리보기"
+        buttonLabel="그룹 이미지 변경"
+        maxSize={900}
+        onBusyChange={setImageProcessing}
+        onChange={(image) => setForm((current) => ({ ...current, image }))}
+        onUploaded={(file) => track('group_image_uploaded', {
+          file_type: file.type,
+          size: file.size,
+          crop_editor: true,
+        })}
+      />
 
       <div className="form-stack compact-form">
         <label>
@@ -4735,6 +6615,8 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
         </label>
       </div>
 
+      </fieldset>
+
       {submitError && <p className="form-error join-submit-error" role="alert">{submitError}</p>}
 
       <div className="sticky-actions single">
@@ -4745,11 +6627,34 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
             setSubmitting(true);
             setSubmitError('');
             try {
-              const createdGroup = await onGroupCreate({
-                ...form,
-                groupId: draftGroupIdRef.current,
-                baseDeal: deal,
-              });
+              if (!submissionAttemptRef.current) {
+                const draft = {
+                  ...form,
+                  groupId: draftGroupIdRef.current,
+                  creationAttemptAt: new Date().toISOString(),
+                  baseDeal: deal,
+                };
+                const allocation = calculateProductAllocation(
+                  Math.max(0, Math.floor(Number(draft.totalPrice || 0))),
+                  Math.max(1, Math.min(999, Number(draft.totalQuantity || 1))),
+                  Math.max(1, Math.min(Number(draft.totalQuantity || 1), Number(draft.creatorQuantity || 1))),
+                );
+                submissionAttemptRef.current = { draft, allocation };
+                setSubmissionLocked(true);
+              }
+              const submissionAttempt = submissionAttemptRef.current;
+              const { draft, allocation } = submissionAttempt;
+              let createdGroup = submissionAttempt.createdGroup || null;
+              if (!createdGroup) {
+                createdGroup = await onGroupCreate(draft);
+                // Keep the centrally created group attached to this UI attempt. A background
+                // order reconciliation may finish and clear its checkout record before the
+                // user presses retry; recreating the group workflow at that point would mint
+                // a second order ID for the same purchase.
+                if (submissionAttemptRef.current === submissionAttempt) {
+                  submissionAttempt.createdGroup = createdGroup;
+                }
+              }
               await onOrderCreate({
                 type: 'group',
                 dealId: createdGroup.id,
@@ -4757,18 +6662,29 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
                 deal: createdGroup,
                 title: createdGroup.title,
                 store: createdGroup.store,
-                total: form.hostMode === 'self'
-                  ? productPreview.hostSelectedAmount
-                  : productPreview.selectedAmount,
-                method: form.method,
-                deadline: `${form.deadlineDate} ${form.deadlineTime}`,
-                quantity: productPreview.selectedQuantity,
-                selectedCount: productPreview.selectedQuantity,
-                hostRemainderApplied: form.hostMode === 'self' ? productPreview.remainder : 0,
+                total: draft.hostMode === 'self'
+                  ? allocation.hostSelectedAmount
+                  : allocation.selectedAmount,
+                method: draft.method,
+                deadline: `${draft.deadlineDate} ${draft.deadlineTime}`,
+                quantity: allocation.selectedQuantity,
+                selectedCount: allocation.selectedQuantity,
+                hostRemainderApplied: draft.hostMode === 'self' ? allocation.remainder : 0,
+                clientMutationId: `create-${createdGroup.id}`,
               });
+              resetSubmissionAttempt(draft.groupId);
               onScreen('room');
-            } catch {
-              setSubmitError('그룹방을 생성하지 못했습니다. 잠시 후 다시 시도해 주세요.');
+            } catch (creationError) {
+              if (creationError?.groupCreationCompensated) {
+                if (submissionAttemptRef.current) resetSubmissionAttempt();
+                else setSubmissionLocked(false);
+                setSubmitError('그룹방을 생성하지 못했습니다. 주문 저장이 거절되어 생성 내용을 안전하게 되돌렸습니다. 다시 누르면 새 그룹으로 생성합니다.');
+              } else {
+                setSubmissionLocked(true);
+                setSubmitError(creationError?.cleanupError
+                  ? '그룹방을 생성하지 못했습니다. 생성 취소 정리를 확인 중입니다. 입력값을 유지한 채 같은 내용으로 다시 시도해 주세요.'
+                  : '그룹방을 생성하지 못했습니다. 처리 결과를 확인하지 못했습니다. 입력값을 유지한 채 같은 내용으로 다시 시도해 주세요.');
+              }
             } finally {
               setSubmitting(false);
             }
@@ -4776,14 +6692,18 @@ function GroupCreator({ deal, onBack, onScreen, onOrderCreate, onGroupCreate }) 
           disabled={submitting || imageProcessing || !form.title || !form.category || Number(form.totalPrice) <= 0}
         >
           <Users size={18} />
-          {submitting ? '그룹방 생성 중…' : '그룹방 생성'}
+          {submitting
+            ? '그룹방 생성 중…'
+            : submissionLocked
+              ? '같은 내용으로 그룹방 생성 다시 시도'
+              : '그룹방 생성'}
         </button>
       </div>
     </section>
   );
 }
 
-function Completion({ deal, onScreen }) {
+function Completion({ deal, message = '', onScreen }) {
   useScreenAnalytics('completion', { deal_id: deal.id });
   const isInstant = deal.saleType === 'instant';
   const isCustomerGroup = deal.source === 'customer';
@@ -4795,6 +6715,13 @@ function Completion({ deal, onScreen }) {
       </div>
       <h1>{isInstant ? '구매 신청 완료' : isCustomerGroup ? '그룹 참여 완료' : '공동구매 참여 완료'}</h1>
       <p>{deal.store} {isInstant ? '선착순 즉시할인 신청이' : '공동구매 신청이'} 저장되었습니다.</p>
+
+      {message && (
+        <div className="completion-payment-note" role="status">
+          <strong>처리 결과</strong>
+          <span>{message}</span>
+        </div>
+      )}
 
       {!isCustomerGroup && (
         <div className="completion-payment-note">
@@ -4920,7 +6847,7 @@ function Survey({ onScreen }) {
       </div>
 
       <p className="evidence-note">제출 즉시 고객번호·이름·연락처·응답 내용·제출 시간이 Google Sheets에 자동 저장됩니다.</p>
-      {submitError && <p className="form-error">{submitError}</p>}
+      {submitError && <p className="form-error" role="alert" aria-live="assertive">{submitError}</p>}
 
       <button
         className="primary-button"
@@ -4928,15 +6855,21 @@ function Survey({ onScreen }) {
         onClick={async () => {
           setSubmitting(true);
           setSubmitError('');
-          const event = track('survey_submitted', answer);
-          const stored = await event.collectionPromise;
-          if (stored) {
-            onScreen('list');
-            return;
+          try {
+            const event = track('survey_submitted', answer);
+            const stored = await event.collectionPromise;
+            if (stored) {
+              onScreen('list');
+              return;
+            }
+            setSubmittedLocally(true);
+            setSubmitError('네트워크 연결을 확인해 주세요. 응답은 기기에 보관되며 온라인 상태에서 자동으로 다시 전송됩니다.');
+          } catch {
+            setSubmittedLocally(true);
+            setSubmitError('네트워크 연결을 확인해 주세요. 응답은 기기에 보관되며 온라인 상태에서 자동으로 다시 전송됩니다.');
+          } finally {
+            setSubmitting(false);
           }
-          setSubmitting(false);
-          setSubmittedLocally(true);
-          setSubmitError('네트워크 연결을 확인해 주세요. 응답은 기기에 보관되며 온라인 상태에서 자동으로 다시 전송됩니다.');
         }}
       >
         <Check size={18} />
@@ -4955,6 +6888,8 @@ function OwnerApp({
   screen,
   selectedDeal,
   deals,
+  centralDeals = [],
+  syncIssues = {},
   createdDeals,
   ownedDeals,
   orders,
@@ -4962,11 +6897,18 @@ function OwnerApp({
   ownerRecoveryCount = 0,
   ownerRecoveryBusy = false,
   ownerRecoveryError = '',
+  workspaceStatus = 'ready',
+  onRetryWorkspace,
+  ownerAccountHint = null,
   location,
   onScreen,
   onCreate,
   onDeleteDeal,
   onRecoverOwnerProducts,
+  onSwitchOwnerAccount,
+  ownerBackupStatus = '',
+  onExportOwnerBackup,
+  onImportOwnerBackup,
   onPreviewCustomer,
   onOrderStatusChange,
   onPaymentConfirm,
@@ -4974,14 +6916,15 @@ function OwnerApp({
 }) {
   const [formVersion, setFormVersion] = useState(0);
   const [editingDeal, setEditingDeal] = useState(null);
+  const confirmedDeals = useMemo(() => mergeDeals(centralDeals, ownedDeals), [centralDeals, ownedDeals]);
   const managedOwnerDeals = useMemo(() => {
-    const centralById = new Map(deals.map((deal) => [deal.id, deal]));
+    const centralById = new Map(confirmedDeals.map((deal) => [deal.id, deal]));
     return mergeDeals(createdDeals, ownedDeals).map((ownedDeal) => {
       const centralDeal = centralById.get(ownedDeal.id);
       if (!centralDeal) return ownedDeal;
       const orderedQuantity = Number(centralDeal.orderedQuantity ?? centralDeal.current ?? 0);
       return {
-        ...ownedDeal,
+        ...mergeDeals([ownedDeal], [centralDeal])[0],
         orderedQuantity,
         allocatedProductQuantity: orderedQuantity,
         current: orderedQuantity,
@@ -4989,55 +6932,74 @@ function OwnerApp({
         participantCount: Number(centralDeal.participantCount || 0),
       };
     });
-  }, [createdDeals, deals, ownedDeals]);
+  }, [createdDeals, confirmedDeals, ownedDeals]);
   const ownerDealIds = useMemo(
     () => new Set(managedOwnerDeals.map((deal) => deal.id)),
     [managedOwnerDeals],
   );
-  const neighborhoodOrders = useMemo(() => mergeAuthoritativeOwnerOrders(ownerOrders, orders).filter(
+  const authoritativeOwnerOrderIds = useMemo(
+    () => new Set(ownerOrders.map((order) => order?.id).filter(Boolean)),
+    [ownerOrders],
+  );
+  const managedOrders = useMemo(() => mergeAuthoritativeOwnerOrders(ownerOrders, orders).filter(
     (order) => ['purchase', 'group'].includes(order.type)
-      && ownerDealIds.has(order.dealId)
-      && (!order.neighborhood || sameLocation(order, location)),
-  ), [location, orders, ownerDealIds, ownerOrders]);
+      && ownerOrderBelongsToWorkspace(order, ownerDealIds, authoritativeOwnerOrderIds),
+  ), [authoritativeOwnerOrderIds, orders, ownerDealIds, ownerOrders]);
   const orderSummaries = useMemo(() => managedOwnerDeals.flatMap((deal) => {
-    if (!sameLocation(deal, location)) return [];
-    const detailedQuantity = neighborhoodOrders
+    const detailedQuantity = managedOrders
       .filter((order) => order.dealId === deal.id && !isCancelledOrder(order))
       .reduce((total, order) => total + Math.max(1, Number(order.selectedCount ?? order.quantity ?? 1)), 0);
     const centralQuantity = Math.max(0, Number(deal.orderedQuantity ?? deal.current ?? 0));
     const pendingQuantity = Math.max(0, centralQuantity - detailedQuantity);
     return pendingQuantity > 0 ? [{ deal, pendingQuantity, centralQuantity }] : [];
-  }), [location, managedOwnerDeals, neighborhoodOrders]);
+  }), [managedOwnerDeals, managedOrders]);
   const ownerOrderDisplay = useMemo(
-    () => summarizeOwnerOrderDisplay(neighborhoodOrders, orderSummaries),
-    [neighborhoodOrders, orderSummaries],
+    () => summarizeOwnerOrderDisplay(managedOrders, orderSummaries),
+    [managedOrders, orderSummaries],
   );
-  const neighborhoodGroups = deals.filter(
-    (deal) => deal.source === 'customer' && sameLocation(deal, location),
+  const publicCustomerGroups = deals.filter(
+    (deal) => deal.source === 'customer' && deal.visibility !== 'private',
   );
 
   if (screen === 'orders') {
     return (
       <OwnerOrders
-        orders={neighborhoodOrders}
+        workspaceStatus={workspaceStatus}
+        onRetryWorkspace={onRetryWorkspace}
+        orders={managedOrders}
         summaries={orderSummaries}
         displayMetrics={ownerOrderDisplay}
         location={location}
         onBack={() => onScreen('form')}
         onStatusChange={onOrderStatusChange}
         onPaymentConfirm={onPaymentConfirm}
+        accountHint={ownerAccountHint}
+        onSwitchAccount={onSwitchOwnerAccount}
+        backupStatus={ownerBackupStatus}
+        onExportBackup={onExportOwnerBackup}
+        onImportBackup={onImportOwnerBackup}
       />
     );
   }
   if (screen === 'products') {
     return (
       <OwnerProducts
+        workspaceStatus={workspaceStatus}
+        onRetryWorkspace={onRetryWorkspace}
         deals={managedOwnerDeals}
+        centralDeals={confirmedDeals}
+        localDeals={createdDeals}
+        syncIssues={syncIssues}
         onBack={() => onScreen('form')}
         recoveryCount={ownerRecoveryCount}
         recoveryBusy={ownerRecoveryBusy}
         recoveryError={ownerRecoveryError}
         onRecover={onRecoverOwnerProducts}
+        accountHint={ownerAccountHint}
+        onSwitchAccount={onSwitchOwnerAccount}
+        backupStatus={ownerBackupStatus}
+        onExportBackup={onExportOwnerBackup}
+        onImportBackup={onImportOwnerBackup}
         onEdit={(deal) => {
           setEditingDeal(deal);
           setFormVersion((current) => current + 1);
@@ -5065,8 +7027,8 @@ function OwnerApp({
     <OwnerForm
       key={formVersion}
       initialDeal={editingDeal}
-      onCreate={(payload) => {
-        const savedDeal = onCreate(payload, editingDeal?.id || null);
+      onCreate={async (payload) => {
+        const savedDeal = await onCreate(payload, editingDeal?.id || null, editingDeal);
         if (savedDeal) setEditingDeal(null);
         return savedDeal;
       }}
@@ -5077,7 +7039,12 @@ function OwnerApp({
       recoveryBusy={ownerRecoveryBusy}
       recoveryError={ownerRecoveryError}
       onRecover={onRecoverOwnerProducts}
-      communityGroups={neighborhoodGroups}
+      accountHint={ownerAccountHint}
+      onSwitchAccount={onSwitchOwnerAccount}
+      backupStatus={ownerBackupStatus}
+      onExportBackup={onExportOwnerBackup}
+      onImportBackup={onImportOwnerBackup}
+      communityGroups={publicCustomerGroups}
       location={location}
       onNeighborhoodChange={onNeighborhoodChange}
     />
@@ -5094,6 +7061,11 @@ function OwnerForm({
   recoveryBusy = false,
   recoveryError = '',
   onRecover,
+  accountHint = null,
+  onSwitchAccount,
+  backupStatus = '',
+  onExportBackup,
+  onImportBackup,
   communityGroups,
   location,
   onNeighborhoodChange,
@@ -5170,7 +7142,11 @@ function OwnerForm({
     } : {}),
   });
   const [imageProcessing, setImageProcessing] = useState(false);
-  const [imageError, setImageError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
+  const draftDealId = useRef(
+    initialDeal?.id || `owner-${globalThis.crypto?.randomUUID?.() || Date.now()}`,
+  ).current;
 
   const selectedRegion = getRegion(form.region);
   const selectedDistrict = getDistrict(selectedRegion, form.district);
@@ -5195,21 +7171,6 @@ function OwnerForm({
       ? form.methods.filter((item) => item !== method)
       : [...form.methods, method];
     setForm({ ...form, methods });
-  };
-
-  const handleImage = async (file) => {
-    if (!file) return;
-    setImageProcessing(true);
-    setImageError('');
-    try {
-      const image = await compressImage(file);
-      setForm((current) => ({ ...current, image }));
-      track('owner_image_uploaded', { file_type: file.type, size: file.size, compressed: true });
-    } catch (error) {
-      setImageError(error.message);
-    } finally {
-      setImageProcessing(false);
-    }
   };
 
   return (
@@ -5241,12 +7202,19 @@ function OwnerForm({
         busy={recoveryBusy}
         error={recoveryError}
         onRecover={onRecover}
+        accountHint={accountHint}
+        onSwitchAccount={onSwitchAccount}
+      />
+      <OwnerBackupControls
+        status={backupStatus}
+        onExport={onExportBackup}
+        onImport={onImportBackup}
       />
 
       <div className="owner-neighborhood-link">
         <div>
           <MapPin size={17} />
-          <span>연동 동네</span>
+          <span>매장·픽업 기준 지역</span>
         </div>
         <div className="region-neighborhood-fields owner-location-fields">
           <label>
@@ -5307,13 +7275,13 @@ function OwnerForm({
             </select>
           </label>
         </div>
-        <p>{formatLocation(form)} 사용자에게 상품과 주문 상태가 표시됩니다.</p>
+        <p>{formatLocation(form)}을 픽업 안내와 지역 통계 기준으로 사용합니다. 공개 상품과 주문 관리는 지역으로 제한되지 않습니다.</p>
       </div>
 
       {communityGroups.length > 0 && (
         <div className="content-block owner-community-groups">
           <div>
-            <p className="eyebrow">같은 동네 사용자 수요</p>
+            <p className="eyebrow">공개 사용자 수요</p>
             <h2>진행 중인 공동구매</h2>
           </div>
           {communityGroups.slice(0, 5).map((group) => {
@@ -5340,30 +7308,53 @@ function OwnerForm({
         </div>
       )}
 
-      <div className="owner-image-uploader">
-        {form.image ? <img src={form.image} alt="" /> : <Upload size={38} />}
-        <label className="secondary-button">
-          <Upload size={18} />
-          {imageProcessing ? '이미지 처리 중…' : '이미지 변경'}
-          <input type="file" accept="image/*" onChange={(event) => handleImage(event.target.files?.[0])} />
-        </label>
-        {imageError && <p className="form-error">{imageError}</p>}
-      </div>
+      <ImageCropUploader
+        className="owner-image-uploader"
+        value={form.image}
+        alt="등록할 상품 이미지 미리보기"
+        buttonLabel="이미지 변경"
+        onBusyChange={setImageProcessing}
+        onChange={(image) => setForm((current) => ({ ...current, image }))}
+        onUploaded={(file) => track('owner_image_uploaded', {
+          file_type: file.type,
+          size: file.size,
+          crop_editor: true,
+        })}
+      />
 
       <form
         className="form-stack"
-        onSubmit={(event) => {
+        onSubmit={async (event) => {
           event.preventDefault();
+          if (submitting) return;
+          setSubmitting(true);
+          setSubmitError('');
           const payload = {
             ...form,
+            draftDealId,
             splitQuantity: form.saleType === 'group' ? groupPricePreview.splitQuantity : 1,
             deadline: form.saleType === 'instant'
               ? `${form.eventStart} ~ ${form.eventEnd}`
               : `${form.deadlineDate} ${form.deadlineTime}`,
             calculatedPrice: price,
           };
-          const savedDeal = onCreate(payload);
-          if (!savedDeal) return;
+          let savedDeal;
+          try {
+            savedDeal = await onCreate(payload);
+          } catch (error) {
+            setSubmitError(error?.code === 'state_conflict' || error?.message === 'state_conflict'
+              ? error.currentPublishVersion === 0
+                ? '서버에서 이 상품의 중앙 저장 기록을 확인하지 못했습니다. 입력 내용은 유지됩니다. 관리자에게 기록 확인을 요청해 주세요.'
+                : '다른 창에서 상품이 변경되었습니다. 입력 내용은 유지됩니다. 등록 상품 관리에서 최신 내용을 확인한 뒤 다시 수정해 주세요.'
+              : '상품을 중앙 서버에 저장하지 못했습니다. 입력 내용은 유지되므로 네트워크를 확인한 뒤 다시 눌러 주세요.');
+            setSubmitting(false);
+            return;
+          }
+          if (!savedDeal) {
+            setSubmitError('상품 정보를 저장하지 못했습니다. 사장님 연락처와 네트워크 상태를 확인한 뒤 다시 시도해 주세요.');
+            setSubmitting(false);
+            return;
+          }
           track(initialDeal ? 'owner_product_updated' : 'owner_product_created', {
             deal_id: savedDeal.id,
             sale_type: form.saleType,
@@ -5386,6 +7377,7 @@ function OwnerForm({
             methods: form.methods,
             has_image: Boolean(form.image),
           });
+          setSubmitting(false);
         }}
       >
         <div className="content-block flush">
@@ -5596,32 +7588,47 @@ function OwnerForm({
           <textarea maxLength={500} value={form.description} onChange={(event) => setForm({ ...form, description: event.target.value })} />
         </label>
 
-        <button className="primary-button" type="submit" disabled={imageProcessing || !form.storeName.trim() || !form.productName.trim() || Number(form.originalPrice) <= 0 || form.methods.length === 0}>
+        {submitError && <p className="form-error" role="alert" aria-live="assertive">{submitError}</p>}
+        <button className="primary-button" type="submit" disabled={submitting || imageProcessing || !form.storeName.trim() || !form.productName.trim() || Number(form.originalPrice) <= 0 || form.methods.length === 0}>
           <Check size={18} />
-          {initialDeal ? '상품 수정 완료' : '상품 등록 완료'}
+          {submitting ? '중앙 서버에 저장 중…' : initialDeal ? '상품 수정 완료' : '상품 등록 완료'}
         </button>
       </form>
     </section>
   );
 }
 
-function OwnerRecoveryBanner({ count = 0, busy = false, error = '', onRecover }) {
-  if (count <= 0 && !error) return null;
+function OwnerRecoveryBanner({
+  count = 0,
+  busy = false,
+  error = '',
+  onRecover,
+  accountHint = null,
+  onSwitchAccount,
+}) {
+  if (count <= 0 && !error && !accountHint) return null;
+  const maskedPhone = accountHint
+    ? formatKoreanMobilePhoneInput(accountHint.phone).replace(/^(010)-\d{3,4}-(\d{4})$/, '$1-****-$2')
+    : '';
   return (
     <div className="owner-recovery-banner" role="status" aria-live="polite">
       <div>
-        <strong>{count > 0 ? `이 브라우저의 미연결 상품 ${count}개를 확인했습니다` : '상품 연결을 확인해 주세요'}</strong>
-        <span>{count > 0
+        <strong>{accountHint
+          ? `기존 사장님 상품 ${accountHint.count}개를 확인했습니다`
+          : count > 0 ? `이 브라우저의 미연결 상품 ${count}개를 확인했습니다` : '상품 연결을 확인해 주세요'}</strong>
+        <span>{accountHint
+          ? `현재 번호와 다른 ${maskedPhone} 번호에 연결된 상품입니다. 기존 번호로 돌아가면 상품과 주문을 다시 불러옵니다.`
+          : count > 0
           ? '브라우저에 저장된 상품 관리키를 서버에서 확인했습니다. 상품명과 매장을 확인한 뒤 수동으로 연결해 주세요.'
           : error}</span>
       </div>
-      {(count > 0 || error) && (
+      {(accountHint || count > 0 || error) && (
         <button
           className="secondary-button compact-button"
           disabled={busy}
-          onClick={onRecover}
+          onClick={accountHint ? onSwitchAccount : onRecover}
         >
-          {busy ? '확인 중…' : count > 0 ? '확인 후 연결' : '다시 확인'}
+          {busy ? '확인 중…' : accountHint ? '기존 번호로 연결' : count > 0 ? '확인 후 연결' : '다시 확인'}
         </button>
       )}
       {count > 0 && error ? <p className="form-error">{error}</p> : null}
@@ -5629,8 +7636,36 @@ function OwnerRecoveryBanner({ count = 0, busy = false, error = '', onRecover })
   );
 }
 
+function OwnerBackupControls() {
+  // Removed from the merchant UI at the user's request. Existing keys/files are preserved.
+  return null;
+}
+
+function OwnerWorkspaceNotice({ status, onRetry }) {
+  if (status === 'loading') return <p role="status">기존 상품·주문 이력을 확인하고 있습니다.</p>;
+  if (status === 'error') return (
+    <div className="form-error" role="alert">
+      <p>기존 이력을 불러오지 못했습니다. 기록이 삭제된 것은 아니며, 마지막으로 확인한 목록을 표시합니다.</p>
+      <button type="button" className="secondary-button" onClick={onRetry}>이력 다시 불러오기</button>
+    </div>
+  );
+  return (
+    <div className="owner-sync-banner">
+      <p>{status === 'unlinked' ? '이 브라우저에는 연결된 상품 관리키가 없습니다.'
+        : status === 'unconfirmed' ? '이 관리키로 서버에 게시된 상품·주문을 확인하지 못했습니다. 이 브라우저의 기록은 유지합니다.'
+          : '서버에서 조회한 관리 이력을 반영했습니다. 이 브라우저에 남아 있는 기록도 보존합니다.'}</p>
+      <p>이전 이력이 없다면 상품을 등록했던 같은 브라우저·사장님 프로필로 확인해 주세요. 다른 기기의 기록은 관리자 앱의 상품·주문 관리에서 확인할 수 있습니다.</p>
+    </div>
+  );
+}
+
 function OwnerProducts({
+  workspaceStatus = 'ready',
+  onRetryWorkspace,
   deals,
+  centralDeals = [],
+  localDeals = [],
+  syncIssues = {},
   onBack,
   onEdit,
   onDelete,
@@ -5638,12 +7673,18 @@ function OwnerProducts({
   recoveryBusy = false,
   recoveryError = '',
   onRecover,
+  accountHint = null,
+  onSwitchAccount,
+  backupStatus = '',
+  onExportBackup,
+  onImportBackup,
 }) {
   useScreenAnalytics('owner_products', { product_count: deals.length });
   const [busyDealId, setBusyDealId] = useState('');
   const [deleteError, setDeleteError] = useState('');
 
   const handleDelete = async (deal) => {
+    if (!SCOPED_UI_ACTIONS.productDeletion || busyDealId) return;
     if (!window.confirm('이 상품을 전체 공개 목록에서 삭제할까요?')) return;
     setBusyDealId(deal.id);
     setDeleteError('');
@@ -5652,8 +7693,8 @@ function OwnerProducts({
       if (!deleted) {
         setDeleteError('상품을 삭제하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.');
       }
-    } catch {
-      setDeleteError('상품을 삭제하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.');
+    } catch (error) {
+      setDeleteError(dealDeleteErrorMessage(error));
     } finally {
       setBusyDealId('');
     }
@@ -5670,18 +7711,26 @@ function OwnerProducts({
           <Home size={20} />
         </button>
       </header>
+      <OwnerWorkspaceNotice status={workspaceStatus} onRetry={onRetryWorkspace} />
       <OwnerRecoveryBanner
         count={recoveryCount}
         busy={recoveryBusy}
         error={recoveryError}
         onRecover={onRecover}
+        accountHint={accountHint}
+        onSwitchAccount={onSwitchAccount}
+      />
+      <OwnerBackupControls
+        status={backupStatus}
+        onExport={onExportBackup}
+        onImport={onImportBackup}
       />
       {deleteError ? <p className="form-error" role="alert" aria-live="assertive">{deleteError}</p> : null}
-      {deals.length === 0 ? (
+      {deals.length === 0 && workspaceStatus === 'ready' ? (
         <EmptyCustomerState
           icon={Store}
           title="등록한 상품이 없습니다"
-          body="상품을 등록하면 이 화면에서 수정하거나 삭제할 수 있습니다."
+          body="상품을 등록하면 이 화면에서 수정할 수 있습니다."
           actionLabel="상품 등록하기"
           onAction={onBack}
         />
@@ -5689,12 +7738,24 @@ function OwnerProducts({
         <div className="owner-product-list">
           {deals.map((deal) => {
             const splitMerchant = isSplitMerchantDeal(deal);
+            const hasManagementKey = Boolean(getDealCapability(deal.id));
+            const publication = publicDealPublicationState(
+              localDeals.find((local) => local.id === deal.id) || deal, centralDeals, syncIssues,
+            );
             return (
               <article className="owner-product-card" key={deal.id}>
-                <img src={deal.image} alt="" />
+                <img
+                  src={deal.image || fallbackImage}
+                  alt={`${deal.title} 상품 이미지`}
+                  onError={replaceBrokenImage}
+                />
                 <div>
                   <strong>{deal.title}</strong>
                   <p>{deal.store} · {formatLocation(deal)}</p>
+                  <p className="owner-publication-state" data-state={publication.state} role="status">
+                    <strong>{publication.label}</strong>
+                    {publication.description && <span>{publication.description}</span>}
+                  </p>
                   <span>{deal.saleType === 'group'
                     ? `${splitMerchant ? '분할 1개 예상 ' : '할인 후 1개 '}${formatWon(getDealPrice(deal))}`
                     : formatWon(getDealPrice(deal))}</span>
@@ -5711,24 +7772,31 @@ function OwnerProducts({
                       {' · '}주문 {getDealQuantity(deal).ordered}개 · 남은 수량 {getDealQuantity(deal).remaining}개
                     </span>
                   )}
+                  {!hasManagementKey && (
+                    <small className="owner-management-key-warning">
+                      이 기기에는 관리 키가 없어 수정할 수 없습니다.
+                    </small>
+                  )}
                 </div>
                 <div className="owner-product-actions">
                   <button
                     className="secondary-button compact-button"
-                    disabled={Boolean(busyDealId)}
+                    disabled={Boolean(busyDealId) || !hasManagementKey}
                     onClick={() => onEdit(deal)}
                   >
                     <Pencil size={14} />
                     수정
                   </button>
-                  <button
-                    className="danger-button compact-button"
-                    disabled={Boolean(busyDealId)}
-                    onClick={() => handleDelete(deal)}
-                  >
-                    <Trash2 size={14} />
-                    {busyDealId === deal.id ? '삭제 중…' : '삭제'}
-                  </button>
+                  {SCOPED_UI_ACTIONS.productDeletion && (
+                    <button
+                      className="danger-button compact-button"
+                      disabled={Boolean(busyDealId) || !hasManagementKey}
+                      onClick={() => handleDelete(deal)}
+                    >
+                      <Trash2 size={14} />
+                      {busyDealId === deal.id ? '삭제 중…' : '삭제'}
+                    </button>
+                  )}
                 </div>
               </article>
             );
@@ -5744,7 +7812,7 @@ function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
   const isInstant = deal.saleType === 'instant';
   const splitMerchant = isSplitMerchantDeal(deal);
   return (
-    <section className="screen complete-screen">
+    <section className="screen complete-screen product-complete-screen">
       <div className="success-mark">
         <Check size={34} />
       </div>
@@ -5752,7 +7820,12 @@ function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
       <p>{deal.title} {isInstant
         ? '선착순 즉시할인 상품이 사용자 리스트에 반영되었습니다.'
         : '상품과 공동구매가 하나의 카드로 사용자 리스트에 반영되었습니다.'}</p>
-      <img className="done-image" src={deal.image} alt="" />
+      <img
+        className="done-image"
+        src={deal.image || fallbackImage}
+        alt={`${deal.title} 상품 이미지`}
+        onError={replaceBrokenImage}
+      />
       <div className="completion-summary">
         <div>
           <span>{isInstant ? '할인가' : splitMerchant ? '할인 후 상품가격' : '할인 후 1개 가격'}</span>
@@ -5792,6 +7865,8 @@ function OwnerDone({ deal, onCreateAnother, onOpenOrders, onPreviewCustomer }) {
 }
 
 function OwnerOrders({
+  workspaceStatus = 'ready',
+  onRetryWorkspace,
   orders,
   summaries = [],
   displayMetrics = summarizeOwnerOrderDisplay(orders, summaries),
@@ -5799,6 +7874,11 @@ function OwnerOrders({
   onBack,
   onStatusChange,
   onPaymentConfirm,
+  accountHint = null,
+  onSwitchAccount,
+  backupStatus = '',
+  onExportBackup,
+  onImportBackup,
 }) {
   useScreenAnalytics('owner_orders', {
     order_count: orders.length,
@@ -5821,6 +7901,8 @@ function OwnerOrders({
           ? '이 주문을 관리할 권한을 확인할 수 없습니다. 상품을 등록한 사장님 계정이나 그룹 호스트·관리자로 접속해 주세요.'
           : code === 'payment_request_required'
             ? '사용자가 “입금했어요”를 눌러 입금확인을 요청한 뒤 완료 처리할 수 있습니다.'
+          : code === 'payment_reversal_requires_group_rewind'
+            ? '입금완료를 취소하려면 공동구매 진행 단계를 먼저 “모집 중”으로 되돌려 주세요.'
           : code === 'state_conflict'
             ? '다른 변경이 먼저 반영되었습니다. 잠시 후 최신 주문을 확인하고 다시 시도해 주세요.'
             : '주문 상태를 변경하지 못했습니다. 잠시 후 다시 시도해 주세요.',
@@ -5838,7 +7920,7 @@ function OwnerOrders({
         </button>
         <h1>주문 관리</h1>
         <span className="order-count-badge">
-          {location.neighborhood} · 활성 {displayMetrics.activeOrderCount}건
+          전체 지역 · 활성 {displayMetrics.activeOrderCount}건
           {displayMetrics.cancelledOrderCount > 0
             ? ` · 취소 ${displayMetrics.cancelledOrderCount}건`
             : ''}
@@ -5848,13 +7930,24 @@ function OwnerOrders({
         </span>
       </header>
 
+      <OwnerRecoveryBanner
+        accountHint={accountHint}
+        onSwitchAccount={onSwitchAccount}
+      />
+      <OwnerBackupControls
+        status={backupStatus}
+        onExport={onExportBackup}
+        onImport={onImportBackup}
+      />
+
       <div className="neighborhood-sync-banner owner-sync-banner">
         <MapPin size={16} />
         <div>
-          <strong>{formatLocation(location)} 주문만 연동 중</strong>
-          <span>같은 동네 사용자의 가상 주문과 수동 결제 상태가 표시됩니다.</span>
+          <strong>내 관리 상품 주문</strong>
+          <span>고객 지역과 관계없이 내가 관리할 수 있는 주문을 표시합니다. {formatLocation(location)}은 픽업·통계 기준입니다.</span>
         </div>
       </div>
+      <OwnerWorkspaceNotice status={workspaceStatus} onRetry={onRetryWorkspace} />
       {actionError && <p className="form-error" role="alert" aria-live="assertive">{actionError}</p>}
 
       <div className="owner-order-flow">
@@ -5866,7 +7959,7 @@ function OwnerOrders({
         ))}
       </div>
 
-      {orders.length === 0 && summaries.length === 0 ? (
+      {orders.length === 0 && summaries.length === 0 && workspaceStatus === 'ready' ? (
         <EmptyCustomerState
           icon={ShoppingBag}
           title="신규 주문이 없습니다"
@@ -5899,6 +7992,7 @@ function OwnerOrders({
             const stage = getOrderStage(order);
             const paymentStatus = getOrderPaymentStatus(order);
             const groupedPayment = Boolean(order.groupId);
+            const callablePhone = callableKoreanMobilePhone(order.customerPhone);
             const canAdvancePayment = paymentStatus === 'requested'
               || (!groupedPayment && paymentStatus === 'pending');
             return (
@@ -5914,7 +8008,9 @@ function OwnerOrders({
                 <p className="owner-customer-contact">
                   <User size={14} />
                   <strong>{order.customerName || '테스트 사용자'}</strong>
-                  <a href={`tel:${order.customerPhone || ''}`}>{order.customerPhone || '연락처 미수집'}</a>
+                  {callablePhone
+                    ? <a href={`tel:${callablePhone}`}>{formatKoreanMobilePhoneInput(callablePhone)}</a>
+                    : <span>{order.customerPhone && order.customerPhone !== '미설정' ? '연락처 형식 확인 필요' : '연락처 미수집'}</span>}
                 </p>
                 {cancelled ? (
                   <div className="manual-payment-state cancelled">
@@ -6049,7 +8145,7 @@ function Dashboard({ analyticsReady, orders }) {
             ? `중앙 통계 재연결 중 · 마지막 성공 반영 ${central.updatedAt}`
             : '중앙 통계를 불러오지 못해 현재 브라우저 기록을 표시하고 있습니다.'
           : central.stats
-            ? `전체 사용자 중앙 데이터 · 5초마다 자동 갱신 · 마지막 반영 ${central.updatedAt}`
+            ? `전체 사용자 중앙 데이터 · 30초마다 자동 갱신 · 마지막 반영 ${central.updatedAt}`
             : '전체 사용자 중앙 데이터를 불러오는 중입니다.'}
       </p>
 
@@ -6058,19 +8154,19 @@ function Dashboard({ analyticsReady, orders }) {
           <div className="section-title">
             <div>
               <h2>전체 데이터 확인</h2>
-              <p>모든 사용자의 신규 이벤트는 Google Sheets로 자동 전송됩니다.</p>
+              <p>대시보드 지표에 필요한 핵심 검증 이벤트는 Google Sheets로 자동 전송됩니다.</p>
             </div>
           </div>
           <ol className="csv-guide-list">
             <li><code>전체 이벤트</code> 탭에서 원본 기록을 확인합니다.</li>
             <li><code>설문 응답</code> 탭에서 고객번호·이름·연락처와 각 문항 답변을 한 줄로 확인합니다.</li>
-            <li>웹 <code>검증 대시보드</code>에서 전체 방문자·참여·설문·지역 지표를 5초 단위로 확인합니다.</li>
+            <li>웹 <code>검증 대시보드</code>에서 전체 방문자·참여·설문·지역 지표를 30초 단위로 확인합니다.</li>
             <li>필요한 경우 시트에서 CSV 또는 Excel로 내려받습니다.</li>
           </ol>
           <p className="evidence-note">
             {analyticsReady
-              ? <>PostHog 행동 분석과 Google Sheets 원본 기록이 함께 수집됩니다. 설문은 <code>설문 응답</code> 탭에 읽기 쉬운 열로 자동 정리됩니다.</>
-              : <>PostHog 키는 아직 설정되지 않았습니다. 중요 행동은 <code>전체 이벤트</code>, 설문은 <code>설문 응답</code> 탭에 중앙 수집됩니다.</>}
+              ? <>전체 행동은 PostHog로 분석하고, 대시보드 핵심 지표와 수명주기 이벤트는 Google Sheets에 원본으로 보관합니다. 설문은 <code>설문 응답</code> 탭에 읽기 쉬운 열로 자동 정리됩니다.</>
+              : <>PostHog 키는 아직 설정되지 않았습니다. 대시보드 핵심 지표와 수명주기 이벤트는 <code>전체 이벤트</code>, 설문은 <code>설문 응답</code> 탭에 중앙 수집됩니다.</>}
           </p>
         </div>
 
@@ -6179,7 +8275,7 @@ function Dashboard({ analyticsReady, orders }) {
           <div className="section-title">
             <div>
               <h2>지역별 이벤트</h2>
-              <p>모든 신규 이벤트에 지역 값이 태그되며 5초마다 자동 갱신됩니다.</p>
+              <p>중앙 수집되는 핵심 검증 이벤트에 지역 값이 태그되며 30초마다 자동 갱신됩니다.</p>
             </div>
           </div>
           <div className="neighborhood-stats">
@@ -6335,14 +8431,14 @@ function Progress({ deal }) {
   );
 }
 
-function Counter({ value, onMinus, onPlus }) {
+function Counter({ label = '수량', value, onMinus, onPlus }) {
   return (
     <div className="counter">
-      <button type="button" onClick={onMinus} aria-label="감소">
+      <button type="button" onClick={onMinus} aria-label={`${label} 감소`}>
         <Minus size={14} />
       </button>
       <strong>{value}</strong>
-      <button type="button" onClick={onPlus} aria-label="증가">
+      <button type="button" onClick={onPlus} aria-label={`${label} 증가`}>
         <Plus size={14} />
       </button>
     </div>
@@ -6353,27 +8449,28 @@ function FieldCounter({ label, value, onMinus, onPlus }) {
   return (
     <div className="field-counter">
       <span>{label}</span>
-      <Counter value={value} onMinus={onMinus} onPlus={onPlus} />
+      <Counter label={label} value={value} onMinus={onMinus} onPlus={onPlus} />
     </div>
   );
 }
 
-function BottomNav({ active, onSelect }) {
-  const items = [
+function BottomNav({ active, onSelect, adminMode = false, readOnly = false }) {
+  const items = filterCustomerNavigation([
     { id: 'home', screen: 'list', label: '홈', icon: Home },
     { id: 'explore', screen: 'explore', label: '탐색', icon: Users },
     { id: 'calculator', screen: 'calculator', label: '계산', icon: Calculator },
     { id: 'orders', screen: 'orders', label: '내 주문', icon: ShoppingBag },
     { id: 'favorites', screen: 'favorites', label: '찜', icon: Heart },
     { id: 'profile', screen: 'profile', label: '마이', icon: User },
-  ];
+  ], { adminMode, readOnly });
 
   return (
-    <nav className="bottom-nav">
+    <nav className="bottom-nav" style={{ '--nav-count': items.length }}>
       {items.map(({ id, screen, label, icon: Icon }) => (
         <button
           key={id}
           className={active === id ? 'active' : ''}
+          aria-current={active === id ? 'page' : undefined}
           onClick={() => {
             track('bottom_tab_clicked', { tab: id });
             onSelect(screen);
@@ -6454,7 +8551,7 @@ function useCentralStats() {
     let active = true;
     let inFlight = false;
     const load = async () => {
-      if (inFlight) return;
+      if (inFlight || document.visibilityState === 'hidden') return;
       inFlight = true;
       try {
         const response = await fetch('/api/stats', { cache: 'no-store' });
@@ -6474,10 +8571,19 @@ function useCentralStats() {
       }
     };
     load();
-    const timer = window.setInterval(load, 5000);
+    const timer = window.setInterval(load, 30000);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') load();
+    };
+    window.addEventListener('focus', load);
+    window.addEventListener('online', load);
+    document.addEventListener('visibilitychange', handleVisibility);
     return () => {
       active = false;
       window.clearInterval(timer);
+      window.removeEventListener('focus', load);
+      window.removeEventListener('online', load);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, []);
 

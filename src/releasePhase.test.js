@@ -22,8 +22,15 @@ test('later phases unlock chat, admin, notifications, sharing, and deep links in
   assert.equal(featuresForPhase(9).deepLinks, true);
 });
 
-test('invalid phase values safely default to the phase 6 review release', () => {
-  assert.equal(featuresForPhase('not-a-number').phase, 6);
+test('invalid phase values safely default to the complete phase 9 release', () => {
+  assert.deepEqual(featuresForPhase('not-a-number'), {
+    phase: 9,
+    chat: true,
+    admin: true,
+    unreadBadges: true,
+    sharing: true,
+    deepLinks: true,
+  });
   assert.equal(featuresForPhase(0).phase, 1);
   assert.equal(featuresForPhase(99).phase, 12);
 });

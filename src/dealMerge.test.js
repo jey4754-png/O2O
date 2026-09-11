@@ -1,6 +1,33 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mergeDeals } from './dealMerge.js';
+import { mergeDeals, reconcilePublicDealCache } from './dealMerge.js';
+
+for (const source of ['merchant', 'customer']) {
+  test(`${source}: first edit uses the published revision even when group activity has an older timestamp`, () => {
+    const local = { id: `${source}-stale`, source, title: 'old', publishVersion: 1,
+      updatedAt: '2026-09-09T02:00:00Z', version: 1 };
+    const remote = { ...local, title: 'latest', publishVersion: 3,
+      updatedAt: '2026-09-08T02:00:00Z', syncedAt: '2026-09-09T03:00:00Z', version: 4, targetCount: 8 };
+    for (const snapshots of [[local, remote], [remote, local]]) {
+      const [merged] = mergeDeals(snapshots);
+      assert.equal(merged.publishVersion, 3);
+      assert.equal(merged.title, 'latest');
+      assert.equal(merged.version, 4);
+      assert.equal(merged.targetCount, 8);
+    }
+  });
+}
+
+test('new product content does not revert a newer group version or target', () => {
+  const [merged] = mergeDeals([
+    { id: 'customer-state', source: 'customer', publishVersion: 4, title: 'new', version: 2, targetCount: 3 },
+    { id: 'customer-state', source: 'customer', publishVersion: 3, title: 'old', version: 5, targetCount: 8 },
+  ]);
+  assert.equal(merged.title, 'new');
+  assert.equal(merged.publishVersion, 4);
+  assert.equal(merged.version, 5);
+  assert.equal(merged.targetCount, 8);
+});
 
 test('server merchant progress wins when local and remote deal timestamps tie', () => {
   const updatedAt = '2026-08-27T09:00:00.000Z';
@@ -100,4 +127,27 @@ test('newer explicit merchant pricing keeps stock capacity separate from its pri
   assert.equal(merged.splitPricing, false);
   assert.equal(merged.pricingModel, 'explicit_split');
   assert.equal(merged.pricingVersion, 2);
+});
+
+test('public reconciliation removes only confirmed tombstones and preserves unlisted local history', () => {
+  const missing = { id: 'owner-local-beer', title: '맥주 60캔', visibility: 'public' };
+  const deleted = { id: 'customer-deleted', title: '중앙 삭제된 그룹', visibility: 'public' };
+  const cached = [missing, deleted];
+  assert.equal(reconcilePublicDealCache(cached, []), cached);
+  const next = reconcilePublicDealCache(cached, [{ id: deleted.id, visibility: 'deleted' }]);
+  assert.deepEqual(next, [missing]);
+  assert.deepEqual(cached, [missing, deleted], 'reconciliation must not mutate the saved input');
+});
+
+test('public reconciliation refreshes a cached image by product revision without importing unrelated records', () => {
+  const cached = [{ id: 'owner-image-cache', source: 'merchant', title: '이미지 상품',
+    image: 'https://example.test/old.jpg', publishVersion: 1, updatedAt: '2099-01-01T00:00:00Z' }];
+  const central = { ...cached[0], image: '/api/public-deals?image=new-image', publishVersion: 2,
+    updatedAt: '2026-09-10T00:00:00Z' };
+  const next = reconcilePublicDealCache(cached, [central, { id: 'owner-other', title: '다른 사장님 상품' }]);
+  assert.equal(next.length, 1);
+  assert.equal(next[0].image, central.image);
+  assert.equal(next[0].publishVersion, 2);
+  assert.equal(reconcilePublicDealCache(next, cached)[0].image, central.image,
+    'a stale list read must not undo the cached mutation');
 });

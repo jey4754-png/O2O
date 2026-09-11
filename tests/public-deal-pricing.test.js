@@ -37,6 +37,16 @@ async function publish(deal) {
   return response;
 }
 
+async function list() {
+  const response = responseRecorder();
+  await publicDealsHandler({
+    method: 'POST',
+    headers: { origin: 'http://localhost:5173' },
+    body: { action: 'list' },
+  }, response);
+  return response;
+}
+
 function withCollector(testBody) {
   return async () => {
     const previousUrl = process.env.GOOGLE_SHEETS_COLLECTOR_URL;
@@ -105,12 +115,58 @@ test('explicit merchant split pricing round-trips without treating stock as its 
   }
 }));
 
+test('legacy customer deals without a stored group id remain visible and use their deal id', async () => {
+  const previousUrl = process.env.GOOGLE_SHEETS_COLLECTOR_URL;
+  const previousToken = process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN;
+  const previousDataOrigin = process.env.O2O_DATA_API_ORIGIN;
+  const previousFetch = globalThis.fetch;
+  process.env.GOOGLE_SHEETS_COLLECTOR_URL = 'https://collector.example.test';
+  process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN = 'collector-token';
+  delete process.env.O2O_DATA_API_ORIGIN;
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        ok: true,
+        deals: [{
+          id: 'customer-legacy-without-group-id',
+          source: 'customer',
+          title: '기존 사용자 공동구매',
+          originalPrice: 12000,
+          discountRate: 0,
+          totalQuantity: 2,
+          menu: [],
+        }],
+      };
+    },
+  });
+
+  try {
+    const response = await list();
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.body.deals.length, 1);
+    assert.equal(response.body.deals[0].id, 'customer-legacy-without-group-id');
+    assert.equal(response.body.deals[0].groupId, 'customer-legacy-without-group-id');
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousUrl === undefined) delete process.env.GOOGLE_SHEETS_COLLECTOR_URL;
+    else process.env.GOOGLE_SHEETS_COLLECTOR_URL = previousUrl;
+    if (previousToken === undefined) delete process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN;
+    else process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN = previousToken;
+    if (previousDataOrigin === undefined) delete process.env.O2O_DATA_API_ORIGIN;
+    else process.env.O2O_DATA_API_ORIGIN = previousDataOrigin;
+  }
+});
+
 test('explicit split values are bounded while invalid metadata cannot convert a legacy deal', withCollector(async (forwarded) => {
   const clampedResponse = await publish({
     id: 'owner-explicit-pricing-clamped',
     source: 'merchant',
     saleType: 'group',
     title: '분할 공동구매',
+    originalPrice: 10000,
+    discountRate: 0,
     totalQuantity: 4,
     pricingModel: 'explicit_split',
     pricingVersion: 99,
@@ -129,6 +185,8 @@ test('explicit split values are bounded while invalid metadata cannot convert a 
     source: 'merchant',
     saleType: 'group',
     title: '최소 분할 공동구매',
+    originalPrice: 10000,
+    discountRate: 0,
     totalQuantity: 9,
     pricingModel: 'explicit_split',
     pricingVersion: 2,
@@ -146,6 +204,8 @@ test('explicit split values are bounded while invalid metadata cannot convert a 
     source: 'merchant',
     saleType: 'group',
     title: '기존 공동구매',
+    originalPrice: 10000,
+    discountRate: 0,
     totalQuantity: 7,
     pricingModel: 'unsupported_model',
     pricingVersion: 'invalid',
@@ -160,4 +220,36 @@ test('explicit split values are bounded while invalid metadata cannot convert a 
   assert.equal('pricingModel' in legacyResponse.body.deal, false);
   assert.equal('pricingVersion' in legacyResponse.body.deal, false);
   assert.equal(forwarded.length, 3);
+}));
+
+test('public deal gateway rejects malformed financial fields before collector forwarding', withCollector(async (forwarded) => {
+  const validDeal = {
+    id: 'owner-invalid-pricing-boundary',
+    source: 'merchant',
+    saleType: 'group',
+    title: '금액 검증 상품',
+    originalPrice: 10000,
+    discountRate: 10,
+    unitPrice: 9000,
+    totalQuantity: 2,
+    menu: [{ id: 'menu-one', name: '상품', price: 9000 }],
+  };
+  const invalidDeals = [
+    { ...validDeal, originalPrice: -1 },
+    { ...validDeal, originalPrice: 1.5 },
+    { ...validDeal, originalPrice: Number.MAX_SAFE_INTEGER + 1 },
+    { ...validDeal, discountRate: -1 },
+    { ...validDeal, discountRate: 101 },
+    { ...validDeal, unitPrice: -1 },
+    { ...validDeal, unitPrice: 1.5 },
+    { ...validDeal, menu: [{ id: 'menu-one', name: '상품', price: -1 }] },
+    { ...validDeal, menu: [{ id: 'menu-one', name: '상품', price: 1.5 }] },
+  ];
+
+  for (const deal of invalidDeals) {
+    const response = await publish(deal);
+    assert.equal(response.statusCode, 400);
+    assert.deepEqual(response.body, { ok: false, error: 'invalid_deal_price' });
+  }
+  assert.equal(forwarded.length, 0);
 }));

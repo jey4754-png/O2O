@@ -23,10 +23,10 @@ function responseRecorder() {
   };
 }
 
-function validEvent() {
+function validEvent(name = 'survey_submitted') {
   return {
     id: 'event-collect-retry-test',
-    name: 'screen_view',
+    name,
     timestamp: new Date().toISOString(),
     visitorId: 'visitor-collect-retry',
     sessionId: 'session-collect-retry',
@@ -34,12 +34,12 @@ function validEvent() {
   };
 }
 
-async function invoke() {
+async function invoke(name) {
   const response = responseRecorder();
   await collectHandler({
     method: 'POST',
     headers: { origin: 'http://localhost:5173' },
-    body: { event: validEvent() },
+    body: { event: validEvent(name) },
   }, response);
   return response;
 }
@@ -68,7 +68,24 @@ async function withCollector(fetchImplementation, run) {
   }
 }
 
-test('collector busy is preserved as retryable 503', async () => {
+test('non-dashboard high-frequency UI analytics bypasses Apps Script and drains old retry queues', async () => {
+  let fetchCalls = 0;
+  await withCollector(async () => {
+    fetchCalls += 1;
+    throw new Error('collector should not be called');
+  }, async () => {
+    const response = await invoke('filter_clicked');
+    assert.equal(response.statusCode, 202);
+    assert.deepEqual(response.body, {
+      ok: true,
+      stored: false,
+      destination: 'posthog_only',
+    });
+    assert.equal(fetchCalls, 0);
+  });
+});
+
+test('collector busy for durable lifecycle events is preserved as retryable 503', async () => {
   await withCollector(async () => ({
     ok: true,
     status: 200,
@@ -81,7 +98,7 @@ test('collector busy is preserved as retryable 503', async () => {
   });
 });
 
-test('collector timeout is preserved as retryable 504', async () => {
+test('collector timeout for durable lifecycle events is preserved as retryable 504', async () => {
   await withCollector(async () => {
     const error = new Error('request timed out');
     error.name = 'TimeoutError';

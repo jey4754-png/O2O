@@ -38,7 +38,19 @@ test('cancelled order keeps the original quantity and amount as an audit record'
   assert.equal(cancelled.selectedCount, 2);
   assert.equal(cancelled.total, 5580);
   assert.equal(cancelled.version, 2);
+  assert.equal(cancelled.publishMutationId, 'publish-cancel-cancel-test-1234');
   assert.equal(cancelled.statusHistory.at(-1).action, 'cancel_participation');
+});
+
+test('participation cancellation advances the highest legacy order version alias', () => {
+  const cancelled = cancelledOrderSnapshot({
+    ...order,
+    version: 3,
+    paymentVersion: 5,
+  });
+
+  assert.equal(cancelled.version, 6);
+  assert.equal(cancelled.paymentVersion, 6);
 });
 
 test('merchant cancellation restores quantity and only removes the last visitor once', () => {

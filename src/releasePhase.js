@@ -2,7 +2,7 @@ const VITE_ENV = import.meta.env || {};
 
 export function featuresForPhase(value) {
   const parsed = Number(value);
-  const phase = Number.isInteger(parsed) ? Math.min(12, Math.max(1, parsed)) : 6;
+  const phase = Number.isInteger(parsed) ? Math.min(12, Math.max(1, parsed)) : 9;
   return Object.freeze({
     phase,
     chat: phase >= 8,
@@ -13,4 +13,4 @@ export function featuresForPhase(value) {
   });
 }
 
-export const RELEASE_FEATURES = featuresForPhase(VITE_ENV.VITE_RELEASE_PHASE ?? 6);
+export const RELEASE_FEATURES = featuresForPhase(VITE_ENV.VITE_RELEASE_PHASE ?? 9);

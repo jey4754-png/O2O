@@ -7,17 +7,21 @@
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
     "preview": "vite preview --host 0.0.0.0",
-    "test": "node --test src/*.test.js tests/*.test.js"
+    "test": "node --test src/*.test.js tests/*.test.js",
+    "test:e2e": "playwright test",
+    "verify:release": "pnpm test && pnpm build && pnpm test:e2e"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.4",
     "lucide-react": "^0.468.0",
-    "posthog-js": "^1.199.0",
+    "posthog-js": "^1.422.5",
     "qrcode": "^1.5.4",
-    "vite": "^6.0.7",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "vite": "^6.0.7"
   },
-  "devDependencies": {},
+  "devDependencies": {
+    "@playwright/test": "^1.62.1"
+  },
   "packageManager": "pnpm@10.15.0+sha512.486ebc259d3e999a4e8691ce03b5cac4a71cbeca39372a9b762cb500cfdf0873e2cb16abe3d951b1ee2cf012503f027b98b6584e4df22524e0c7450d9ec7aa7b"
 }

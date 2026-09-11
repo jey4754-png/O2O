@@ -1,11 +1,52 @@
 const PRODUCTION_ORIGIN = 'https://o2o-ten.vercel.app';
 const SERVER_ONLY_EVENTS = new Set(['customer_order_snapshot']);
+// Most UI-only events are already sent to PostHog by the browser. Persisting
+// every slider movement and tab click to the same Apps Script that owns orders
+// and groups can let harmless telemetry compete with business mutations.
+const HIGH_FREQUENCY_UI_EVENTS = new Set([
+  'app_opened',
+  'bottom_tab_action_clicked',
+  'bottom_tab_clicked',
+  'calculator_opened',
+  'calculator_people_changed',
+  'calculator_product_quantity_changed',
+  'calculator_result_viewed',
+  'calculator_selected_quantity_changed',
+  'filter_clicked',
+  'group_deep_link_opened',
+  'group_room_opened',
+  'group_shared',
+  'group_status_notice_viewed',
+  'like_clicked',
+  'method_selected',
+  'neighborhood_changed',
+  'notification_center_opened',
+  'open_listing',
+  'owner_neighborhood_changed',
+  'quantity_changed',
+  'sale_type_selected',
+  'screen_dwell',
+  'screen_view',
+  'share_clicked',
+  'source_filter_clicked',
+  'unread_badge_viewed',
+]);
+// These events directly drive the Google Sheets-backed validation dashboard.
+// They must remain central even though they are UI events; Apps Script gives
+// them a non-blocking write path so they cannot queue ahead of commerce work.
+const CENTRAL_DASHBOARD_EVENTS = new Set([
+  'open_listing',
+  'screen_view',
+  'share_clicked',
+]);
 const SERVER_ONLY_EVENT_PROPERTY_NAMES = new Set([
   'ownercapabilityhash',
   'owneridentityhash',
 ]);
 
-import { callDataApi, fetchUpstreamJson } from './_data-upstream.js';
+import { callDataApiJson, fetchUpstreamJson } from './_data-upstream.js';
+
+export const config = { maxDuration: 60 };
 
 function collectorErrorStatus(code, fallbackStatus = 502) {
   if (code === 'collector_busy') return 503;
@@ -95,30 +136,48 @@ export default async function handler(request, response) {
     return response.status(400).json({ ok: false, error: 'invalid_event' });
   }
 
-  const collectorUrl = process.env.GOOGLE_SHEETS_COLLECTOR_URL;
-  const collectorToken = process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN;
-  if (!collectorUrl || !collectorToken) {
-    return response.status(503).json({ ok: false, error: 'collector_not_configured' });
+  const centralDashboardEvent = CENTRAL_DASHBOARD_EVENTS.has(event.name)
+    && event.properties.screen !== 'analytics_dashboard'
+    && event.properties.app !== 'dashboard'
+    && event.properties.is_internal !== true;
+  if (HIGH_FREQUENCY_UI_EVENTS.has(event.name) && !centralDashboardEvent) {
+    return response.status(202).json({
+      ok: true,
+      stored: false,
+      destination: 'posthog_only',
+    });
   }
 
   try {
-    const proxied = await callDataApi('/api/collect', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ event }),
-    });
+    // A previously deployed data proxy may still acknowledge these events as
+    // PostHog-only. Send dashboard events to the collector directly so a 2xx
+    // response always proves they reached the central persistence boundary.
+    const proxied = centralDashboardEvent
+      ? null
+      : await callDataApiJson('/api/collect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event }),
+      });
     if (proxied) {
-      const result = await proxied.json();
-      if (!proxied.ok || !result?.ok) {
+      const { upstream, result } = proxied;
+      if (!upstream.ok || !result?.ok) {
         return sendCollectorError(
           response,
           result?.error || 'collector_failed',
-          proxied.status,
+          upstream.status,
         );
       }
-      return response.status(proxied.status).json(result);
+      return response.status(upstream.status).json(centralDashboardEvent
+        ? { ...result, stored: true, destination: 'google_sheets' }
+        : result);
     }
 
+    const collectorUrl = process.env.GOOGLE_SHEETS_COLLECTOR_URL;
+    const collectorToken = process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN;
+    if (!collectorUrl || !collectorToken) {
+      return response.status(503).json({ ok: false, error: 'collector_not_configured' });
+    }
     const { upstream, result } = await fetchUpstreamJson(collectorUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -129,16 +188,17 @@ export default async function handler(request, response) {
       return sendCollectorError(
         response,
         result?.error || 'collector_failed',
-        502,
+        upstream.status,
       );
     }
     return response.status(result.duplicate ? 200 : 202).json({
       ok: true,
       duplicate: Boolean(result.duplicate),
+      ...(centralDashboardEvent ? { stored: true, destination: 'google_sheets' } : {}),
     });
   } catch (error) {
-    if (error?.code === 'upstream_timeout') {
-      return sendCollectorError(response, 'upstream_timeout', 504);
+    if (error?.code) {
+      return sendCollectorError(response, error.code, error.status || 502);
     }
     return response.status(502).json({ ok: false, error: 'collector_unreachable' });
   }

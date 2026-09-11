@@ -84,6 +84,8 @@ test('owner deal listing hashes every browser capability before collector forwar
             source: 'merchant',
             saleType: 'group',
             title: '소유 상품',
+            originalPrice: 10000,
+            discountRate: 0,
             image: 'https://example.test/owned.jpg',
             menu: [],
             _ownerCapabilityHash: 'f'.repeat(64),
