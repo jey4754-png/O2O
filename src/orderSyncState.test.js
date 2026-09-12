@@ -21,6 +21,9 @@ test('legacy rejected fingerprints stay held and pending issues never become suc
     { [order.id]: { state: 'failed' } }), false);
   assert.equal(shouldPublishQueuedOrder(order, acknowledgements,
     { [order.id]: { state: 'pending' } }), true);
+  assert.equal(shouldPublishQueuedOrder(order, {}, {
+    [order.id]: { state: 'failed', fingerprint: customerOrderSyncFingerprint(order), cleanupPending: true },
+  }), false, 'a rejected payload stays held while reservation cleanup is recovered separately');
 });
 
 test('explicit retry can clear the rejection only after an accepted snapshot', () => {

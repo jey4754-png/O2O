@@ -496,7 +496,8 @@ test('실제 API·GAS: 첫 입금완료 채팅 조회가 진행 중인 오래된
     holdNextRead = true;
     await page.evaluate(() => window.dispatchEvent(new Event('o2o-customer-orders-updated')));
     await heldRead.promise;
-    await expect(page.locator('.order-card')).toContainText('입금 상태 확인 중');
+    await expect(page.locator('.order-card')).not.toContainText('입금 상태 확인 중');
+    await expect(page.locator('.customer-payment-state.pending')).toContainText('입금대기');
     // Use the real API/GAS transitions without GroupRoom's local mutation
     // callback, representing a host update from a different open window.
     await page.evaluate(async ({ groupId, visitorId }) => {

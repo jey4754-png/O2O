@@ -2332,7 +2332,15 @@ function App() {
       syncing = true;
       refreshQueued = false;
       readController = new AbortController();
-      setCustomerHistoryState({ scope: profilePhone, status: 'loading' });
+      // Keep the last resolved order/payment snapshot visible during a
+      // background refresh. Replacing every card with “확인 중” every 30
+      // seconds made a healthy confirmed state look stuck while the network
+      // request was merely in flight.
+      setCustomerHistoryState((current) => (
+        current.scope === profilePhone && current.status !== 'loading'
+          ? current
+          : { scope: profilePhone, status: 'loading' }
+      ));
       try {
         const visitorId = getVisitorId();
         const matchingLocalOrders = loadOrders()
@@ -2359,11 +2367,17 @@ function App() {
             if (!isCurrent()) return;
             let reconciledOrder = null;
             let reconciliationReadError = null;
-            try {
-              const centralOrders = await fetchCustomerOrders(profilePhone, { strict: true, signal: readController.signal });
-              reconciledOrder = centralOrders.find((item) => item.id === order.id) || null;
-            } catch (readError) {
-              reconciliationReadError = readError;
+            // A definite 4xx rejection proves the central store did not accept
+            // this payload. Reconciliation is needed only for uncertain
+            // transport/server failures; doing it after every legacy 4xx made
+            // one polling pass issue several expensive history reads.
+            if (!isTerminalOrderSyncError(error)) {
+              try {
+                const centralOrders = await fetchCustomerOrders(profilePhone, { strict: true, signal: readController.signal });
+                reconciledOrder = centralOrders.find((item) => item.id === order.id) || null;
+              } catch (readError) {
+                reconciliationReadError = readError;
+              }
             }
             if (!isCurrent()) return;
             if (reconciledOrder) {
@@ -2457,10 +2471,16 @@ function App() {
           }
           if (rollbackResults[index]?.error) {
             updateOrderSyncIssue(order.id, {
-              state: 'pending',
+              // The publish request was already rejected as a terminal 4xx.
+              // Keep the local order for the user and let reservation recovery
+              // continue separately, but never republish the same rejected
+              // payload every polling interval.
+              state: 'failed',
               code: rollbackResults[index].error?.code
                 || rollbackResults[index].error?.message
                 || 'reservation_rollback_pending',
+              fingerprint: customerOrderSyncFingerprint(order),
+              cleanupPending: true,
               updatedAt: new Date().toISOString(),
             });
             track('order_reservation_rollback_pending', {

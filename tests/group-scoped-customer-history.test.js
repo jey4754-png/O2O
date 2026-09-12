@@ -94,6 +94,28 @@ test('adaptive event windows preserve distant cross-group versions, conflicting 
   assert.equal(JSON.stringify([scoped, unscoped]).includes(hash), false);
 });
 
+test('customer history filters phone matches without a second full event-name scan', () => {
+  const mine = fixtureOrder(123);
+  const store = customerHistoryStore({ current: [mine], historic: [mine] });
+  const originalGetRange = store.data.events.getRange.bind(store.data.events);
+  let globalEventNameFinders = 0;
+  store.data.events.getRange = (row, column, height, width) => {
+    const range = originalGetRange(row, column, height, width);
+    const originalCreateTextFinder = range.createTextFinder.bind(range);
+    range.createTextFinder = (value) => {
+      if (column === 7 && row === 2 && height === store.eventRows.length - 1) {
+        globalEventNameFinders += 1;
+      }
+      return originalCreateTextFinder(value);
+    };
+    return range;
+  };
+  const result = read(store, '');
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.orders.map((order) => order.id), [mine.id]);
+  assert.equal(globalEventNameFinders, 0);
+});
+
 for (const proxied of [false, true]) {
   test(`browser → customer API → scoped collector read preserves capability proof (proxy=${proxied})`, async () => {
     const store = customerHistoryStore({ current: [fixtureOrder(108), fixtureOrder(109, {

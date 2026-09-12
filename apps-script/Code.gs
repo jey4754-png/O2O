@@ -3976,6 +3976,36 @@ function matchedEventRows_(events, matches) {
   return results;
 }
 
+function matchedEventColumnValues_(events, matches, column) {
+  const rowNumbers = matches.map(function(match) { return match.getRow(); })
+    .sort(function(left, right) { return left - right; })
+    .filter(function(rowNumber, index, rows) { return index === 0 || rowNumber !== rows[index - 1]; });
+  const results = Object.create(null);
+  if (!rowNumbers.length) return results;
+  // Read only the discriminator column for phone/deal matches before touching
+  // their larger event payloads. A global event-name TextFinder made every
+  // customer history request scan the complete event sheet twice and began
+  // timing out as analytics rows accumulated.
+  let index = 0;
+  while (index < rowNumbers.length) {
+    const startRow = rowNumbers[index];
+    let endIndex = index;
+    while (endIndex + 1 < rowNumbers.length
+      && rowNumbers[endIndex + 1] - startRow < 1000
+      && rowNumbers[endIndex + 1] - startRow + 1 <= (endIndex - index + 2) * 100) endIndex += 1;
+    const values = events.getRange(
+      startRow,
+      column,
+      rowNumbers[endIndex] - startRow + 1,
+      1
+    ).getValues();
+    for (; index <= endIndex; index += 1) {
+      results[rowNumbers[index]] = values[rowNumbers[index] - startRow][0];
+    }
+  }
+  return results;
+}
+
 function historicCustomerOrders_(events, phone, dealId) {
   if (events.getLastRow() < 2) return [];
   let rows;
@@ -3992,15 +4022,13 @@ function historicCustomerOrders_(events, phone, dealId) {
   }
   if (matches) {
     if (!matches.length) return [];
-    const snapshotRows = Object.create(null);
-    events.getRange(2, 7, events.getLastRow() - 1, 1)
-      .createTextFinder('customer_order_snapshot').matchCase(true).matchEntireCell(true)
-      .findAll().forEach(function(match) { snapshotRows[match.getRow()] = true; });
+    const eventNames = matchedEventColumnValues_(events, matches, 7);
     // Most phone/deal matches are analytics events. Intersect indexes before
-    // reading their large payload cells, then retain the exact event/phone/
-    // deal checks below; no ownership or canonical-version proof is skipped.
+    // reading their large payload cells without scanning the complete event
+    // sheet a second time. The exact event/phone/deal checks below remain the
+    // authorization and canonical-version boundary.
     rows = matchedEventRows_(events, matches.filter(function(match) {
-      return snapshotRows[match.getRow()] === true;
+      return String(eventNames[match.getRow()] || '') === 'customer_order_snapshot';
     }));
   }
   const results = [];
