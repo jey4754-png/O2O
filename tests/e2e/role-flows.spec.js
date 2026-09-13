@@ -38,6 +38,7 @@ async function mockCentralApis(page, {
   rejectGroupCreateTerminal = false,
   failOrderPublish = false,
   shouldFailOrderPublish = () => false,
+  repairAcceptedOrder = (order) => order,
   abortCommittedOrderResponses = false,
   abortOrderReads = false,
   publishAttempts = [],
@@ -164,10 +165,11 @@ async function mockCentralApis(page, {
       }
     } else if (path.endsWith('/customer-orders')) {
       if (request.action === 'publish') {
-        if (request.order?.id && !committedOrders.has(request.order.id)) {
-          committedOrders.set(request.order.id, request.order);
+        const acceptedOrder = repairAcceptedOrder(request.order);
+        if (acceptedOrder?.id && !committedOrders.has(acceptedOrder.id)) {
+          committedOrders.set(acceptedOrder.id, acceptedOrder);
         }
-        payload = { ok: true, order: committedOrders.get(request.order?.id) || request.order };
+        payload = { ok: true, order: committedOrders.get(acceptedOrder?.id) || acceptedOrder };
       } else {
         payload = { ok: true, orders: [...committedOrders.values()] };
       }
@@ -2076,9 +2078,24 @@ test('사용자 생성 그룹은 중앙 주문 저장 확인 뒤에만 입금 �
   const requests = [];
   const committedOrders = new Map();
   let failPublication = false;
+  let rejectStaleReservation = false;
+  let canonicalReservation = null;
   await page.unroute('**/api/**');
   await mockCentralApis(page, {
-    requests, committedOrders, shouldFailOrderPublish: () => failPublication,
+    requests, committedOrders,
+    shouldFailOrderPublish: (request) => failPublication
+      || (rejectStaleReservation && Boolean(request.order?.reservationMutationId)
+        && request.order.reservationMutationId !== canonicalReservation),
+    repairAcceptedOrder: (order) => (
+      rejectStaleReservation && !order?.reservationMutationId && canonicalReservation
+        ? {
+            ...order,
+            reservationMutationId: canonicalReservation,
+            reservationAction: 'create',
+            reservationQuantity: Number(order.selectedCount || order.quantity || 1),
+          }
+        : order
+    ),
   });
   await page.goto('/customer');
   await completeOnboarding(page, { name: '생성자 주문 선저장 검수' });
@@ -2088,6 +2105,7 @@ test('사용자 생성 그룹은 중앙 주문 저장 확인 뒤에만 입금 �
   await expect(page.locator('.group-room-screen')).toBeVisible();
   await expect.poll(() => committedOrders.size).toBe(1);
   expect([...committedOrders.values()][0].type).toBe('group');
+  canonicalReservation = 'central-create-reservation-repaired';
   await expect.poll(() => page.evaluate(async () => {
     const { customerOrderSyncFingerprint } = await import('/src/customerHistory.js');
     const orders = JSON.parse(localStorage.getItem('o2o_mvp_customer_orders') || '[]');
@@ -2137,15 +2155,22 @@ test('사용자 생성 그룹은 중앙 주문 저장 확인 뒤에만 입금 �
   expect(requests.filter(({ action }) => action === 'transition_payment')).toHaveLength(0);
 
   failPublication = false;
+  rejectStaleReservation = true;
   const retryStartIndex = requests.length;
   await scrollPaymentIntoView();
   page.once('dialog', (dialog) => dialog.accept());
   await requestButton.click();
   await expect(page.locator('.payment-chip.requested')).toHaveText('입금확인요청');
   const paymentIndex = requests.findIndex(({ action }) => action === 'transition_payment');
-  expect(requests.slice(retryStartIndex, paymentIndex).some(({ path, action }) => (
+  const recoveryPublishes = requests.slice(retryStartIndex, paymentIndex).filter(({ path, action }) => (
     path.endsWith('/customer-orders') && action === 'publish'
-  ))).toBe(true);
+  ));
+  expect(recoveryPublishes).toHaveLength(2);
+  expect(recoveryPublishes[0].request.order.reservationMutationId).toBeTruthy();
+  expect(recoveryPublishes[1].request.order.reservationMutationId).toBeUndefined();
+  expect(recoveryPublishes[1].request.order.reservationAction).toBeUndefined();
+  expect(recoveryPublishes[1].request.order.reservationQuantity).toBeUndefined();
+  expect(recoveryPublishes[1].request.order.clientMutationId).toBeUndefined();
   expect(committedOrders.size).toBe(1);
   expect([...committedOrders.values()][0].paymentStatus).toBe('requested');
   await page.getByRole('button', { name: '내 주문', exact: true }).click();

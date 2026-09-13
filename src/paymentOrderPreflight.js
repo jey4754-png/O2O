@@ -13,11 +13,23 @@ const SAFE_CAUSE_CODES = new Set([
   'customer_history_timeout',
   'collector_busy', 'collector_failed', 'collector_unreachable', 'order_sync_failed',
   'order_ownership_conflict', 'order_reservation_conflict', 'order_payment_link_required',
+  'order_reservation_unverified',
   'order_payment_state_conflict', 'state_conflict', 'order_sync_pending',
 ]);
 
 function pending(reason) {
   return Object.assign(new Error('order_sync_pending'), { preflightReason: reason });
+}
+
+function withoutUnverifiedReservation(order) {
+  const {
+    reservationMutationId: _reservationMutationId,
+    reservationAction: _reservationAction,
+    reservationQuantity: _reservationQuantity,
+    clientMutationId: _legacyReservationMutationId,
+    ...legacyOrder
+  } = order;
+  return legacyOrder;
 }
 
 export function canUseAcknowledgedCheckout(order, acknowledgements = {}, issues = {}, checkoutOptions = {}) {
@@ -82,7 +94,21 @@ export async function ensureGroupPaymentOrderSaved({
       if (attempt && !matchesCheckoutReservation(order, attempt)) throw pending('order_binding_conflict');
       phase = 'publish';
       // Replay this saved payload only; never reserve a new quantity here.
-      const saved = await publishOrder(order);
+      let saved;
+      try {
+        saved = await publishOrder(order);
+      } catch (publishError) {
+        const publishCode = String(publishError?.code || publishError?.message || '');
+        if (publishCode !== 'order_reservation_unverified') throw publishError;
+        // Some pre-central-storage browsers retained a provisional reservation
+        // id that no longer matches the server's immutable group history. The
+        // collector already has a fail-closed legacy binder: it accepts this
+        // retry only when exactly one active order can be tied to an existing
+        // participant reservation with the same actor, group and quantity.
+        // Removing only the untrusted hint lets that server check run; it does
+        // not create a participant, reserve quantity or change payment state.
+        saved = await publishOrder(withoutUnverifiedReservation(order));
+      }
       if (!saved || saved.id !== order.id || !belongs(saved)
         || (attempt && !matchesCheckoutReservation(saved, attempt))) throw pending('invalid_order_response');
       persistOrder({ ...order, ...saved });

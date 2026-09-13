@@ -209,6 +209,55 @@ test('a terminal publish rejection keeps the unresolved reservation and reports 
   assert.deepEqual(f.state.persisted, []);
 });
 
+test('a stale provisional reservation id gets one fail-closed legacy binding retry', async () => {
+  const f = fixture();
+  f.order.clientMutationId = f.order.reservationMutationId;
+  f.state.local = [structuredClone(f.order)];
+  f.state.central = [];
+  const calls = [];
+  f.args.publishOrder = async (value) => {
+    calls.push(structuredClone(value));
+    if (calls.length === 1) {
+      throw Object.assign(new Error('order_reservation_unverified'), {
+        code: 'order_reservation_unverified', status: 409,
+      });
+    }
+    assert.equal('reservationMutationId' in value, false);
+    assert.equal('reservationAction' in value, false);
+    assert.equal('reservationQuantity' in value, false);
+    assert.equal('clientMutationId' in value, false);
+    return structuredClone(f.order);
+  };
+  await ensureGroupPaymentOrderSaved(f.args);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0], f.order);
+  assert.deepEqual(f.state.persisted, [f.order]);
+  assert.deepEqual(f.remaining(), []);
+});
+
+test('a rejected legacy binding retry stays blocked and preserves the local order', async () => {
+  const f = fixture();
+  f.state.central = [];
+  const before = f.serialized();
+  let calls = 0;
+  f.args.publishOrder = async () => {
+    calls += 1;
+    throw Object.assign(new Error(calls === 1
+      ? 'order_reservation_unverified'
+      : 'order_reservation_conflict'), {
+      code: calls === 1 ? 'order_reservation_unverified' : 'order_reservation_conflict',
+      status: 409,
+    });
+  };
+  await assert.rejects(ensureGroupPaymentOrderSaved(f.args), {
+    message: 'order_sync_pending', preflightPhase: 'publish',
+    preflightReason: 'publish_failed', causeCode: 'order_reservation_conflict',
+  });
+  assert.equal(calls, 2);
+  assert.equal(f.serialized(), before);
+  assert.deepEqual(f.state.persisted, []);
+});
+
 test('a failed legacy fingerprint never skips canonical verification', async () => {
   const f = fixture();
   reconcileGroupCheckoutAttempts(f.args.groupId, f.args.actorId, [f.order], f.args.checkoutOptions);
