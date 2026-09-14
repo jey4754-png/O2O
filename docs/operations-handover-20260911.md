@@ -4,9 +4,9 @@
 
 - 서비스: https://o2o-ten.vercel.app
 - 사용자 `/customer`, 사장님 `/owner`, 관리자 `/admin`, 대시보드 `/dashboard`.
-- 현재 중앙 저장소는 Google Sheets와 Apps Script v24다. 운영 웹은 Vercel 배포 `dpl_6WfDpmVfCfrNsHgd93HdRgoUoRGh`, 자산 `index-V8XYG_gh.js`를 사용한다. 웹 소스는 이 저장소, 중앙 처리 소스는 `apps-script/Code.gs`, 필요한 설정 이름은 `.env.example`과 README에 있다. 비밀값은 공개 자료에 포함하지 않는다.
+- 현재 중앙 저장소는 Google Sheets와 Apps Script v24다. 운영 웹은 2026-09-13 20:28:40 KST에 생성된 Vercel 배포 `dpl_7jvvUfkb4eEeNS11YbyuRCBh5bsG`, 배포 URL `https://o2o-ifruvzvb3-malshues-projects.vercel.app`, 운영 별칭 `https://o2o-ten.vercel.app`, 자산 `index-D_5eoLRN.js`를 사용한다. 자산 SHA-256은 `39de8f2c59afeb798fc16974a292653e29186c32f0b68f5132964f67937c41a6`이다. 웹 소스 기준 커밋은 `d23973176ed161cdd6d62b0619e07f74abbf4f3f`이며, 중앙 처리 소스는 `apps-script/Code.gs`, 필요한 설정 이름은 `.env.example`과 README에 있다. 비밀값은 공개 자료에 포함하지 않는다.
 - Apps Script 프로젝트 소유자는 `Joo Joo`이며 `dev@bottlecorp.kr`은 편집기다. Git 원격은 `jey4754-png/O2O`, 기본 브랜치는 `main`이다. 인수자는 각 서비스에서 자신의 실제 소유·관리 권한을 직접 확인한다.
-- 2026-09-11 20:34 KST 중앙 시점 백업을 `/Users/seungsoohan/Documents/O2O-Handover/uptwoyou-data-20260911-2034.xlsx`에 생성했다. 파일은 3,272,479바이트, 권한 600이며 11개 시트의 XLSX 구조 검사를 통과했다. 고객 정보가 포함될 수 있으므로 공개 저장소·일반 채팅에 첨부하지 않는다.
+- 2026-09-11 20:34 KST 중앙 시점 백업을 `/Users/seungsoohan/Documents/O2O-Handover/uptwoyou-data-20260911-2034.xlsx`에 생성했다. 2026-09-14 재검사 기준 파일은 3,272,479바이트, 권한 600, SHA-256 `12cbab012034d324682dc0d2957f7f676c8ae00b302a8f41c483fe851a43c58f`이며 ZIP 무결성과 11개 시트의 XLSX 구조 검사를 통과했다. 고객 정보가 포함될 수 있으므로 공개 저장소·일반 채팅에 첨부하지 않는다.
 - 관리자 PIN 변경은 관리자 로그인 후 PIN 변경 화면에서 한다. 중앙 PIN 해시 속성이나 권한 비밀을 삭제·초기화하는 것을 장애 복구로 사용하지 않는다.
 
 ## 역할별 확인
@@ -32,4 +32,6 @@
 
 ## 인수 상태
 
-이 문서는 운영 배포, 읽기 검증, GitHub 전달용 비밀값 제거, 중앙 데이터 시점 백업까지 반영한 인수 안내다. 외부 서비스별 수신자 소유·관리 권한 확인과 고객 인수 승인을 대신하지 않는다. 현재 미완료된 과거 상품·주문 원본 연결은 `feedback-20260911-csv-review.md`에서 추적한다. 현재 계약 파일은 협의용 초안이므로 서명된 최종본이나 명시적으로 합의한 변경서가 제공되면 다시 대조한다.
+이 문서는 운영 배포, 읽기 검증, GitHub 전달용 비밀값 제거, 중앙 데이터 시점 백업까지 반영한 인수 안내다. 2026-09-14 `pnpm verify:release` 재검사에서 단위·API·Apps Script 연계 검사 532개, 프로덕션 빌드, 모바일 Chromium·WebKit 회귀 186개가 모두 통과했다. 운영의 `/`, `/customer`, `/owner`, `/admin`, `/dashboard`는 모두 HTTP 200이었고 공개상품 중앙 읽기는 활성 45건을 반환했다. 최종 배포 이후 확인한 요청 로그에는 4xx·5xx가 없었다.
+
+자동검증은 고객의 실제 기기·브라우저·관리키로 수행한 운영 인수 승인을 대신하지 않는다. 최종 검수 현황과 남은 확인은 `contract-closeout-20260914.md`를 따른다. 중앙 원본이 없거나 주문·그룹 연결 근거가 불완전한 과거 맥주·아메리카노·양파 기록의 임의 재생성은 계약상 행동 데이터 연속성에 포함되지 않는 과거 데이터 백필이며 `feedback-20260911-csv-review.md`에서 별도 추적한다. 현재 계약 파일은 협의용 초안이므로 서명된 최종본이나 명시적으로 합의한 변경서가 제공되면 다시 대조한다.
