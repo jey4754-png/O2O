@@ -4,7 +4,7 @@
 
 - 서비스: https://o2o-ten.vercel.app
 - 사용자 `/customer`, 사장님 `/owner`, 관리자 `/admin`, 대시보드 `/dashboard`.
-- 현재 중앙 저장소는 Google Sheets와 Apps Script v24다. 운영 웹은 2026-09-13 20:28:40 KST에 생성된 Vercel 배포 `dpl_7jvvUfkb4eEeNS11YbyuRCBh5bsG`, 배포 URL `https://o2o-ifruvzvb3-malshues-projects.vercel.app`, 운영 별칭 `https://o2o-ten.vercel.app`, 자산 `index-D_5eoLRN.js`를 사용한다. 자산 SHA-256은 `39de8f2c59afeb798fc16974a292653e29186c32f0b68f5132964f67937c41a6`이다. 웹 소스 기준 커밋은 `d23973176ed161cdd6d62b0619e07f74abbf4f3f`이며, 중앙 처리 소스는 `apps-script/Code.gs`, 필요한 설정 이름은 `.env.example`과 README에 있다. 비밀값은 공개 자료에 포함하지 않는다.
+- 현재 중앙 저장소는 Google Sheets와 Apps Script v24다. 운영 웹은 2026-09-15 11:55:57 KST에 생성된 Vercel 배포 `dpl_2SuP9bAyxboB65A8jPUmkKKM6xLr`, 배포 URL `https://o2o-ook3w3gby-malshues-projects.vercel.app`, 운영 별칭 `https://o2o-ten.vercel.app`, 자산 `index-D_rzv2f-.js`를 사용한다. 자산 SHA-256은 `db7e3fd8f174161ecf3aae2d9543e862adf5583966dcf38fb32e1fa8c5a986c9`이다. 웹 소스 기준 커밋은 `c4dc0273730f10b58a715da3038365292a900434`이며, 중앙 처리 소스는 `apps-script/Code.gs`, 필요한 설정 이름은 `.env.example`과 README에 있다. 비밀값은 공개 자료에 포함하지 않는다.
 - Apps Script 프로젝트 소유자는 `Joo Joo`이며 `dev@bottlecorp.kr`은 편집기다. Git 원격은 `jey4754-png/O2O`, 기본 브랜치는 `main`이다. 인수자는 각 서비스에서 자신의 실제 소유·관리 권한을 직접 확인한다.
 - 2026-09-11 20:34 KST 중앙 시점 백업을 `/Users/seungsoohan/Documents/O2O-Handover/uptwoyou-data-20260911-2034.xlsx`에 생성했다. 2026-09-14 재검사 기준 파일은 3,272,479바이트, 권한 600, SHA-256 `12cbab012034d324682dc0d2957f7f676c8ae00b302a8f41c483fe851a43c58f`이며 ZIP 무결성과 11개 시트의 XLSX 구조 검사를 통과했다. 고객 정보가 포함될 수 있으므로 공개 저장소·일반 채팅에 첨부하지 않는다.
 - 관리자 PIN 변경은 관리자 로그인 후 PIN 변경 화면에서 한다. 중앙 PIN 해시 속성이나 권한 비밀을 삭제·초기화하는 것을 장애 복구로 사용하지 않는다.
@@ -32,6 +32,8 @@
 
 ## 인수 상태
 
-이 문서는 운영 배포, 읽기 검증, GitHub 전달용 비밀값 제거, 중앙 데이터 시점 백업까지 반영한 인수 안내다. 2026-09-14 `pnpm verify:release` 재검사에서 단위·API·Apps Script 연계 검사 532개, 프로덕션 빌드, 모바일 Chromium·WebKit 회귀 186개가 모두 통과했다. 운영의 `/`, `/customer`, `/owner`, `/admin`, `/dashboard`는 모두 HTTP 200이었고 공개상품 중앙 읽기는 활성 45건을 반환했다. 최종 배포 이후 조회된 런타임 요청은 이번 읽기 점검 1건이며 4xx·5xx는 없었다. Joo의 새 배포 실기기 재검수 요청은 아직 로그에서 확인되지 않았다.
+이 문서는 운영 배포, 읽기 검증, GitHub 전달용 비밀값 제거, 중앙 데이터 시점 백업까지 반영한 인수 안내다. 2026-09-15 `pnpm verify:release` 재검사에서 단위·API·Apps Script 연계 검사 535개, 프로덕션 빌드, 모바일 Chromium·WebKit 회귀 188개가 모두 통과했다. 운영의 `/`, `/customer`, `/owner`, `/admin`, `/dashboard`는 모두 HTTP 200이었고 공개상품 중앙 읽기는 활성 45건을 반환했다. Chromium·WebKit으로 역할별 운영 화면을 열었을 때 페이지 오류는 없었다. 최종 배포 읽기 점검의 응답 완료 5건은 모두 HTTP 200이었고 4xx·5xx는 없었다.
+
+2026-09-14 피드백의 입금 상태·내 주문 불일치는 중앙 주문 선조회, 오래된 로컬 주문 재게시 차단, 전화번호 형식 정규화, 늦은 실패 요청의 삭제·복구 차단으로 수정했다. 그룹 채팅은 요청 시작 간격을 약 5초로 맞췄고 새 메시지 배지는 5초 주기 병렬 조회로 변경했다. 사장님 상품·주문은 원래 등록한 브라우저의 관리키로 조회한다. 관리키가 없는 다른 브라우저·기기에 소유권을 자동 복구하는 화면은 신규 계정·권한 복구 기능이므로 현재 계약 범위에 포함하지 않았다.
 
 자동검증은 고객의 실제 기기·브라우저·관리키로 수행한 운영 인수 승인을 대신하지 않는다. 최종 검수 현황과 남은 확인은 `contract-closeout-20260914.md`를 따른다. 중앙 원본이 없거나 주문·그룹 연결 근거가 불완전한 과거 맥주·아메리카노·양파 기록의 임의 재생성은 계약상 행동 데이터 연속성에 포함되지 않는 과거 데이터 백필이며 `feedback-20260911-csv-review.md`에서 별도 추적한다. 현재 계약 파일은 협의용 초안이므로 서명된 최종본이나 명시적으로 합의한 변경서가 제공되면 다시 대조한다.
