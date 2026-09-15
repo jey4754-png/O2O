@@ -86,6 +86,19 @@ test('fingerprints ignore object key order and undefined metadata while preservi
   }
 });
 
+test('fingerprints treat formatted and normalized customer phone numbers as the same order', () => {
+  const order = {
+    id: 'order-1234567890396',
+    customerPhone: '010-1234-5678',
+    paymentStatus: 'pending',
+    deal: { id: 'phone-normalization', title: '전화번호 정규화 검수' },
+  };
+  assert.equal(
+    customerOrderSyncFingerprint(order),
+    customerOrderSyncFingerprint({ ...order, customerPhone: '01012345678' }),
+  );
+});
+
 test('customer browser read → real API → GAS returns only phone/key-authorized current and event history', async () => {
   const current = historyOrder('1234567890301', { _customerCapabilityHash: hash });
   const historic = historyOrder('1234567890302', { _customerCapabilityHash: hash });

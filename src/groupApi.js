@@ -1939,16 +1939,15 @@ export async function fetchUnreadCounts({ adminMode = false, onSnapshot } = {}) 
     .filter(({ credential }) => Boolean(credential?.actorId && credential?.capabilityToken))
     .filter(({ credential }) => credential.active !== false)
     .filter(({ credential }) => (adminMode ? credential.role === 'admin' : credential.role !== 'admin'));
-  const snapshots = [];
-  for (const { groupId, credential } of entries) {
+  const snapshots = await Promise.all(entries.map(async ({ groupId, credential }) => {
     try {
       const snapshot = await fetchGroupSnapshot(groupId, { actorId: credential.actorId });
-      snapshots.push([groupId, snapshot]);
       onSnapshot?.(groupId, snapshot, credential.actorId);
+      return [groupId, snapshot];
     } catch {
-      snapshots.push([groupId, null]);
+      return [groupId, null];
     }
-  }
+  }));
   return Object.fromEntries(snapshots.map(([groupId, snapshot]) => [
     groupId,
     snapshot ? resolveUnreadCount(snapshot, getLastReadSeq(groupId)) : 0,

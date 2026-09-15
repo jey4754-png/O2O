@@ -39,7 +39,10 @@ export function customerOrderSyncFingerprint(order) {
   const reservationMutationId = content.reservationMutationId || clientMutationId;
   const canonicalContent = Object.fromEntries(ORDER_SYNC_FIELDS
     .filter((key) => Object.hasOwn(content, key))
-    .map((key) => [key, content[key]]));
+    .map((key) => [
+      key,
+      key === 'customerPhone' ? String(content[key] || '').replace(/\D/g, '') : content[key],
+    ]));
   return JSON.stringify(stableJsonValue({
     ...canonicalContent,
     ...(reservationMutationId ? { reservationMutationId } : {}),

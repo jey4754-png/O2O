@@ -560,3 +560,47 @@ test('실제 API·GAS: 중앙 주문의 빈 변경 이력을 임의 보강해 �
     expect(pipeline.failures).toEqual([]);
   } finally { await pipeline.close(); }
 });
+
+test('실제 API·GAS: 다른 화면에서 입금완료된 오래된 로컬 주문은 중앙 조회 뒤 재게시하지 않는다', async ({ page }) => {
+  const pipeline = await installPaymentPipeline(page);
+  try {
+    await createSelfHostedGroup(page);
+    await waitForOrderAcknowledgement(page, pipeline);
+    const [order] = pipeline.orders();
+    const staleOrders = await page.evaluate(() => localStorage.getItem('o2o_mvp_customer_orders'));
+
+    // Advance the canonical payment state without this screen's local callback,
+    // reproducing a second window or an administrator confirmation.
+    await page.evaluate(async ({ groupId, visitorId }) => {
+      const { transitionParticipantPayment } = await import('/src/groupApi.js');
+      await transitionParticipantPayment(groupId, visitorId, 'next', visitorId);
+      await transitionParticipantPayment(groupId, visitorId, 'next', visitorId);
+    }, order);
+    expect(pipeline.orders()[0].paymentStatus).toBe('confirmed');
+
+    // Reopen with the genuine earlier pending snapshot and without its local
+    // acknowledgement. The old publish-first loop replayed this row, received
+    // a version conflict and delayed both My Orders and group polling.
+    await page.evaluate((saved) => {
+      localStorage.setItem('o2o_mvp_customer_orders', saved);
+      localStorage.removeItem('o2o_mvp_customer_order_sync_fingerprints');
+      localStorage.removeItem('o2o_mvp_customer_order_sync_issues_v1');
+    }, staleOrders);
+    const requestStart = pipeline.apiRequests.length;
+    await page.reload();
+    await expect.poll(() => pipeline.apiRequests.slice(requestStart).filter(({ path, body }) => (
+      path === '/api/customer-orders' && body.action === 'list'
+    )).length).toBeGreaterThan(0);
+    await page.waitForTimeout(300);
+    const refreshRequests = pipeline.apiRequests.slice(requestStart)
+      .filter(({ path }) => path === '/api/customer-orders');
+    expect(refreshRequests[0].body.action).toBe('list');
+    expect(refreshRequests.filter(({ body }) => body.action === 'publish')).toEqual([]);
+
+    await page.getByRole('button', { name: '내 주문', exact: true }).click();
+    await expect(page.locator('.customer-payment-state.confirmed')).toContainText('입금완료');
+    expect(pipeline.orders()[0].paymentStatus).toBe('confirmed');
+    expect(pipeline.payments()).toHaveLength(2);
+    expect(pipeline.failures).toEqual([]);
+  } finally { await pipeline.close(); }
+});

@@ -42,6 +42,7 @@ import {
 import { RELEASE_FEATURES } from './releasePhase';
 import { SCOPED_UI_ACTIONS } from './scopeUi';
 import { isOlderGroupSnapshot } from './groupSnapshotFreshness';
+import { nextPollDelay } from './pollCadence';
 
 const ERROR_MESSAGES = {
   admin_pin_required: '관리자 PIN을 입력해 주세요.',
@@ -365,6 +366,7 @@ export default function GroupRoom({
       }
       if (inFlight) return;
       inFlight = true;
+      const startedAt = Date.now();
       controller?.abort();
       controller = new AbortController();
       const revision = mutationRevisionRef.current;
@@ -393,7 +395,12 @@ export default function GroupRoom({
         inFlight = false;
         if (!cancelled) {
           setLoading(false);
-          if (!terminalMissing) schedule(retryDelay);
+          if (!terminalMissing) schedule(nextPollDelay({
+            startedAt,
+            completedAt: Date.now(),
+            intervalMs: 5000,
+            retryDelayMs: retryDelay,
+          }));
         }
       }
     };

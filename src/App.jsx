@@ -1525,7 +1525,7 @@ function App() {
       }
     };
     refreshUnread();
-    const timer = window.setInterval(refreshUnread, 10000);
+    const timer = window.setInterval(refreshUnread, 5000);
     const handleFocus = () => refreshUnread();
     window.addEventListener('focus', handleFocus);
     window.addEventListener('pageshow', handleFocus);
@@ -2348,14 +2348,68 @@ function App() {
           .map((order) => ({ ...order, customerPhone: profilePhone }));
         const fingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
         const issues = loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {});
-        const pending = matchingLocalOrders.filter(
-          (order) => shouldPublishQueuedOrder(order, fingerprints, issues),
+        // Read the central collection before replaying any locally queued row.
+        // A different room or manager can advance an order while this browser
+        // still has the older payment version. Publishing that stale copy first
+        // creates an avoidable CAS/receipt conflict and can occupy the collector
+        // long enough to delay chat and My Orders refreshes.
+        let centralOrders = [];
+        let historyReadFailed = false;
+        try {
+          centralOrders = await fetchCustomerOrders(profilePhone, {
+            strict: true,
+            signal: readController.signal,
+          });
+        } catch {
+          historyReadFailed = true;
+        }
+        if (!isCurrent()) return;
+        const centralById = new Map(centralOrders.map((order) => [order.id, order]));
+        const recoverableOrderIds = new Set(
+          listRecoverableCheckoutAttempts().map((attempt) => attempt.orderId),
         );
+        // When the authoritative read is unavailable, keep the local display
+        // snapshot and wait. Blind publication cannot distinguish a genuinely
+        // new checkout from an old browser copy of an already changed order.
+        const pending = matchingLocalOrders.filter((order) => {
+          if (!shouldPublishQueuedOrder(order, fingerprints, issues)) return false;
+          // A recorded interrupted checkout has a frozen mutation identity and
+          // is safe to retry even while the read endpoint is temporarily down.
+          if (historyReadFailed) return recoverableOrderIds.has(order.id);
+          const centralOrder = centralById.get(order.id);
+          if (!centralOrder) return true;
+          // Never replay a stale browser copy over a newer canonical payment
+          // version. Equal-version content changes remain eligible so a real
+          // unsent customer edit/recovery can still complete.
+          if (canonicalOrderVersion(centralOrder) > canonicalOrderVersion(order)) return false;
+          return customerOrderSyncFingerprint(centralOrder) !== customerOrderSyncFingerprint(order);
+        });
         const published = [];
         const syncErrors = [];
         const rollbackResults = [];
         for (const order of pending) {
           if (!isCurrent()) return;
+          const latestOrder = loadOrders().find((item) => item.id === order.id);
+          const latestFingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
+          const latestIssues = loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {});
+          // The authoritative read can overlap a room action or a persisted
+          // failure marker. Recheck the exact input immediately before writing
+          // so an older polling pass cannot publish or compensate that order.
+          if (orderSyncStateChanged({
+            previousOrder: order,
+            currentOrder: latestOrder ? { ...latestOrder, customerPhone: profilePhone } : undefined,
+            previousAcknowledgement: fingerprints[order.id],
+            currentAcknowledgement: latestFingerprints[order.id],
+            previousIssue: issues[order.id],
+            currentIssue: latestIssues[order.id],
+          }) || !latestOrder || !shouldPublishQueuedOrder(
+            { ...latestOrder, customerPhone: profilePhone }, latestFingerprints, latestIssues,
+          )) {
+            published.push(null);
+            syncErrors.push(null);
+            rollbackResults.push(null);
+            continue;
+          }
           try {
             published.push(await publishCustomerOrder(order, {
               throwOnError: true,
@@ -2392,7 +2446,22 @@ function App() {
               : (reconciliationReadError || error));
             let rollbackResult = null;
             const reservationMutationId = order.reservationMutationId || order.clientMutationId;
-            if (isTerminalOrderSyncError(error)
+            // The user or another refresh can change the local order state while
+            // this request is in flight. Never compensate a creator group from
+            // an obsolete failure; the later commit phase already treats that
+            // result as superseded, and the destructive rollback must obey the
+            // same boundary.
+            const latestOrder = loadOrders().find((item) => item.id === order.id);
+            const failureWasSuperseded = orderSyncStateChanged({
+              previousOrder: order,
+              currentOrder: latestOrder ? { ...latestOrder, customerPhone: profilePhone } : undefined,
+              previousAcknowledgement: fingerprints[order.id],
+              currentAcknowledgement: loadJson(CUSTOMER_ORDER_SYNCED_KEY, {})[order.id],
+              previousIssue: issues[order.id],
+              currentIssue: loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {})[order.id],
+            });
+            if (!failureWasSuperseded
+              && isTerminalOrderSyncError(error)
               && order.groupId
               && reservationMutationId) {
               try {
@@ -2416,12 +2485,18 @@ function App() {
           }
         }
         if (!isCurrent()) return;
-        let centralOrders = [];
-        let historyReadFailed = false;
-        try {
-          centralOrders = await fetchCustomerOrders(profilePhone, { strict: true, signal: readController.signal });
-        } catch {
-          historyReadFailed = true;
+        // Only writes need a follow-up read. A read-only refresh already has the
+        // newest authorized collection and must not double the expensive
+        // history request on every interval.
+        if (pending.length) {
+          try {
+            centralOrders = await fetchCustomerOrders(profilePhone, {
+              strict: true,
+              signal: readController.signal,
+            });
+          } catch {
+            historyReadFailed = true;
+          }
         }
         if (!isCurrent()) return;
         // Another action can finish while either request above is awaiting.
@@ -4248,7 +4323,14 @@ function CustomerApp({
   );
   const selectedGroupCanRestore = selectedGroupIsLocalCreator || selectedGroupCanRecoverLegacy;
   const requestedScreen = normalizeCustomerScreen(screen, accessOptions);
-  const activeScreen = requestedScreen === 'room' && !(
+  const selectionRequiredScreens = ['detail', 'room', 'join', 'group', 'complete'];
+  // A central refresh can remove a deal while one of its screens is open.
+  // Render the safe list immediately instead of dereferencing the now-missing
+  // selection and blanking the whole customer app.
+  const selectedScreen = !selectedDeal && selectionRequiredScreens.includes(requestedScreen)
+    ? 'list'
+    : requestedScreen;
+  const activeScreen = selectedScreen === 'room' && !(
     dealHasGroupRoom(selectedDeal)
     && customerCanOpenGroupRoom({
       adminMode,
@@ -4258,7 +4340,7 @@ function CustomerApp({
     })
   )
     ? 'detail'
-    : requestedScreen;
+    : selectedScreen;
   const navigateCustomer = (nextScreen, options) => onScreen(
     normalizeCustomerScreen(nextScreen, accessOptions),
     options,
