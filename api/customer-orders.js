@@ -8,6 +8,7 @@ const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
 const CAPABILITY_HASH_PATTERN = /^[a-f0-9]{64}$/;
 const OWNER_DEAL_ID_PATTERN = /^owner-[a-zA-Z0-9-]{1,100}$/;
 const OWNER_CLAIM_LIMIT = 50;
+const HISTORY_READ_TIMEOUT_MS = 25000;
 
 export const config = { maxDuration: 60 };
 
@@ -364,6 +365,11 @@ async function directCollector(body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ token: collectorToken, ...body }),
     redirect: 'follow',
+    // A customer with many past rows made this read exceed the shared upstream
+    // default on a cold collector, and “내 주문” then showed every card as
+    // unverified. Reading is idempotent, so waiting is preferable to failing;
+    // mutations keep the shared default so an unknown write outcome stays short.
+    ...(body.action === 'list' ? { timeoutMs: HISTORY_READ_TIMEOUT_MS } : {}),
   });
   if (!upstream.ok || !result.ok) throw new Error(result.error || 'collector_failed');
   return result;

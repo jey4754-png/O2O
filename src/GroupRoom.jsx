@@ -1114,6 +1114,13 @@ export default function GroupRoom({
                     {role === 'admin' && paymentStatus === 'requested' && groupStatus === 'recruiting' && (
                       <button className="secondary-button mini-button" disabled={busy || paymentRetryBlocked} onClick={() => changePayment(participant, 'previous')}>입금대기로 변경</button>
                     )}
+                    {paymentRetryBlocked && !rowFeedback && (canSelfRequest || canOperatorChange) && (
+                      <div className="payment-feedback">
+                        <p className="room-loading" role="status">{pendingTransition?.action === 'transition_group'
+                          ? '이전 거래 단계 변경의 처리 결과를 먼저 확인해야 합니다. 위 “현재 거래 진행 상태”에서 같은 단계 버튼을 눌러 결과를 확인한 뒤 입금 상태를 변경해 주세요.'
+                          : '다른 참여자의 이전 입금 요청 결과를 먼저 확인해야 합니다. 해당 참여자 줄의 입금 버튼을 눌러 결과를 확인해 주세요.'}</p>
+                      </div>
+                    )}
                     {rowFeedback && <div className="payment-feedback" ref={paymentFeedbackRef}>
                       <p className={rowFeedback.phase === 'error' ? 'room-error' : rowFeedback.phase === 'success' ? 'room-notice' : 'room-loading'}
                         role={rowFeedback.phase === 'error' ? 'alert' : 'status'}>{rowFeedback.message}</p>

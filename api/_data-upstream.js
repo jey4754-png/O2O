@@ -22,14 +22,14 @@ function currentDeploymentOrigins() {
   ].filter(Boolean));
 }
 
-function upstreamTimeoutMs() {
-  const configured = Number(process.env.O2O_UPSTREAM_TIMEOUT_MS);
+function upstreamTimeoutMs(overrideMs) {
+  const configured = Number(overrideMs ?? process.env.O2O_UPSTREAM_TIMEOUT_MS);
   if (!Number.isFinite(configured)) return DEFAULT_UPSTREAM_TIMEOUT_MS;
   return Math.max(1000, Math.min(MAX_UPSTREAM_TIMEOUT_MS, Math.floor(configured)));
 }
 
-function timeoutSignal(existingSignal) {
-  const deadline = AbortSignal.timeout(upstreamTimeoutMs());
+function timeoutSignal(existingSignal, overrideMs) {
+  const deadline = AbortSignal.timeout(upstreamTimeoutMs(overrideMs));
   if (!existingSignal) return deadline;
   return typeof AbortSignal.any === 'function'
     ? AbortSignal.any([existingSignal, deadline])
@@ -90,11 +90,15 @@ export async function callDataApiJson(path, options = {}) {
 }
 
 export async function fetchUpstreamJson(url, options = {}) {
+  // A cold Apps Script run can exceed the shared default before it answers at
+  // all. Callers whose request is a single short round trip may wait longer
+  // instead of turning that start-up delay into a user-visible failure.
+  const { timeoutMs, ...fetchOptions } = options;
   let upstream;
   try {
     upstream = await fetch(url, {
-      ...options,
-      signal: timeoutSignal(options.signal),
+      ...fetchOptions,
+      signal: timeoutSignal(options.signal, timeoutMs),
     });
   } catch (error) {
     throw normalizeFetchError(error);

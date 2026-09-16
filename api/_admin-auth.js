@@ -7,6 +7,7 @@ const SCRYPT_OPTIONS = { N: 16384, r: 8, p: 1, maxmem: 64 * 1024 * 1024 };
 const ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
 const MUTATION_ID = /^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/;
 const RATE_LIMIT_KEY = /^[a-f0-9]{32}$/;
+const ADMIN_CREDENTIAL_TIMEOUT_MS = 25000;
 export function adminAuthError(code, status = 400) {
   return Object.assign(new Error(code), { code, status });
 }
@@ -70,6 +71,10 @@ async function credentialRequest(payload) {
     for (let attempt = 0; ; attempt += 1) {
       const { upstream, result } = await fetchUpstreamJson(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
+        // A reserved rate-limit slot is lost when this request times out, so a
+        // cold collector start must not be cut short. The admin functions allow
+        // 60s, which still bounds this call plus the operation that follows.
+        timeoutMs: ADMIN_CREDENTIAL_TIMEOUT_MS,
       });
       // These exact GAS responses originate only before acquiring the auth
       // script lock, before reading or changing the limiter. Do not replay an

@@ -2319,25 +2319,38 @@ function App() {
     if (!profilePhone || profile?.testerType !== '사용자') return undefined;
     let cancelled = false;
     let syncing = false;
+    let syncingExplicit = false;
     let refreshQueued = false;
+    let explicitQueued = false;
     let readController = null;
     const isCurrent = () => !cancelled && customerHistoryScopeRef.current === profilePhone;
 
-    const syncOrders = async (queueIfBusy = false) => {
+    const syncOrders = async (queueIfBusy = false, { explicit = false } = {}) => {
       if (!isCurrent() || document.visibilityState === 'hidden') return;
+      // “주문 이력 다시 불러오기” must always show that it is running and must
+      // reach a new read. Dropping the press because an unrelated background
+      // refresh happened to be in flight left the previous failure notice
+      // unchanged, so the button looked dead exactly when it was needed.
+      if (explicit) setCustomerHistoryState({ scope: profilePhone, status: 'loading' });
       if (syncing) {
-        if (queueIfBusy === true) refreshQueued = true;
+        // Repeated presses during the refresh they already started are covered
+        // by it; queueing those would only repeat an expensive history read.
+        const coveredByRunningRefresh = explicit && syncingExplicit;
+        if (!coveredByRunningRefresh && (queueIfBusy === true || explicit)) refreshQueued = true;
+        if (!coveredByRunningRefresh && explicit) explicitQueued = true;
         return;
       }
       syncing = true;
+      syncingExplicit = explicit;
       refreshQueued = false;
+      explicitQueued = false;
       readController = new AbortController();
       // Keep the last resolved order/payment snapshot visible during a
       // background refresh. Replacing every card with “확인 중” every 30
       // seconds made a healthy confirmed state look stuck while the network
       // request was merely in flight.
       setCustomerHistoryState((current) => (
-        current.scope === profilePhone && current.status !== 'loading'
+        !explicit && current.scope === profilePhone && current.status !== 'loading'
           ? current
           : { scope: profilePhone, status: 'loading' }
       ));
@@ -2613,14 +2626,17 @@ function App() {
         if (isCurrent()) setCustomerHistoryState({ scope: profilePhone, status: 'error' });
       } finally {
         syncing = false;
+        syncingExplicit = false;
         readController = null;
+        const queuedExplicit = explicitQueued;
+        explicitQueued = false;
         // A room snapshot or completed payment may arrive while the previous
         // read is still returning an older order. Keep one follow-up request
         // instead of dropping that change until the next periodic poll.
-        if (refreshQueued && isCurrent()) void syncOrders();
+        if (refreshQueued && isCurrent()) void syncOrders(false, { explicit: queuedExplicit });
       }
     };
-    customerHistoryRetryRef.current = syncOrders;
+    customerHistoryRetryRef.current = () => syncOrders(false, { explicit: true });
     const refreshChangedOrders = () => syncOrders(true);
 
     const handleVisibility = () => {
