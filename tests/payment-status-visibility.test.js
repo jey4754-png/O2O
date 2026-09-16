@@ -50,9 +50,9 @@ test('the admin credential round trip may outlast the shared upstream default wi
 });
 
 test('a slow history read is awaited instead of being reported as unverified', () => {
-  assert.equal(CUSTOMER_HISTORY_TIMEOUT_MS, 30000);
-  assert.match(customerOrdersSource, /const HISTORY_READ_TIMEOUT_MS = 25000;/);
+  assert.equal(CUSTOMER_HISTORY_TIMEOUT_MS, 55000);
+  assert.match(customerOrdersSource, /const HISTORY_READ_TIMEOUT_MS = 50000;/);
   assert.match(customerOrdersSource, /\.\.\.\(body\.action === 'list' \? \{ timeoutMs: HISTORY_READ_TIMEOUT_MS \} : \{\}\)/);
-  assert.equal(CUSTOMER_HISTORY_TIMEOUT_MS > 25000, true,
+  assert.equal(CUSTOMER_HISTORY_TIMEOUT_MS > 50000, true,
     'the browser must outlast the central read it asked for');
 });

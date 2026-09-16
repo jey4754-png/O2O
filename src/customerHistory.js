@@ -1,7 +1,7 @@
-// The browser must outlast the central read it asked for. Aborting at 20s
-// while the server was still allowed 25s turned a slow but successful history
-// read into “입금 상태 확인 필요” on every order card.
-export const CUSTOMER_HISTORY_TIMEOUT_MS = 30000;
+// The browser must outlast the central read it asked for. Aborting first turned
+// a slow but successful history read into “입금 상태 확인 필요” on every order
+// card, so this stays above the server's own read budget.
+export const CUSTOMER_HISTORY_TIMEOUT_MS = 55000;
 
 const ORDER_SYNC_FIELDS = [
   'id', 'createdAt', 'statusUpdatedAt', 'status', 'paymentStatus', 'visitorId',

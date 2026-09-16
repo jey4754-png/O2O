@@ -53,6 +53,9 @@ const ADMIN_AUTH_RATE_BLOCK_MS = 15 * 60 * 1000;
 const ADMIN_AUTH_RATE_CLIENT_FAILURE_LIMIT = 5;
 const ADMIN_AUTH_RATE_GLOBAL_FAILURE_LIMIT = 40;
 const ADMIN_AUTH_RATE_MAX_CLIENTS = 48;
+const HISTORIC_CUSTOMER_ORDER_CACHE_PREFIX = 'historic_customer_orders_v1_';
+const HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS = 21600;
+const HISTORIC_CUSTOMER_ORDER_CACHE_MAX_LENGTH = 90000;
 const PUBLIC_DEALS_CACHE_KEY = 'public_deals_v4';
 const PUBLIC_DEALS_CACHE_CHUNK_PREFIX = 'public_deals_v4_chunk_';
 const PUBLIC_DEALS_CACHE_CHUNK_SIZE = 60000;
@@ -795,6 +798,42 @@ function sha256Hex_(value) {
   )
     .map(function(byte) { return ('0' + (byte & 255).toString(16)).slice(-2); })
     .join('');
+}
+
+// Legacy order snapshots live in the analytics event log, and a phone read has
+// to scan that whole sheet to rebuild them. Publishing writes the canonical
+// 주문 내역 row instead, so this derived set only changes when the event sheet
+// itself gains a row — the row count is therefore a safe cache key. Current
+// orders and the participant payment projection are always read fresh, so a
+// cache hit can never freeze a live 입금 상태.
+function historicCustomerOrderCacheKey_(phone, eventRowCount) {
+  return HISTORIC_CUSTOMER_ORDER_CACHE_PREFIX
+    + sha256Hex_('historic-orders:' + String(phone || '')).slice(0, 24)
+    + '_' + String(eventRowCount);
+}
+
+function cachedHistoricCustomerOrders_(phone, eventRowCount) {
+  try {
+    const value = CacheService.getScriptCache()
+      .get(historicCustomerOrderCacheKey_(phone, eventRowCount));
+    if (typeof value !== 'string') return null;
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function cacheHistoricCustomerOrders_(phone, eventRowCount, orders) {
+  try {
+    const serialized = JSON.stringify(orders);
+    if (serialized.length > HISTORIC_CUSTOMER_ORDER_CACHE_MAX_LENGTH) return;
+    CacheService.getScriptCache().put(
+      historicCustomerOrderCacheKey_(phone, eventRowCount),
+      serialized,
+      HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS
+    );
+  } catch (error) {}
 }
 
 function legacyRecoveryDenied_() {
@@ -3914,7 +3953,12 @@ function getCustomerOrders_(phoneValue, visitorIdValue, customerCapabilityHashVa
   // Ownership conflicts and canonical versions are keyed by order id, not by
   // group. Keep every phone-matching snapshot in those checks so a scoped read
   // cannot revive an older order or hide a conflicting key in another group.
-  const historic = historicCustomerOrders_(sheets.events, phone, '');
+  const eventRowCount = sheets.events.getLastRow();
+  let historic = cachedHistoricCustomerOrders_(phone, eventRowCount);
+  if (!historic) {
+    historic = historicCustomerOrders_(sheets.events, phone, '');
+    cacheHistoricCustomerOrders_(phone, eventRowCount, historic);
+  }
   const authorized = filterCustomerOrdersForProof_(
     current.concat(historic),
     visitorId,
