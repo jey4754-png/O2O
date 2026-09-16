@@ -54,6 +54,22 @@
 - 6번 관리자 인증 지연은 완화이며 제거를 확인한 것이 아니다. 배포 후 첫 로그인 결과를 기록해야 한다.
 - 중앙 원본이나 그룹·주문 연결 근거가 없는 과거 기록의 재생성은 이번 수정 범위가 아니다. `feedback-20260911-csv-review.md`의 추적 항목을 따른다.
 
-## 배포 상태
+## 배포
 
-2026-09-16 기준 이 수정은 로컬 검증까지 완료했고 운영 배포는 하지 않았다. 이 작업 환경에서 `git`이 Xcode 라이선스 미동의로 실행되지 않아 커밋·푸시를 만들지 못했다. 운영 자산을 GitHub `main`의 커밋과 연결해 기록하는 기존 인수 절차를 지키기 위해, 커밋이 가능해진 뒤에 배포하고 배포 ID·자산 해시·읽기 점검 결과를 여기에 추가한다.
+| 항목 | 값 |
+| --- | --- |
+| 운영 URL | `https://o2o-ten.vercel.app` |
+| 배포 | `dpl_BXJwPNvYZp6mP65BQihKSJWqAGCS` / 2026-09-16 10:21:12 KST / READY |
+| 배포 원본 URL | `https://o2o-s0j3k4twa-malshues-projects.vercel.app` |
+| 운영 자산 | `index-CNh8Yhat.js` / SHA-256 `00769e2dbfabc505ca06b4342b322b4b45d2a7c4a38ba9cab97239bf51488d08` |
+| 소스 기준 | GitHub `jey4754-png/O2O`, `main`, `c68b386cf1c57ef8e2bb3fc0b855a4c6c7e6bcc0` |
+| 되돌리기 참조 | 이전 운영 배포 `dpl_2SuP9bAyxboB65A8jPUmkKKM6xLr` / 자산 `index-D_rzv2f-.js` |
+
+운영 설정으로 후보를 먼저 만들어 검사한 뒤 운영 별칭에 연결했다. 후보와 운영의 자산 바이트가 동일한 것을 확인했다. 로컬 기본 설정 빌드의 해시는 환경변수 차이로 다르며, 이는 기존 배포 절차와 같다.
+
+- 후보·운영 모두 `/`, `/customer`, `/owner`, `/admin`, `/dashboard` HTTP 200
+- 중앙 공개상품 읽기 200, `ok: true`, 활성 46건(후보 9.6초, 운영 9.4초). 이 응답 시간은 이번 제한 시간 조정의 근거와 일치한다
+- 후보를 Chromium·WebKit 모바일 뷰포트로 `/customer`·`/owner`·`/admin`에서 열었을 때 페이지 오류 0건
+- Apps Script는 v24를 유지했고 운영 PIN·상품·주문·입금 상태는 변경하지 않았다
+
+`contract-closeout-20260914.md`의 배포 식별자는 9월 15일 기준이므로, 인수 자료를 다시 낼 때는 위 배포로 갱신해야 한다.

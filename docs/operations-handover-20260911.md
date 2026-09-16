@@ -4,7 +4,8 @@
 
 - 서비스: https://o2o-ten.vercel.app
 - 사용자 `/customer`, 사장님 `/owner`, 관리자 `/admin`, 대시보드 `/dashboard`.
-- 현재 중앙 저장소는 Google Sheets와 Apps Script v24다. 운영 웹은 2026-09-15 11:55:57 KST에 생성된 Vercel 배포 `dpl_2SuP9bAyxboB65A8jPUmkKKM6xLr`, 배포 URL `https://o2o-ook3w3gby-malshues-projects.vercel.app`, 운영 별칭 `https://o2o-ten.vercel.app`, 자산 `index-D_rzv2f-.js`를 사용한다. 자산 SHA-256은 `db7e3fd8f174161ecf3aae2d9543e862adf5583966dcf38fb32e1fa8c5a986c9`이다. 웹 소스 기준 커밋은 `c4dc0273730f10b58a715da3038365292a900434`이며, 중앙 처리 소스는 `apps-script/Code.gs`, 필요한 설정 이름은 `.env.example`과 README에 있다. 비밀값은 공개 자료에 포함하지 않는다.
+- 현재 중앙 저장소는 Google Sheets와 Apps Script v24다. 운영 웹은 2026-09-16 10:21:12 KST에 생성된 Vercel 배포 `dpl_BXJwPNvYZp6mP65BQihKSJWqAGCS`, 배포 URL `https://o2o-s0j3k4twa-malshues-projects.vercel.app`, 운영 별칭 `https://o2o-ten.vercel.app`, 자산 `index-CNh8Yhat.js`를 사용한다. 자산 SHA-256은 `00769e2dbfabc505ca06b4342b322b4b45d2a7c4a38ba9cab97239bf51488d08`이다. 웹 소스 기준 커밋은 `c68b386cf1c57ef8e2bb3fc0b855a4c6c7e6bcc0`이며, 중앙 처리 소스는 `apps-script/Code.gs`, 필요한 설정 이름은 `.env.example`과 README에 있다. 비밀값은 공개 자료에 포함하지 않는다.
+- 되돌리기 참조로 이전 운영 배포 `dpl_2SuP9bAyxboB65A8jPUmkKKM6xLr`(자산 `index-D_rzv2f-.js`, 커밋 `c4dc0273730f10b58a715da3038365292a900434`)를 보존한다. 2026-09-16 배포의 수정 범위와 남은 확인은 `feedback-20260915-payment-sync-qa.md`에 있다.
 - Apps Script 프로젝트 소유자는 `Joo Joo`이며 `dev@bottlecorp.kr`은 편집기다. Git 원격은 `jey4754-png/O2O`, 기본 브랜치는 `main`이다. 인수자는 각 서비스에서 자신의 실제 소유·관리 권한을 직접 확인한다.
 - 2026-09-11 20:34 KST 중앙 시점 백업을 `/Users/seungsoohan/Documents/O2O-Handover/uptwoyou-data-20260911-2034.xlsx`에 생성했다. 2026-09-14 재검사 기준 파일은 3,272,479바이트, 권한 600, SHA-256 `12cbab012034d324682dc0d2957f7f676c8ae00b302a8f41c483fe851a43c58f`이며 ZIP 무결성과 11개 시트의 XLSX 구조 검사를 통과했다. 고객 정보가 포함될 수 있으므로 공개 저장소·일반 채팅에 첨부하지 않는다.
 - 관리자 PIN 변경은 관리자 로그인 후 PIN 변경 화면에서 한다. 중앙 PIN 해시 속성이나 권한 비밀을 삭제·초기화하는 것을 장애 복구로 사용하지 않는다.
