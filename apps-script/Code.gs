@@ -4050,21 +4050,33 @@ function matchedEventColumnValues_(events, matches, column) {
   return results;
 }
 
+// The phone column carries every analytics row for that customer, so a 4-digit
+// match returned a huge, sparse match set and this read grew past a 50s budget.
+// The order snapshots themselves are a small, bounded set, and matching the
+// event name exactly is what the authorized owner/admin read already does in
+// production. Select those rows first, then apply the existing phone check
+// below, so no snapshot is ever skipped.
 function historicCustomerOrders_(events, phone, dealId) {
   if (events.getLastRow() < 2) return [];
   let rows;
   let matches;
+  let snapshotMatched = false;
   if (dealId) {
     matches = events.getRange(2, 12, events.getLastRow() - 1, 1)
       .createTextFinder(String(dealId)).matchCase(true).findAll();
   } else if (phone) {
-    const normalizedPhone = normalizePhone_(phone);
-    matches = events.getRange(2, 14, events.getLastRow() - 1, 1)
-      .createTextFinder(normalizedPhone.slice(-4)).findAll();
+    snapshotMatched = true;
+    matches = events.getRange(2, 7, events.getLastRow() - 1, 1)
+      .createTextFinder('customer_order_snapshot').matchCase(true).matchEntireCell(true)
+      .findAll();
   } else {
     rows = events.getRange(2, 1, events.getLastRow() - 1, EVENT_HEADERS.length).getValues();
   }
-  if (matches) {
+  if (matches && snapshotMatched) {
+    if (!matches.length) return [];
+    rows = matchedEventRows_(events, matches);
+  }
+  if (matches && !snapshotMatched) {
     if (!matches.length) return [];
     const eventNames = matchedEventColumnValues_(events, matches, 7);
     // Most phone/deal matches are analytics events. Intersect indexes before

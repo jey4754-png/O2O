@@ -94,17 +94,21 @@ test('adaptive event windows preserve distant cross-group versions, conflicting 
   assert.equal(JSON.stringify([scoped, unscoped]).includes(hash), false);
 });
 
-test('customer history filters phone matches without a second full event-name scan', () => {
+test('customer history makes one selective full-column scan and still filters by phone', () => {
   const mine = fixtureOrder(123);
-  const store = customerHistoryStore({ current: [mine], historic: [mine] });
+  // Another customer's snapshot must never leak now that the selective scan is
+  // the bounded order-snapshot set rather than a phone match.
+  const theirs = historyOrder('1700000000124', { groupId, dealId: groupId,
+    _customerCapabilityHash: hash, customerPhone: '01099998888' });
+  const store = customerHistoryStore({ current: [mine], historic: [mine, theirs] });
   const originalGetRange = store.data.events.getRange.bind(store.data.events);
-  let globalEventNameFinders = 0;
+  const fullColumnScans = [];
   store.data.events.getRange = (row, column, height, width) => {
     const range = originalGetRange(row, column, height, width);
     const originalCreateTextFinder = range.createTextFinder.bind(range);
     range.createTextFinder = (value) => {
-      if (column === 7 && row === 2 && height === store.eventRows.length - 1) {
-        globalEventNameFinders += 1;
+      if (row === 2 && height === store.eventRows.length - 1) {
+        fullColumnScans.push({ column, value });
       }
       return originalCreateTextFinder(value);
     };
@@ -113,7 +117,11 @@ test('customer history filters phone matches without a second full event-name sc
   const result = read(store, '');
   assert.equal(result.ok, true, result.error);
   assert.deepEqual(result.orders.map((order) => order.id), [mine.id]);
-  assert.equal(globalEventNameFinders, 0);
+  // One pass, not two. A phone match over the whole sheet returned every
+  // analytics row for that customer and stopped completing in production, so
+  // the snapshot set is selected directly and filtered by phone afterwards.
+  assert.equal(fullColumnScans.length, 1);
+  assert.deepEqual(fullColumnScans[0], { column: 7, value: 'customer_order_snapshot' });
 });
 
 for (const proxied of [false, true]) {

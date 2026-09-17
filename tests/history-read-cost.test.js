@@ -238,3 +238,26 @@ test('a repeated phone history read reuses the legacy event scan but never a sta
   read();
   assert.ok(eventScans > scansAfterFirst, 'a changed event sheet must invalidate the cached legacy set');
 });
+
+test('a phone history read selects order snapshots by exact event name, not by a 4-digit phone match', () => {
+  const { context, data } = adminStore();
+  // Analytics rows carrying the same last 4 phone digits must not drive the scan.
+  for (let index = 0; index < 50; index += 1) {
+    data.events.rows.push(['2026-09-01T00:00:00Z', '', '', '', '', '', 'screen_view',
+      '', '', '', '', '{}', '', '01011112222']);
+  }
+  const finders = [];
+  const eventsGetRange = data.events.getRange.bind(data.events);
+  data.events.getRange = (...args) => {
+    const range = eventsGetRange(...args);
+    const createTextFinder = range.createTextFinder?.bind(range);
+    if (createTextFinder) {
+      range.createTextFinder = (needle) => { finders.push({ column: args[1], needle }); return createTextFinder(needle); };
+    }
+    return range;
+  };
+  const result = context.getCustomerOrdersResponse_('01011112222', 'member-test', 'b'.repeat(64));
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(finders, [{ column: 7, needle: 'customer_order_snapshot' }],
+    'the selective scan is the bounded snapshot set, never every row carrying the last 4 phone digits');
+});
