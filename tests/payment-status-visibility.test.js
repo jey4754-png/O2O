@@ -56,3 +56,38 @@ test('a slow history read is awaited instead of being reported as unverified', (
   assert.equal(CUSTOMER_HISTORY_TIMEOUT_MS > 50000, true,
     'the browser must outlast the central read it asked for');
 });
+
+test('the history screen resolves on the read, not on the publish backlog', () => {
+  // A busy collector kept the publish train running for minutes while the
+  // screen still said “이력 확인 중”, even though the history was already known.
+  assert.match(
+    appSource,
+    /setCustomerHistoryState\(\{ scope: profilePhone, status: historyReadFailed \? 'error' : 'ready' \}\);\s*\n\s*const centralById = new Map/,
+  );
+});
+
+test('one sync pass publishes a bounded slice and carries the rest to the next cycle', () => {
+  assert.match(appSource, /const CUSTOMER_ORDER_PUBLISH_BUDGET = 3;/);
+  assert.match(appSource, /const publishBudget = pending\.slice\(0, CUSTOMER_ORDER_PUBLISH_BUDGET\);/);
+  assert.match(appSource, /const deferredPublishCount = pending\.length - publishBudget\.length;/);
+  assert.match(appSource, /if \(deferredPublishCount > 0\) refreshQueued = true;/);
+  // The commit phase must walk the same slice it published.
+  assert.match(appSource, /for \(const order of publishBudget\) \{/);
+  assert.match(appSource, /publishBudget\.forEach\(\(order, index\) => \{/);
+  assert.match(appSource, /if \(publishBudget\.length\) \{/);
+});
+
+test('a stuck publish socket cannot hold the single-file mutation queue open', () => {
+  const checkoutSource = readFileSync(new URL('../src/checkoutAttempt.js', import.meta.url), 'utf8');
+  assert.match(checkoutSource, /const ORDER_PUBLISH_TIMEOUT_MS = 75000;/);
+  assert.match(
+    checkoutSource,
+    /\.\.\.\(typeof AbortSignal\?\.timeout === 'function'\s*\n\s*\? \{ signal: AbortSignal\.timeout\(ORDER_PUBLISH_TIMEOUT_MS\) \}\s*\n\s*: \{\}\),/,
+    'older mobile browsers without AbortSignal.timeout must still publish',
+  );
+  // An aborted publish has an unknown outcome: it carries no status, so it is
+  // neither replayed inline nor treated as a terminal rejection. The sync loop
+  // reconciles it with a central read instead.
+  assert.match(checkoutSource, /const TRANSIENT_ORDER_PUBLISH_CODES = new Set\(\['collector_busy', 'upstream_timeout'\]\);/);
+  assert.match(checkoutSource, /const status = Number\(error\?\.status \|\| 0\);\s*\n\s*return status >= 400 && status < 500/);
+});

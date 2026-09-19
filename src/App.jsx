@@ -364,6 +364,7 @@ const GROUP_STATUS_SEEN_KEY = 'o2o_mvp_group_status_seen_v1';
 const COUNTED_PARTICIPATIONS_KEY = 'o2o_mvp_counted_participations';
 const PUBLIC_DEAL_SYNC_INTERVAL_MS = 60000;
 const CUSTOMER_ORDER_SYNC_INTERVAL_MS = 30000;
+const CUSTOMER_ORDER_PUBLISH_BUDGET = 3;
 const EVENT_MIN_RELEASE_PHASE = Object.freeze({
   chat_message_sent: 8,
   chat_lock_changed: 8,
@@ -2377,6 +2378,11 @@ function App() {
           historyReadFailed = true;
         }
         if (!isCurrent()) return;
+        // The authoritative read is what this screen reports. Publishing any
+        // queued rows happens afterwards and can take a while on a busy
+        // collector, so resolving only at the end left “이력 확인 중” on screen
+        // for minutes even though the history was already known.
+        setCustomerHistoryState({ scope: profilePhone, status: historyReadFailed ? 'error' : 'ready' });
         const centralById = new Map(centralOrders.map((order) => [order.id, order]));
         const recoverableOrderIds = new Set(
           listRecoverableCheckoutAttempts().map((attempt) => attempt.orderId),
@@ -2397,10 +2403,16 @@ function App() {
           if (canonicalOrderVersion(centralOrder) > canonicalOrderVersion(order)) return false;
           return customerOrderSyncFingerprint(centralOrder) !== customerOrderSyncFingerprint(order);
         });
+        // Publishing runs one request at a time against a single-threaded
+        // collector. An unbounded backlog kept that queue busy for minutes and
+        // starved the payment and chat requests behind it, so each pass takes a
+        // bounded slice and the rest is carried to the next cycle.
+        const publishBudget = pending.slice(0, CUSTOMER_ORDER_PUBLISH_BUDGET);
+        const deferredPublishCount = pending.length - publishBudget.length;
         const published = [];
         const syncErrors = [];
         const rollbackResults = [];
-        for (const order of pending) {
+        for (const order of publishBudget) {
           if (!isCurrent()) return;
           const latestOrder = loadOrders().find((item) => item.id === order.id);
           const latestFingerprints = loadJson(CUSTOMER_ORDER_SYNCED_KEY, {});
@@ -2501,7 +2513,7 @@ function App() {
         // Only writes need a follow-up read. A read-only refresh already has the
         // newest authorized collection and must not double the expensive
         // history request on every interval.
-        if (pending.length) {
+        if (publishBudget.length) {
           try {
             centralOrders = await fetchCustomerOrders(profilePhone, {
               strict: true,
@@ -2518,6 +2530,9 @@ function App() {
         const currentIssues = loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {});
         const currentOrders = new Map(loadOrders().map((order) => [order.id, order]));
         const previousOrders = new Map(matchingLocalOrders.map((order) => [order.id, order]));
+        // A deferred remainder is picked up by the next cycle rather than kept
+        // on screen as an unfinished refresh.
+        if (deferredPublishCount > 0) refreshQueued = true;
         const candidateIds = new Set([...previousOrders.keys(), ...centralOrders.map((order) => order.id),
           ...published.filter(Boolean).map((order) => order.id)]);
         const supersededOrderIds = new Set([...candidateIds].filter((id) => {
@@ -2531,7 +2546,7 @@ function App() {
         }));
         const nextFingerprints = { ...currentFingerprints };
         const rolledBackOrderIds = new Set();
-        pending.forEach((order, index) => {
+        publishBudget.forEach((order, index) => {
           if (supersededOrderIds.has(order.id)) {
             published[index] = null;
             return;

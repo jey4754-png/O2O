@@ -1,5 +1,6 @@
 import { runCentralMutation } from './centralMutationQueue.js';
 
+const ORDER_PUBLISH_TIMEOUT_MS = 75000;
 const CHECKOUT_ATTEMPTS_KEY = 'o2o_mvp_checkout_attempts_v1';
 const CHECKOUT_ATTEMPT_TTL_MS = 24 * 60 * 60 * 1000;
 const ORDER_ID_PATTERN = /^order-\d{10,20}$/;
@@ -347,6 +348,14 @@ async function performCustomerOrderPublish(payload, options = {}) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body,
+        // The serverless function answers within its own 60s budget, so only a
+        // genuinely stuck socket reaches this. Without it one such request held
+        // the single-file mutation queue open indefinitely and every later
+        // payment and order write waited behind it. The frozen payload and its
+        // mutation id make the retry idempotent.
+        ...(typeof AbortSignal?.timeout === 'function'
+          ? { signal: AbortSignal.timeout(ORDER_PUBLISH_TIMEOUT_MS) }
+          : {}),
       });
       let result = {};
       try {
