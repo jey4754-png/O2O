@@ -29,6 +29,14 @@ const GROUP_CHAT_HEADERS = [
   '그룹ID', 'SEQ', '메시지ID', '참여자ID', '닉네임', '역할',
   '메시지', '생성시각', '요청ID'
 ];
+// 복구 등록: 기기의 권한 키가 사라졌을 때 본인 확인 후 접근을 되살리기 위한 표.
+// 시트 행을 다시 쓰지 않고 '승계'만 기록한다. 기존 행을 덮어쓰면 부분 실패가
+// 그대로 소유 해시 충돌이 되어 filterCustomerOrdersForProof_ 가 그 주문을
+// 원래 주인에게까지 영구히 숨기기 때문이다.
+const RECOVERY_HEADERS = [
+  '등록시각', '갱신시각', '식별키', '검증자', '결박해시', '현재해시',
+  '결박주문', '결박그룹', '결박상품', '참여자ID', '버전', '마지막변경ID'
+];
 const GROUP_HISTORY_HEADERS = [
   '이력ID', '그룹ID', '대상유형', '대상ID', '이전상태', '변경상태',
   '행동', '수행자ID', '수행자역할', '사유', '요청ID', '버전', '변경시각', '결과데이터'
@@ -3897,7 +3905,61 @@ function customerOrderOwnership_(orders) {
   return { hash: hash, conflict: conflict };
 }
 
-function filterCustomerOrdersForProof_(orders, visitorId, customerCapabilityHash) {
+// 복구 승계 해석.
+//
+// 서버는 원본 권한 토큰을 갖고 있지 않고 해시만 갖고 있으므로 "원래 키를 돌려주는"
+// 복구는 불가능하다. 대신 새 키가 등록 시점에 증명된 옛 키를 '승계'했다고 기록하고,
+// 읽는 시점에만 해석한다. 시트 행은 절대 다시 쓰지 않는다.
+//
+// 승계는 전화번호가 아니라 '등록 시점에 살아있는 키로 증명된 항목 집합'에만 적용된다.
+// 전화번호는 주문 게시 시 클라이언트가 그대로 정하는 값이고(3353행 부근) 사장님·그룹
+// 화면에 노출되므로 소유 증명이 될 수 없다. 전화번호를 근거로 삼으면 남의 번호로 주문
+// 한 건을 만든 뒤 그 번호 전체를 인수할 수 있다.
+function recoveryRowValue_(row, rowNumber) {
+  const parse = function(value, fallback) {
+    try {
+      const parsed = JSON.parse(String(value || ''));
+      return parsed && typeof parsed === 'object' ? parsed : fallback;
+    } catch (error) { return fallback; }
+  };
+  return {
+    rowNumber: rowNumber,
+    identityKey: String(row[2] || ''),
+    verifier: parse(row[3], null),
+    boundHash: String(row[4] || '').toLowerCase(),
+    currentHash: String(row[5] || '').toLowerCase(),
+    boundOrderIds: parse(row[6], []),
+    boundGroups: parse(row[7], []),
+    boundDeals: parse(row[8], []),
+    actorId: String(row[9] || ''),
+    version: Number(row[10] || 0),
+    lastMutationId: String(row[11] || '')
+  };
+}
+
+function recoveryRows_(sheets) {
+  const sheet = sheets && sheets.recovery;
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, RECOVERY_HEADERS.length)
+    .getValues()
+    .map(function(row, index) { return recoveryRowValue_(row, index + 2); })
+    .filter(function(record) {
+      return /^[a-f0-9]{64}$/.test(record.boundHash) && /^[a-f0-9]{64}$/.test(record.currentHash);
+    });
+}
+
+// 제시된 해시가 승계한 옛 해시를 돌려준다. 승계가 없으면 null.
+function recoverySuccession_(sheets, capabilityHash) {
+  const hash = String(capabilityHash || '').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(hash)) return null;
+  const matches = recoveryRows_(sheets).filter(function(record) {
+    return record.currentHash === hash && record.boundHash !== hash;
+  });
+  // 한 키가 여러 등록을 승계하는 것은 정상 경로로 생길 수 없다. 모호하면 승계하지 않는다.
+  return matches.length === 1 ? matches[0] : null;
+}
+
+function filterCustomerOrdersForProof_(orders, visitorId, customerCapabilityHash, succession) {
   const ownershipById = Object.create(null);
   orders.forEach(function(order) {
     if (!order || !order.id) return;
@@ -3913,11 +3975,23 @@ function filterCustomerOrdersForProof_(orders, visitorId, customerCapabilityHash
       ownershipById[key].conflict = true;
     }
   });
+  // 승계된 옛 해시는 등록 시점에 증명된 주문에 한해서만 인정한다.
+  const successionOrderIds = Object.create(null);
+  if (succession) {
+    (succession.boundOrderIds || []).forEach(function(orderId) {
+      successionOrderIds[String(orderId)] = true;
+    });
+  }
   return orders.filter(function(order) {
     if (!order || !order.id) return false;
     const ownership = ownershipById[String(order.id)];
     if (ownership && ownership.conflict) return false;
-    if (ownership && ownership.hash) return ownership.hash === customerCapabilityHash;
+    if (ownership && ownership.hash) {
+      if (ownership.hash === customerCapabilityHash) return true;
+      return Boolean(succession)
+        && successionOrderIds[String(order.id)] === true
+        && ownership.hash === succession.boundHash;
+    }
     // Phone numbers and visitor ids are exposed to the merchant/group owner
     // views and therefore cannot authenticate old unhashed rows. Legacy rows
     // need an explicit capability migration before customer history can expose
@@ -3959,10 +4033,13 @@ function getCustomerOrders_(phoneValue, visitorIdValue, customerCapabilityHashVa
     historic = historicCustomerOrders_(sheets.events, phone, '');
     cacheHistoricCustomerOrders_(phone, eventRowCount, historic);
   }
+  // 승계는 직접 소유가 없을 때만 의미가 있으므로 여기서 한 번만 읽는다.
+  const succession = recoverySuccession_(sheets, customerCapabilityHash);
   const authorized = filterCustomerOrdersForProof_(
     current.concat(historic),
     visitorId,
-    customerCapabilityHash
+    customerCapabilityHash,
+    succession
   );
   const projectionContext = {};
   return mergeCustomerOrderSnapshots_(authorized).filter(function(order) {
@@ -6266,6 +6343,9 @@ function ensureSheets_() {
     publicDeals.getRange(1, 1, 1, PUBLIC_DEAL_HEADERS.length).setValues([PUBLIC_DEAL_HEADERS]);
     publicDeals.setFrozenRows(1);
   }
+  let recovery = spreadsheet.getSheetByName('복구 등록');
+  if (!recovery) recovery = spreadsheet.insertSheet('복구 등록');
+  ensureHeader_(recovery, RECOVERY_HEADERS);
   let customerOrders = spreadsheet.getSheetByName('주문 내역');
   if (!customerOrders) customerOrders = spreadsheet.insertSheet('주문 내역');
   if (customerOrders.getLastRow() === 0) {
@@ -6286,7 +6366,7 @@ function ensureSheets_() {
   ensureHeader_(groupHistory, GROUP_HISTORY_HEADERS);
   RUNTIME_SHEETS_CACHE_ = {
     events, summary, surveys, publicDeals, customerOrders,
-    groups, groupParticipants, groupChat, groupHistory
+    groups, groupParticipants, groupChat, groupHistory, recovery,
   };
   return RUNTIME_SHEETS_CACHE_;
 }
