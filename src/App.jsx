@@ -378,6 +378,7 @@ const isEventVisibleInRelease = (eventName) => (
   Number(EVENT_MIN_RELEASE_PHASE[eventName] || 1) <= RELEASE_FEATURES.phase
 );
 let memoryCustomerOrderCapability = '';
+let customerOrderCapabilityState = { created: false, persisted: true, lostKey: false };
 const visibleEventDefinitions = eventDefinitions.filter((event) => isEventVisibleInRelease(event.name));
 const DEFAULT_LOCATION = {
   region: '경기도',
@@ -493,16 +494,74 @@ function getOwnerCapabilityEntries(ownerScope, scopeByDeal) {
   return scopedOwnerCapabilityEntries(capabilities, scopeByDeal, ownerScope);
 }
 
+// This key is the only proof of ownership for every past order: the central
+// read authorizes by its hash alone. A write that quietly fails hands the
+// customer a brand-new identity on the next load and their whole history
+// disappears, so it is persisted with the same quota recovery as every other
+// stored value and the outcome is reported instead of being swallowed.
+function persistCustomerOrderCapability(capability) {
+  try {
+    localStorage.setItem(CUSTOMER_ORDER_CAPABILITY_KEY, capability);
+    return true;
+  } catch {
+    [CREATED_DEALS_KEY, CUSTOMER_GROUPS_KEY].forEach((storageKey) => {
+      try {
+        const stored = JSON.parse(localStorage.getItem(storageKey) || '[]');
+        localStorage.setItem(storageKey, JSON.stringify(stored, (property, item) => (
+          property === 'image' && typeof item === 'string' && item.startsWith('data:image/')
+            ? fallbackImage
+            : item
+        )));
+      } catch {
+        // A malformed cached value must not stop the retry below.
+      }
+    });
+    try {
+      localStorage.setItem(CUSTOMER_ORDER_CAPABILITY_KEY, capability);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+export function getCustomerOrderCapabilityState() {
+  return customerOrderCapabilityState;
+}
+
 function getCustomerOrderCapability() {
   let capability = memoryCustomerOrderCapability;
+  let stored = null;
   try {
-    capability = localStorage.getItem(CUSTOMER_ORDER_CAPABILITY_KEY) || capability;
-    if (!capability) {
-      capability = createClientCapability('customer');
-      localStorage.setItem(CUSTOMER_ORDER_CAPABILITY_KEY, capability);
-    }
+    stored = localStorage.getItem(CUSTOMER_ORDER_CAPABILITY_KEY);
   } catch {
-    if (!capability) capability = createClientCapability('customer');
+    // Storage is unreadable; fall through to the in-memory value below.
+  }
+  capability = stored || capability;
+  if (!capability) {
+    capability = createClientCapability('customer');
+    // Minting a key on a first visit is normal. It only signals a problem when
+    // this browser still holds orders whose ownership key is gone: the central
+    // read authorizes by that key alone, so those orders can no longer be seen
+    // and an empty list must not be reported as a checked history.
+    let ordersWithoutKey = false;
+    try {
+      ordersWithoutKey = [CUSTOMER_ORDERS_KEY, CUSTOMER_ORDER_SYNCED_KEY].some((storageKey) => {
+        const raw = localStorage.getItem(storageKey);
+        if (!raw) return false;
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed.length > 0 : Object.keys(parsed || {}).length > 0;
+      });
+    } catch {
+      // An unreadable cache is not evidence either way.
+    }
+    customerOrderCapabilityState = {
+      created: true,
+      persisted: persistCustomerOrderCapability(capability),
+      lostKey: ordersWithoutKey,
+    };
+  } else if (stored && !customerOrderCapabilityState.persisted) {
+    customerOrderCapabilityState = { created: false, persisted: true, lostKey: false };
   }
   memoryCustomerOrderCapability = capability;
   return capability;
@@ -5233,11 +5292,22 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
 }
 
 function CustomerHistoryNotice({ status, onRetry }) {
+  // A key minted in this browser cannot authorize anything ordered earlier, so
+  // an empty list is not a confirmed history. Saying otherwise made a lost
+  // ownership key look like deleted orders.
+  const capability = getCustomerOrderCapabilityState();
+  const freshKey = capability.lostKey;
   return (
-    <div className={`customer-history-notice${status === 'error' ? ' has-error' : ''}`} aria-live="polite">
+    <div className={`customer-history-notice${status === 'error' || freshKey || !capability.persisted ? ' has-error' : ''}`} aria-live="polite">
       {status === 'loading' ? <p role="status">이전 주문·참여 이력을 확인하고 있습니다.</p>
         : status === 'error' ? <p role="alert">이전 이력을 불러오지 못했습니다. 현재 표시된 목록은 유지되며, 이전 주문이 없는 것으로 확정된 것은 아닙니다.</p>
           : <p>조회 가능한 주문 이력을 확인했습니다.</p>}
+      {freshKey && (
+        <p role="alert">이 브라우저의 주문 확인 키가 사라져 새로 만들었습니다. 브라우저가 저장소를 비웠을 때 생기며, 이전 주문은 이 키로는 조회되지 않습니다. 없어진 것이 아니라 이 브라우저에서 확인할 수 없는 상태이니 원래 사용하던 브라우저에서 확인하거나 관리자 앱으로 조회해 주세요.</p>
+      )}
+      {!capability.persisted && (
+        <p role="alert">브라우저 저장공간이 부족해 주문 확인 키를 저장하지 못했습니다. 지금 넣은 주문은 다음 접속에서 보이지 않을 수 있습니다. 저장공간을 확보한 뒤 다시 확인해 주세요.</p>
+      )}
       <button type="button" className="secondary-button compact-button" disabled={status === 'loading'} onClick={onRetry}>
         {status === 'loading' ? '이력 확인 중…' : '주문 이력 다시 불러오기'}
       </button>
@@ -5310,7 +5380,7 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
       </header>
 
       <CustomerHistoryNotice status={historyStatus} onRetry={onRetryHistory} />
-      {orders.length === 0 && historyStatus === 'ready' ? (
+      {orders.length === 0 && historyStatus === 'ready' && !getCustomerOrderCapabilityState().lostKey ? (
         <EmptyCustomerState
           icon={ShoppingBag}
           title="조회 가능한 참여 내역이 없습니다"

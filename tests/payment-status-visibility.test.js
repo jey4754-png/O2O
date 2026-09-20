@@ -91,3 +91,36 @@ test('a stuck publish socket cannot hold the single-file mutation queue open', (
   assert.match(checkoutSource, /const TRANSIENT_ORDER_PUBLISH_CODES = new Set\(\['collector_busy', 'upstream_timeout'\]\);/);
   assert.match(checkoutSource, /const status = Number\(error\?\.status \|\| 0\);\s*\n\s*return status >= 400 && status < 500/);
 });
+
+test('the order ownership key survives a full storage instead of silently rotating', () => {
+  // Central reads authorize by this key's hash alone, so a write that quietly
+  // fails hands the customer a new identity and hides every past order.
+  assert.match(appSource, /function persistCustomerOrderCapability\(capability\) \{/);
+  assert.match(appSource, /\[CREATED_DEALS_KEY, CUSTOMER_GROUPS_KEY\]\.forEach\(\(storageKey\) => \{[\s\S]*?\}\);\s*\n\s*try \{\s*\n\s*localStorage\.setItem\(CUSTOMER_ORDER_CAPABILITY_KEY, capability\);\s*\n\s*return true;/);
+  assert.match(appSource, /persisted: persistCustomerOrderCapability\(capability\),/);
+  // The raw unguarded write must be gone.
+  assert.equal(
+    /capability = createClientCapability\('customer'\);\s*\n\s*localStorage\.setItem\(CUSTOMER_ORDER_CAPABILITY_KEY, capability\);/.test(appSource),
+    false,
+    'the ownership key is never written without quota recovery',
+  );
+});
+
+test('a newly minted ownership key is explained rather than reported as a confirmed history', () => {
+  assert.match(appSource, /let customerOrderCapabilityState = \{ created: false, persisted: true, lostKey: false \};/);
+  assert.match(appSource, /export function getCustomerOrderCapabilityState\(\)/);
+  assert.match(appSource, /customerOrderCapabilityState = \{\s*\n\s*created: true,/);
+  // Minting a key on a first visit is normal; only a lost key warns.
+  assert.match(appSource, /const freshKey = capability\.lostKey;/);
+  assert.match(appSource, /lostKey: ordersWithoutKey,/);
+  assert.match(appSource, /ordersWithoutKey = \[CUSTOMER_ORDERS_KEY, CUSTOMER_ORDER_SYNCED_KEY\]\.some/);
+  assert.match(appSource, /이 브라우저의 주문 확인 키가 사라져 새로 만들었습니다\./);
+  assert.match(appSource, /: <p>조회 가능한 주문 이력을 확인했습니다\.<\/p>\}/);
+  assert.match(appSource, /\{!capability\.persisted && \(/);
+  assert.match(appSource, /브라우저 저장공간이 부족해 주문 확인 키를 저장하지 못했습니다\./);
+  // An empty list under a fresh key must not render the “no participation” state.
+  assert.match(
+    appSource,
+    /orders\.length === 0 && historyStatus === 'ready' && !getCustomerOrderCapabilityState\(\)\.lostKey \?/,
+  );
+});
