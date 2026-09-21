@@ -3,7 +3,8 @@ import { callDataApiJson, fetchUpstreamJson } from './_data-upstream.js';
 import { sanitizeDealImage } from './public-deals.js';
 
 export const config = { maxDuration: 60 };
-const ACTIONS = new Set(['list', 'orders', 'delete', 'image', 'cancel_order']);
+const ACTIONS = new Set(['list', 'orders', 'delete', 'image', 'cancel_order', 'recovery_reassign']);
+const RECOVERY_ORDER_LIMIT = 50;
 const LOGGED_ERRORS = new Set([
   'forbidden_origin', 'payload_too_large', 'invalid_action', 'invalid_actor_id',
   'invalid_deal_id', 'invalid_order_id', 'invalid_client_mutation_id', 'reason_required',
@@ -15,6 +16,9 @@ const LOGGED_ERRORS = new Set([
   'host_cancellation_requires_recruiting', 'cancel_other_host_orders_first',
   'deal_not_found', 'deal_deleted', 'deal_too_large', 'invalid_order_record',
   'invalid_order_quantity', 'admin_operation_failed',
+  'invalid_recovery_capability', 'invalid_order_ids', 'recovery_mixed_ownership',
+  'recovery_already_owned', 'recovery_succession_exists', 'order_ownership_unclaimable',
+  'recovery_store_unavailable',
 ]);
 function logAdminFailure(action, error, status, phase) {
   // Log only fixed enums. Request fields and arbitrary provider exceptions may
@@ -77,15 +81,28 @@ export default async function handler(request, response) {
     const payload = { action: body.action, adminAssertion: true, adminCredentialVersion: credential?.version || 0,
       actorId: identifier(body.actorId, /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/, 'actor_id') };
     if (body.action !== 'list') payload.dealId = identifier(body.dealId, /^(owner|customer)-[a-zA-Z0-9-]{1,100}$/, 'deal_id');
-    if (['delete', 'image', 'cancel_order'].includes(body.action)) {
+    if (['delete', 'image', 'cancel_order', 'recovery_reassign'].includes(body.action)) {
       payload.clientMutationId = identifier(body.clientMutationId, /^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/, 'client_mutation_id');
       payload.reason = String(body.reason || '').trim().slice(0, 200);
       if (!payload.reason) fail('reason_required');
+    }
+    if (['delete', 'image', 'cancel_order'].includes(body.action)) {
       payload.expectedVersion = Number(body.expectedVersion);
       if (!Number.isSafeInteger(payload.expectedVersion) || payload.expectedVersion < 0) fail('invalid_expected_version');
     }
     if (body.action === 'cancel_order') {
       payload.orderId = identifier(body.orderId, /^order-\d{10,20}$/, 'order_id');
+    }
+    if (body.action === 'recovery_reassign') {
+      // The hash is a public identifier the customer reads off their own
+      // screen; the raw token never leaves their browser. Reject anything that
+      // is not exactly that hash so a token can never be forwarded by mistake.
+      payload.capabilityHash = String(body.capabilityHash || '').trim().toLowerCase();
+      if (!/^[a-f0-9]{64}$/.test(payload.capabilityHash)) fail('invalid_recovery_capability');
+      const orderIds = Array.isArray(body.orderIds) ? body.orderIds : [];
+      if (!orderIds.length || orderIds.length > RECOVERY_ORDER_LIMIT) fail('invalid_order_ids');
+      payload.orderIds = orderIds.map((value) => identifier(value, /^order-\d{10,20}$/, 'order_id'));
+      if (new Set(payload.orderIds).size !== payload.orderIds.length) fail('invalid_order_ids');
     }
     if (body.action === 'image') {
       const image = String(body.image || '');

@@ -27,6 +27,13 @@ const MESSAGES = {
   invalid_new_pin: '새 PIN은 숫자 8~12자리로 입력해 주세요.',
   pin_mismatch: '새 PIN과 확인 입력이 일치하지 않습니다.',
   pin_unchanged: '현재 PIN과 다른 새 PIN을 입력해 주세요.',
+  invalid_recovery_capability: '복구 코드는 영문 소문자·숫자 64자리입니다. 사용자 화면의 “복구 코드 보기”에서 나온 값을 그대로 붙여넣어 주세요.',
+  invalid_order_ids: '재연결할 주문을 1건 이상 50건 이하로 선택해 주세요.',
+  recovery_mixed_ownership: '선택한 주문들의 이전 기기가 서로 다릅니다. 한 기기에는 한 번의 재연결만 기록할 수 있으니, 같은 기기에서 넣은 주문끼리만 선택해 주세요.',
+  recovery_already_owned: '선택한 주문은 이미 이 복구 코드의 기기가 조회할 수 있습니다.',
+  recovery_succession_exists: '이 복구 코드에는 이미 재연결 기록이 있습니다. 사용자 화면에서 복구 코드를 다시 확인한 뒤, 남은 주문은 그 기기에서 직접 조회되는지 먼저 확인해 주세요.',
+  order_ownership_unclaimable: '선택한 주문에 조회 권한 기록이 없거나 서로 어긋나 재연결할 수 없습니다. 해당 주문은 개별 확인이 필요합니다.',
+  recovery_store_unavailable: '복구 등록 시트를 찾지 못했습니다. 수집기 설정을 확인해 주세요.',
   admin_credential_store_unavailable: '관리자 인증 저장소 응답이 지연되고 있습니다. 잠시 후 다시 시도해 주세요.',
   admin_response_invalid: '관리자 목록 응답이 올바르지 않습니다. 잠시 후 다시 시도해 주세요.',
   collector_busy: '서버에 요청이 몰려 조회를 완료하지 못했습니다. 잠시 후 새로고침해 주세요.',
@@ -86,6 +93,8 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
   const [image, setImage] = useState('');
   const [imageBusy, setImageBusy] = useState(false);
   const [reason, setReason] = useState('');
+  const [recoveryCode, setRecoveryCode] = useState('');
+  const [recoverySelection, setRecoverySelection] = useState({});
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -118,11 +127,12 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
         } catch (failure) { setOrdersStatus('error'); throw failure; }
       } else {
         setOrders([]); setOrdersStatus('idle'); setImage(''); setReason('');
+        setRecoveryCode(''); setRecoverySelection({});
       }
     }
   });
   const select = (deal) => run(async () => {
-    if (selected?.id !== deal.id) { setOrders([]); setImage(''); setReason(''); }
+    if (selected?.id !== deal.id) { setOrders([]); setImage(''); setReason(''); setRecoveryCode(''); setRecoverySelection({}); }
     setSelected(deal); setOrdersStatus('loading');
     try {
       const result = await requestAdminOperation(pin, { action: 'orders', dealId: deal.id });
@@ -157,6 +167,27 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
       : action === 'cancel_order' ? '참여 취소와 수량 반환을 저장했습니다. 입금 내역은 보존되며 환불은 별도 확인해 주세요.' : '상품 이미지를 저장했습니다.');
     window.dispatchEvent(new CustomEvent('o2o-customer-orders-updated'));
   });
+  // Admin-led reconnection. Pre-enrollment only restores what a live key
+  // registered, so a customer who already lost their key has nothing bound.
+  // Identity is verified off-screen (in person or by phone); the recovery code
+  // is a public identifier and proves nothing on its own.
+  const reassign = () => run(async () => {
+    if (!reason.trim()) { setError('변경 사유를 입력해 주세요.'); return; }
+    const capabilityHash = recoveryCode.trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(capabilityHash)) { setError(MESSAGES.invalid_recovery_capability); return; }
+    const orderIds = orders.filter((order) => recoverySelection[order.id]).map((order) => order.id);
+    if (!orderIds.length) { setError('재연결할 주문을 한 건 이상 선택해 주세요.'); return; }
+    const fields = { action: 'recovery_reassign', dealId: selected.id, reason: reason.trim(), capabilityHash, orderIds };
+    const contract = JSON.stringify(fields);
+    if (!pending.current || pending.current.contract !== contract) {
+      if (!window.confirm(`대면 또는 유선으로 본인 확인을 마쳤습니까?\n선택한 주문 ${orderIds.length}건을 복구 코드 …${capabilityHash.slice(-8)} 기기에서 조회할 수 있게 합니다. 주문·입금 기록 자체는 변경되지 않으며, 변경 사유가 상태 이력에 남습니다.`)) return;
+      pending.current = { contract, fields: { ...fields, clientMutationId: createMutationId('admin_recovery') } };
+    }
+    const result = await requestAdminOperation(pin, pending.current.fields);
+    pending.current = null;
+    setRecoveryCode(''); setRecoverySelection({});
+    setMessage(`주문 ${Number(result.recovery?.orders || orderIds.length)}건을 해당 기기로 재연결했습니다. 사용자가 같은 전화번호로 주문 내역을 다시 불러오면 확인할 수 있습니다.`);
+  });
   const changePin = () => run(async () => {
     if (!currentPin) { setError('현재 PIN을 입력해 주세요.'); return; }
     if (!/^\d{8,12}$/.test(newPin)) { setError(MESSAGES.invalid_new_pin); return; }
@@ -178,6 +209,7 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
     onPinChange(nextPin);
     setVerified(false); setDeals([]); setSelected(null); setOrders([]); setOrdersStatus('idle');
     setCurrentPin(''); setNewPin(''); setConfirmPin(''); setError(''); setMessage('');
+    setRecoveryCode(''); setRecoverySelection({});
     pendingPin.current = null; pending.current = null;
   };
   return <section className="screen admin-console">
@@ -214,8 +246,20 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
           <strong>{order.customerName || order.nickname || order.visitorId}</strong><small>{order.id}</small>
           <p>수량 {order.selectedCount || order.quantity || 1} · {order.status === 'cancelled' ? '참여 취소' : { pending: '입금대기', requested: '입금확인 요청', confirmed: '입금완료' }[order.paymentStatus] || order.status}</p>
           {order.refundReviewRequired && <p className="form-error">입금완료 후 취소 · 실제 환불 확인 필요</p>}
+          <label className="admin-order-select"><input type="checkbox" aria-label={`${order.id} 재연결 대상 선택`} checked={Boolean(recoverySelection[order.id])} disabled={busy || ordersStatus !== 'ready'}
+            onChange={(event) => setRecoverySelection((current) => ({ ...current, [order.id]: event.target.checked }))} />이 주문을 재연결 대상으로 선택</label>
           {order.status !== 'cancelled' && <button className="secondary-button" disabled={busy || ordersStatus !== 'ready'} onClick={() => mutate('cancel_order', order)}>관리자 참여 취소</button>}
         </article>)}
+        <details className="admin-recovery">
+          <summary>기기 재연결 (주문 조회 권한 복구)</summary>
+          <p className="form-error">반드시 대면 또는 유선으로 본인 확인을 마친 뒤에만 사용하세요. 복구 코드는 비밀이 아니라 공개 식별자이므로, 코드를 알고 있다는 사실만으로는 본인 확인이 되지 않습니다.</p>
+          <p>사용자가 자기 기기의 <strong>내 주문 → 이전 주문이 보이지 않나요? → 복구 코드 보기</strong>에서 64자리 코드를 읽어 주면, 위에서 선택한 주문만 그 기기에서 조회할 수 있게 연결합니다. 주문·입금 기록과 원래 소유 기록은 그대로 두고 연결 기록만 추가하며, 변경 사유는 상태 이력에 남습니다.</p>
+          <p>한 기기에는 재연결을 한 번만 기록할 수 있고, 같은 기기에서 넣은 주문끼리만 함께 선택할 수 있습니다. 사용자는 재연결 뒤 같은 전화번호로 주문 내역을 다시 불러와야 합니다.</p>
+          <label>사용자 복구 코드 (64자리)<input aria-label="사용자 복구 코드" autoComplete="off" spellCheck={false} maxLength={64} value={recoveryCode} disabled={busy}
+            onChange={(event) => setRecoveryCode(event.target.value)} placeholder="예: 3f9a…(64자리)" /></label>
+          <p>선택한 주문 {orders.filter((order) => recoverySelection[order.id]).length}건</p>
+          <button className="secondary-button" disabled={busy || ordersStatus !== 'ready'} onClick={reassign}>선택한 주문을 이 기기로 재연결</button>
+        </details>
       </div>}
       <div className="admin-products" aria-label="관리할 상품 목록">{deals.filter((deal) => `${deal.title} ${deal.id}`.toLowerCase().includes(query.toLowerCase())).map((deal) =>
         <button className="admin-product" disabled={busy} key={deal.id} onClick={() => select(deal)}>

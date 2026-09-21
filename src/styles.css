@@ -3969,6 +3969,12 @@ code {
 .admin-image input[type=file] { display: none; }
 .admin-order { padding: 12px 0; border-top: 1px solid #d9dfe4; }
 .admin-order p { margin: 0; }
+.admin-console .admin-order-select { grid-auto-flow: column; justify-content: start; align-items: center; gap: 8px; font-size: 12px; color: #536170; }
+.admin-console .admin-order-select input { width: auto; min-width: 0; padding: 0; }
+.admin-recovery { display: grid; gap: 10px; padding: 12px; border: 1px solid #d9dfe4; border-radius: 10px; font-size: 13px; }
+.admin-recovery summary { cursor: pointer; font-weight: 600; }
+.admin-recovery p { margin: 0; }
+.recovery-code { display: inline-block; margin: 6px 0; padding: 6px 8px; border-radius: 6px; background: #eef2f5; color: #2b3542; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; overflow-wrap: anywhere; user-select: all; }
 .customer-history-notice { margin-bottom: 12px; padding: 10px; border: 1px solid #e0e5e9; border-radius: 10px; background: #f7f9fa; font-size: 12px; line-height: 1.5; color: #536170; }
 .customer-history-notice.has-error { border-color: #efc9c4; background: #fff7f5; color: #9a392d; }
 .customer-history-notice p { margin: 0; font-size: inherit; line-height: inherit; }

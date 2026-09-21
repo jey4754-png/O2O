@@ -46,6 +46,11 @@ const PAYMENT_STATUSES = ['pending', 'requested', 'confirmed'];
 const GROUP_MAX_PARTICIPANTS = 20;
 const GROUP_MESSAGE_LIMIT = 100;
 const OWNER_CLAIM_LIMIT = 50;
+const ADMIN_RECOVERY_ORDER_LIMIT = 50;
+// 관리자 주도 승계의 이력은 그룹 채팅방 이력(historyForGroup_)에 섞이면 안 된다.
+// 사유에는 대면·유선 신원 확인 메모가 들어가고 해시는 다른 참여자와 무관하다.
+// 실제 그룹ID 가 될 수 없는 고정 값으로 적어 그룹 조회에서 배제한다.
+const ADMIN_RECOVERY_HISTORY_SCOPE = 'admin-recovery';
 const SCRIPT_LOCK_TIMEOUT_MS = 3000;
 const CENTRAL_ANALYTICS_LOCK_TIMEOUT_MS = 0;
 const CENTRAL_ANALYTICS_EVENT_CACHE_SECONDS = 21600;
@@ -2707,7 +2712,7 @@ function handleAdminOperation_(payload) {
     if (payload.adminAssertion !== true) throw groupOperationError_('forbidden');
     const actorId = requireGroupId_(payload.actorId, 'actor_id');
     const action = String(payload.action || '');
-    if (!['list', 'orders', 'delete', 'image', 'cancel_order'].includes(action)) throw groupOperationError_('invalid_action');
+    if (!['list', 'orders', 'delete', 'image', 'cancel_order', 'recovery_reassign'].includes(action)) throw groupOperationError_('invalid_action');
     const sheets = ensureSheets_();
     if (action === 'list') {
       const deals = [];
@@ -2734,6 +2739,16 @@ function handleAdminOperation_(payload) {
       return json_({ ok: true, orders: mergeCustomerOrderSnapshots_(orders.concat(historic)).map(function(order) {
         return publicOrderValue_(projectStoredGroupOrderPayment_(sheets, order, projectionContext));
       }) });
+    }
+    if (action === 'recovery_reassign') {
+      const reassignMutationId = requireMutationId_(payload.clientMutationId);
+      const reassignReason = groupText_(payload.reason, 200).trim();
+      if (!reassignReason) throw groupOperationError_('reason_required');
+      lock = acquireScriptLock_();
+      return adminRecoveryReassign_(sheets, {
+        dealId: dealId, actorId: actorId, clientMutationId: reassignMutationId,
+        reason: reassignReason, capabilityHash: payload.capabilityHash, orderIds: payload.orderIds
+      });
     }
     const mutationId = requireMutationId_(payload.clientMutationId);
     const reason = groupText_(payload.reason, 200).trim();
@@ -4017,6 +4032,121 @@ function recoveryBoundSet_(sheets, capabilityHash, groupClaims, dealClaims) {
     deals.push({ dealId: dealId, hash: hash });
   });
   return { orderIds: orderIds, groups: groups, deals: deals };
+}
+
+// 한 상품의 주문별 소유 해시를 판정한다. 범위는 관리자 화면의 '주문 · 참여 내역'
+// 과 같다(현재 행 + 과거 스냅샷). 판정 규칙도 filterCustomerOrdersForProof_ 와
+// 같아서, 읽기 시점에 충돌로 숨겨질 주문을 결박 대상으로 고르는 일이 없다.
+function adminDealOrderOwnership_(sheets, dealId) {
+  const ownership = Object.create(null);
+  const record = function(order) {
+    if (!order || !order.id) return;
+    const key = String(order.id);
+    if (!ownership[key]) ownership[key] = { hash: '', conflict: false, actorId: '' };
+    const entry = ownership[key];
+    const actorId = String(order.visitorId || order.participantActorId || '');
+    if (actorId && !entry.actorId) entry.actorId = actorId;
+    const storedHash = String(order._customerCapabilityHash || '').toLowerCase();
+    if (!storedHash) return;
+    if (!RECOVERY_HASH.test(storedHash)) entry.conflict = true;
+    else if (!entry.hash) entry.hash = storedHash;
+    else if (entry.hash !== storedHash) entry.conflict = true;
+  };
+  const sheet = sheets.customerOrders;
+  if (sheet && sheet.getLastRow() >= 2) {
+    sheet.getRange(2, 4, sheet.getLastRow() - 1, 1).getValues().forEach(function(row) {
+      let order = null;
+      try { order = JSON.parse(row[0] || '{}'); } catch (error) { return; }
+      // 이력에 남는 상품 범위와 실제로 결박되는 주문이 어긋나면 안 된다.
+      if (order && customerOrderDealId_(order) === dealId) record(order);
+    });
+  }
+  historicCustomerOrders_(sheets.events, '', dealId).forEach(record);
+  return ownership;
+}
+
+// 관리자 주도 승계.
+//
+// 사전등록은 '키가 살아있을 때 등록해 둔 것'만 되살린다. 이미 키를 잃은 사용자는
+// 결박된 것이 없어 스스로 복구할 수 없으므로, PIN 으로 인증된 관리자가 대면·유선
+// 으로 신원을 확인한 뒤 지정한 주문만 새 기기에 승계시키는 경로를 둔다.
+//
+// 전화번호는 여기서도 권한 근거가 아니다. 관리자가 고른 주문 ID 만 결박한다.
+// 주문 행은 절대 다시 쓰지 않는다. 승계 행만 더해 filterCustomerOrdersForProof_
+// 가 읽기 시점에만 옛 해시 권한을 인정하게 한다.
+function adminRecoveryReassign_(sheets, request) {
+  if (!sheets.recovery) throw groupOperationError_('recovery_store_unavailable');
+  const newHash = groupText_(request.capabilityHash, 64).toLowerCase();
+  if (!RECOVERY_HASH.test(newHash)) throw groupOperationError_('invalid_recovery_capability');
+  const seenOrderId = Object.create(null);
+  const orderIds = (Array.isArray(request.orderIds) ? request.orderIds : []).map(function(value) {
+    const orderId = groupText_(value, 40);
+    if (!/^order-\d{10,20}$/.test(orderId) || seenOrderId[orderId]) {
+      throw groupOperationError_('invalid_order_id');
+    }
+    seenOrderId[orderId] = true;
+    return orderId;
+  });
+  if (!orderIds.length || orderIds.length > ADMIN_RECOVERY_ORDER_LIMIT) {
+    throw groupOperationError_('invalid_order_id');
+  }
+
+  const rows = recoveryRowsRaw_(sheets);
+  for (let index = 0; index < rows.length; index += 1) {
+    if (rows[index].lastMutationId !== request.clientMutationId) continue;
+    const previous = rows[index];
+    const sameOrders = (previous.boundOrderIds || []).length === orderIds.length
+      && orderIds.every(function(orderId) { return previous.boundOrderIds.indexOf(orderId) !== -1; });
+    if (previous.currentHash !== newHash || !sameOrders) {
+      throw groupOperationError_('client_mutation_conflict');
+    }
+    return json_({ ok: true, duplicate: true, recovery: { version: previous.version, orders: orderIds.length } });
+  }
+  // recoverySuccession_ 은 승계가 하나로 확정될 때만 권한을 준다. 같은 기기에
+  // 승계를 두 번 기록하면 둘 다 무효가 되므로, 덮어쓰는 대신 여기서 거절한다.
+  const ambiguous = rows.some(function(row) {
+    return RECOVERY_HASH.test(row.boundHash) && RECOVERY_HASH.test(row.currentHash)
+      && row.currentHash === newHash && row.boundHash !== newHash;
+  });
+  if (ambiguous) throw groupOperationError_('recovery_succession_exists');
+
+  const ownership = adminDealOrderOwnership_(sheets, request.dealId);
+  let boundHash = '';
+  let boundActorId = '';
+  orderIds.forEach(function(orderId) {
+    const entry = ownership[orderId];
+    if (!entry) throw groupOperationError_('order_not_found');
+    if (entry.conflict || !entry.hash) throw groupOperationError_('order_ownership_unclaimable');
+    if (!boundHash) boundHash = entry.hash;
+    else if (boundHash !== entry.hash) throw groupOperationError_('recovery_mixed_ownership');
+    if (!boundActorId) boundActorId = entry.actorId;
+    else if (boundActorId !== entry.actorId) boundActorId = '';
+  });
+  if (boundHash === newHash) throw groupOperationError_('recovery_already_owned');
+
+  const now = new Date().toISOString();
+  // 사전등록 행과 같은 표를 쓰지만 식별키 공간은 겹치지 않아야 한다. 복구 API 는
+  // 전화번호 sha256(64hex)만 식별키로 받으므로, 접두사가 붙은 이 값은 begin·enroll
+  // ·redeem 어느 경로에서도 조회되지 않는다.
+  const identityKey = 'admin:' + sha256Hex_('admin-recovery-grant:' + newHash);
+  // 승계 행을 먼저 쓰면 이력 기록이 실패했을 때 근거 없는 권한만 남는다.
+  // 사유를 남기지 못하면 권한도 생기지 않도록 이력을 먼저 기록한다.
+  appendGroupHistory_(sheets, {
+    groupId: ADMIN_RECOVERY_HISTORY_SCOPE, entityType: 'recovery', entityId: request.dealId,
+    fromStatus: boundHash, toStatus: newHash, action: 'admin_recovery_reassign',
+    actorId: request.actorId, actorRole: 'admin', reason: request.reason,
+    clientMutationId: request.clientMutationId, version: 1, createdAt: now,
+    result: { ok: true, dealId: request.dealId, orderIds: orderIds, identityKey: identityKey }
+  });
+  sheets.recovery.appendRow([
+    now, now, identityKey, '', boundHash, newHash,
+    JSON.stringify(orderIds), '[]', '[]', safeCell_(boundActorId), 1,
+    safeCell_(request.clientMutationId)
+  ]);
+  // 같은 실행 안에서 방금 쓴 승계가 보여야 한다. 읽기 캐시를 비우지 않으면
+  // 재연결 직후의 조회가 예전 상태를 그대로 돌려준다.
+  invalidateRecoveryRows_();
+  return json_({ ok: true, recovery: { version: 1, orders: orderIds.length, orderIds: orderIds } });
 }
 
 function handleRecoveryCredentials_(payload) {

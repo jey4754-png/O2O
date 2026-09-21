@@ -567,6 +567,17 @@ function getCustomerOrderCapability() {
   return capability;
 }
 
+// 복구 코드 = 이 기기 주문 확인 키의 sha256. 서버가 소유 판정에 쓰는 값과 같은
+// 공개 식별자라 화면에 보여도 권한이 넘어가지 않는다. 원문 키는 절대 내보내지
+// 않는다. sha256 을 계산할 수 없는 환경에서는 틀린 값을 보여 주느니 실패시킨다:
+// 잘못된 코드로 재연결하면 사용자는 끝내 자기 주문을 보지 못한다.
+export async function getCustomerRecoveryCode() {
+  if (!globalThis.crypto?.subtle) throw new Error('recovery_code_unavailable');
+  const input = new TextEncoder().encode(getCustomerOrderCapability());
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', input);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 async function fetchPublicDeals() {
   try {
     const deals = await fetchPublicDealListRequest();
@@ -5314,8 +5325,32 @@ function CustomerHistoryNotice({ status, onRetry }) {
       <details>
         <summary>이전 주문이 보이지 않나요?</summary>
         <p>이 브라우저와 현재 프로필에서 조회 권한이 확인된 이력만 표시합니다. 주문했던 같은 브라우저와 전화번호인지 확인해 주세요. 이전 주문의 권한키가 없거나 연결되지 않은 기록은 여기서 자동 복구할 수 없습니다. 브라우저 데이터를 지우지 말고 관리자에게 해당 주문 확인을 요청해 주세요.</p>
+        <CustomerRecoveryCode />
       </details>
     </div>
+  );
+}
+
+function CustomerRecoveryCode() {
+  const [code, setCode] = useState('');
+  const [failed, setFailed] = useState(false);
+  const reveal = async () => {
+    setFailed(false);
+    try {
+      setCode(await getCustomerRecoveryCode());
+    } catch {
+      setCode('');
+      setFailed(true);
+    }
+  };
+  return (
+    <>
+      <p>관리자가 전화나 대면으로 본인 확인을 한 뒤, 아래 복구 코드로 이 기기에 지난 주문을 다시 연결해 줄 수 있습니다. 이 코드는 이 기기를 가리키는 공개 식별자일 뿐이라 알려 줘도 주문 권한이 넘어가지 않습니다.</p>
+      {code
+        ? <p><code className="recovery-code">{code}</code><br />이 64자리를 관리자에게 그대로 읽어 주거나 전달해 주세요. 연결이 끝나면 같은 전화번호로 “주문 이력 다시 불러오기”를 눌러 주세요.</p>
+        : <button type="button" className="secondary-button compact-button" onClick={reveal}>복구 코드 보기</button>}
+      {failed && <p role="alert">이 브라우저에서는 복구 코드를 계산할 수 없습니다. 주소창이 https 인지 확인하거나 다른 브라우저에서 다시 시도해 주세요.</p>}
+    </>
   );
 }
 
