@@ -3025,6 +3025,9 @@ function requireParticipantCapability_(participant, participantCapabilityHashVal
     participantCapabilityHashValue,
     'invalid_participant_capability'
   );
+  // 복구한 기기는 등록 당시 결박된 그룹에 한해 옛 해시로 행세할 수 있다.
+
+  // 여기서만 해석하지 않으면 그룹 주문 게시가 막혀 반쪽 복구가 된다.
   if (!participant || !participant.capabilityHash
     || participant.capabilityHash !== participantCapabilityHash) {
     throw groupOperationError_('invalid_participant_capability');
@@ -3409,6 +3412,8 @@ function publishCustomerOrder_(
   }
   const phone = normalizePhone_(order.customerPhone);
   if (phone.length < 8) return json_({ ok: false, error: 'invalid_customer_phone' });
+  // 승계로 인가된 쓰기인지. 그런 쓰기는 소유 표시를 그대로 보존해야 한다.
+  let writesUnderSuccession = false;
   let publishMutationId;
   let publishMutationContract;
   try {
@@ -3457,9 +3462,15 @@ function publishCustomerOrder_(
     if (existingOrder) {
       const existingHash = String(existingOrder._customerCapabilityHash || '').toLowerCase();
       if (/^[a-f0-9]{64}$/.test(existingHash)) {
-        if (existingHash !== incomingHash
-          && !recoveryActsAsHash_(sheets, incomingHash, existingHash, existingOrder.id)) {
-          return json_({ ok: false, error: 'forbidden' });
+        if (existingHash !== incomingHash) {
+          if (!recoveryActsAsHash_(sheets, incomingHash, existingHash, existingOrder.id)) {
+            return json_({ ok: false, error: 'forbidden' });
+          }
+          // 승계로 인가된 쓰기는 저장된 소유 표시를 바꾸지 않는다. 주문 행만
+          // 새 해시로 바뀌고 이벤트 로그 스냅샷은 옛 해시로 남으면, 같은 주문에
+          // 해시가 둘이 되어 충돌로 판정되고 그 주문이 새 키와 옛 키 양쪽에서
+          // 영구히 사라진다. 이벤트 로그는 추가 전용이라 되돌릴 수도 없다.
+          writesUnderSuccession = true;
         }
       } else if (existingHash) {
         return json_({ ok: false, error: 'order_ownership_unclaimable' });
@@ -3537,11 +3548,17 @@ function publishCustomerOrder_(
         );
         storedOrder = canonicalGroupOrderPricing_(sheets, storedOrder, visitorId);
       }
-      storedOrder = Object.assign({}, storedOrder, {
-        customerPhone: phone,
-        visitorId: visitorId,
-        _customerCapabilityHash: incomingHash
-      });
+      storedOrder = Object.assign({}, storedOrder, writesUnderSuccession
+        ? {
+            customerPhone: phone,
+            visitorId: String(existingOrder.visitorId || ''),
+            _customerCapabilityHash: String(existingOrder._customerCapabilityHash || '').toLowerCase()
+          }
+        : {
+            customerPhone: phone,
+            visitorId: visitorId,
+            _customerCapabilityHash: incomingHash
+          });
     } else {
       if (String(order.status || 'new') !== 'new'
         || String(order.paymentStatus || 'pending') !== 'pending'
@@ -4205,12 +4222,21 @@ function handleRecoveryCredentials_(payload) {
       // 0개와 1개의 차이는 계정 열거가 된다. 미끼는 맞출 수 없는 값이며 호출자는
       // 어느 쪽이든 같은 양의 파생 비용을 치른다.
       while (candidates.length < RECOVERY_ROWS_PER_IDENTITY) {
-        const seed = sha256Hex_('recovery-decoy:' + identityKey + ':' + candidates.length + ':' + INGEST_TOKEN);
+        // 각 항목을 따로 파생한다. 같은 씨앗을 재사용하면 salt 가 ref 의 앞부분과
+        // 같고 hash 가 같은 값의 반복이 되어, 호출자가 미끼를 알아보고 이 번호의
+        // 등록 수를 그대로 읽어낸다.
+        const base = 'recovery-decoy:' + identityKey + ':' + candidates.length + ':' + INGEST_TOKEN;
         candidates.push({
-          ref: seed,
-          verifier: { algorithm: 'scrypt-v1', salt: seed.slice(0, 32), hash: seed + seed }
+          ref: sha256Hex_(base + ':ref'),
+          verifier: {
+            algorithm: 'scrypt-v1',
+            salt: sha256Hex_(base + ':salt').slice(0, 32),
+            hash: sha256Hex_(base + ':hash-a') + sha256Hex_(base + ':hash-b')
+          }
         });
       }
+      // 실제 등록과 미끼가 섞인 순서도 등록 수를 알려주지 않아야 한다.
+      candidates.sort(function(left, right) { return left.ref < right.ref ? -1 : 1; });
       return json_(Object.assign({}, limited, { verifiers: candidates }));
     }
 

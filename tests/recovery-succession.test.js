@@ -383,7 +383,7 @@ test('승계는 쓰기 경로에서도 인정되어 조회 전용 복구로 끝�
   const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
   assert.match(source, /function recoveryActsAsHash_\(sheets, presentedHash, storedHash, orderId\) \{/);
   // 게시와 취소 양쪽이 같은 근거를 쓴다.
-  assert.match(source, /if \(existingHash !== incomingHash\s*\n\s*&& !recoveryActsAsHash_\(sheets, incomingHash, existingHash, existingOrder\.id\)\) \{/);
+  assert.match(source, /if \(!recoveryActsAsHash_\(sheets, incomingHash, existingHash, existingOrder\.id\)\) \{\s*\n\s*return json_\(\{ ok: false, error: 'forbidden' \}\);/);
   assert.match(source, /if \(storedHash !== suppliedHash\s*\n\s*&& !recoveryActsAsHash_\(sheets, suppliedHash, storedHash, order\.id\)\) \{/);
   // 결박된 주문에만 적용된다.
   assert.match(source, /return \(succession\.boundOrderIds \|\| \[\]\)\.some\(function\(id\) \{/);
@@ -395,4 +395,32 @@ test('한 키가 두 등록을 승계하는 상태를 만들지 않는다', () =
   // 그 키가 이미 되살린 접근까지 한꺼번에 사라진다.
   assert.match(source, /const ambiguous = recoveryRowsRaw_\(sheets\)\.some\(function\(row\) \{/);
   assert.match(source, /if \(ambiguous\) throw recoveryError_\('recovery_succession_exists'\);/);
+});
+
+test('승계로 인가된 쓰기는 저장된 소유 표시를 바꾸지 않는다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // 주문 행만 새 해시로 바뀌고 이벤트 로그 스냅샷은 옛 해시로 남으면, 같은
+  // 주문에 해시가 둘이 되어 filterCustomerOrdersForProof_ 가 충돌로 판정하고
+  // 그 주문이 새 키와 옛 키 양쪽에서 영구히 사라진다. 이벤트 로그는 추가
+  // 전용이라 되돌릴 수 없고 관리자 재연결로도 복구되지 않는다.
+  assert.match(source, /let writesUnderSuccession = false;/);
+  assert.match(source, /writesUnderSuccession = true;/);
+  assert.match(
+    source,
+    /storedOrder = Object\.assign\(\{\}, storedOrder, writesUnderSuccession\s*\n\s*\? \{\s*\n\s*customerPhone: phone,\s*\n\s*visitorId: String\(existingOrder\.visitorId \|\| ''\),\s*\n\s*_customerCapabilityHash: String\(existingOrder\._customerCapabilityHash \|\| ''\)\.toLowerCase\(\)/,
+  );
+  // 이것이 설계의 제1원칙이다: 시트 행의 소유 표시를 다시 쓰지 않는다.
+  assert.match(source, /시트 행을 절대 다시 쓰지 않는다|주문 행은 절대 다시 쓰지 않는다|다시 쓰지 않는다/);
+});
+
+test('미끼 검증자가 실제 등록과 구분되지 않는다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // 같은 씨앗을 재사용하면 salt 가 ref 의 앞부분과 같고 hash 가 같은 값의
+  // 반복이 되어, 호출자가 미끼를 알아보고 등록 수를 그대로 읽어낸다.
+  assert.match(source, /ref: sha256Hex_\(base \+ ':ref'\),/);
+  assert.match(source, /salt: sha256Hex_\(base \+ ':salt'\)\.slice\(0, 32\),/);
+  assert.match(source, /hash: sha256Hex_\(base \+ ':hash-a'\) \+ sha256Hex_\(base \+ ':hash-b'\)/);
+  assert.equal(/salt: seed\.slice\(0, 32\), hash: seed \+ seed/.test(source), false);
+  // 순서도 정보가 되지 않아야 한다.
+  assert.match(source, /candidates\.sort\(function\(left, right\) \{ return left\.ref < right\.ref \? -1 : 1; \}\);/);
 });
