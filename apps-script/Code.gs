@@ -234,6 +234,7 @@ function doPost(e) {
     if (body.action === 'manage_order') return manageCustomerOrder_(body.payload || {});
     if (body.action === 'admin_operation') return handleAdminOperation_(body.payload || {});
     if (body.action === 'admin_credentials') return handleAdminCredentials_(body.payload);
+    if (body.action === 'recovery_credentials') return handleRecoveryCredentials_(body.payload || {});
     if (/^group_(create|repair_customer_group|recover_legacy_customer_group|join|snapshot|send_message|mark_read|transition_group|transition_payment|update_target|toggle_lock|claim_host|release_host|reserve_quantity|rollback_reservation|cancel_participation)$/.test(String(body.action || ''))) {
       return handleGroupOperation_(String(body.action).replace(/^group_/, ''), body.payload || {});
     }
@@ -351,9 +352,9 @@ function validAdminAuthRateBucket_(value) {
     && Number.isSafeInteger(value.lastSeenAt) && value.lastSeenAt >= 0;
 }
 
-function readAdminAuthRateState_(properties) {
+function readAdminAuthRateState_(properties, propertyKey) {
   let serialized;
-  try { serialized = properties.getProperty(ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY); }
+  try { serialized = properties.getProperty((propertyKey || ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY)); }
   catch (error) { throw groupOperationError_('admin_credential_store_unavailable'); }
   if (serialized === null) return { version: 1, global: null, clients: {} };
   let state;
@@ -440,17 +441,20 @@ function pruneAdminAuthRateClients_(clients, now) {
     .forEach(function(key) { delete clients[key]; });
 }
 
-function writeAdminAuthRateState_(properties, state) {
+function writeAdminAuthRateState_(properties, state, propertyKey) {
   const serialized = JSON.stringify(state);
   try {
-    properties.setProperty(ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY, serialized);
-    if (properties.getProperty(ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY) !== serialized) throw new Error('write_not_visible');
+    properties.setProperty(propertyKey || ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY, serialized);
+    if (properties.getProperty(propertyKey || ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY) !== serialized) throw new Error('write_not_visible');
   } catch (error) { throw groupOperationError_('admin_credential_store_unavailable'); }
 }
 
-function handleAdminAuthRateLimit_(properties, operation, clientKey) {
+// 같은 잠금 안에서 결과를 다시 읽어야 하는 호출자를 위해 평문 객체를 돌려줄 수 있게 한다.
+function recoveryRateResult_(raw, value) { return raw ? value : json_(value); }
+
+function handleAdminAuthRateLimit_(properties, operation, clientKey, propertyKey, raw) {
   const now = Date.now();
-  const state = readAdminAuthRateState_(properties);
+  const state = readAdminAuthRateState_(properties, propertyKey);
   state.global = activeAdminAuthRateBucket_(state.global, now);
   pruneAdminAuthRateClients_(state.clients, now);
   const client = activeAdminAuthRateBucket_(state.clients[clientKey], now);
@@ -460,34 +464,40 @@ function handleAdminAuthRateLimit_(properties, operation, clientKey) {
     adminAuthRateRetryAfter_(state.global, now),
     adminAuthRateRetryAfter_(client, now)
   );
-  if (retryAfter > 0) return json_({ ok: true, allowed: false, retryAfter: retryAfter });
+  if (retryAfter > 0) return recoveryRateResult_(raw, { ok: true, allowed: false, retryAfter: retryAfter });
   if (operation === 'rate_begin' || operation === 'rate_check') {
     const capacityRetryAfter = Math.max(
       adminAuthRateCapacityRetryAfter_(state.global, now, ADMIN_AUTH_RATE_GLOBAL_FAILURE_LIMIT),
       adminAuthRateCapacityRetryAfter_(client, now, ADMIN_AUTH_RATE_CLIENT_FAILURE_LIMIT)
     );
     if (capacityRetryAfter > 0) {
-      return json_({ ok: true, allowed: false, retryAfter: capacityRetryAfter });
+      return recoveryRateResult_(raw, { ok: true, allowed: false, retryAfter: capacityRetryAfter });
     }
     state.global = reserveAdminAuthRateBucket_(state.global, now);
     state.clients[clientKey] = reserveAdminAuthRateBucket_(client, now);
     pruneAdminAuthRateClients_(state.clients, now);
-    writeAdminAuthRateState_(properties, state);
+    writeAdminAuthRateState_(properties, state, propertyKey);
     const result = { ok: true, allowed: true, reserved: true };
     // A PIN check previously needed another cold Apps Script request merely to
     // read the verifier. Return that same snapshot only for a successful
     // rate_begin reservation, while still requiring rate_success/failure to be
     // durably recorded before any privileged operation can run.
-    if (operation === 'rate_begin') result.credential = readAdminCredential_(properties);
-    return json_(result);
+    //
+    // Only the admin bucket may carry the admin verifier. Other callers share
+    // this limiter but must never receive another realm's credential.
+    if (operation === 'rate_begin'
+      && (propertyKey || ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY) === ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY) {
+      result.credential = readAdminCredential_(properties);
+    }
+    return recoveryRateResult_(raw, result);
   }
   if (operation === 'rate_success') {
     state.global = finishAdminAuthSuccessBucket_(state.global, now, false);
     const successfulClient = finishAdminAuthSuccessBucket_(client, now, true);
     if (successfulClient) state.clients[clientKey] = successfulClient;
     else delete state.clients[clientKey];
-    writeAdminAuthRateState_(properties, state);
-    return json_({ ok: true, allowed: true });
+    writeAdminAuthRateState_(properties, state, propertyKey);
+    return recoveryRateResult_(raw, { ok: true, allowed: true });
   }
   if (!state.global || state.global.inFlight < 1 || !client || client.inFlight < 1) {
     throw groupOperationError_('admin_auth_rate_limit_state_invalid');
@@ -495,12 +505,12 @@ function handleAdminAuthRateLimit_(properties, operation, clientKey) {
   state.global = nextAdminAuthFailureBucket_(state.global, now, ADMIN_AUTH_RATE_GLOBAL_FAILURE_LIMIT);
   state.clients[clientKey] = nextAdminAuthFailureBucket_(client, now, ADMIN_AUTH_RATE_CLIENT_FAILURE_LIMIT);
   pruneAdminAuthRateClients_(state.clients, now);
-  writeAdminAuthRateState_(properties, state);
+  writeAdminAuthRateState_(properties, state, propertyKey);
   const failureRetryAfter = Math.max(
     adminAuthRateRetryAfter_(state.global, now),
     adminAuthRateRetryAfter_(state.clients[clientKey], now)
   );
-  return json_({ ok: true, allowed: failureRetryAfter === 0,
+  return recoveryRateResult_(raw, { ok: true, allowed: failureRetryAfter === 0,
     ...(failureRetryAfter ? { retryAfter: failureRetryAfter } : {}) });
 }
 
@@ -3915,6 +3925,172 @@ function customerOrderOwnership_(orders) {
 // 전화번호는 주문 게시 시 클라이언트가 그대로 정하는 값이고(3353행 부근) 사장님·그룹
 // 화면에 노출되므로 소유 증명이 될 수 없다. 전화번호를 근거로 삼으면 남의 번호로 주문
 // 한 건을 만든 뒤 그 번호 전체를 인수할 수 있다.
+const RECOVERY_RATE_LIMIT_PROPERTY_KEY = 'O2O_RECOVERY_AUTH_RATE_LIMIT_V1';
+const RECOVERY_IDENTITY_KEY = /^[a-f0-9]{64}$/;
+const RECOVERY_HASH = /^[a-f0-9]{64}$/;
+
+function recoveryError_(code) { return groupOperationError_(code); }
+
+function recoveryIdentityRow_(sheets, identityKey) {
+  const rows = recoveryRowsRaw_(sheets);
+  for (let index = 0; index < rows.length; index += 1) {
+    if (rows[index].identityKey === identityKey) return rows[index];
+  }
+  return null;
+}
+
+function recoveryRowsRaw_(sheets) {
+  const sheet = sheets && sheets.recovery;
+  if (!sheet || sheet.getLastRow() < 2) return [];
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, RECOVERY_HEADERS.length)
+    .getValues()
+    .map(function(row, index) { return recoveryRowValue_(row, index + 2); });
+}
+
+// 등록 시점에 살아있는 키가 실제로 소유한 항목만 모은다. 전화번호는 쓰지 않는다.
+function recoveryBoundSet_(sheets, capabilityHash, groupClaims, dealClaims) {
+  const orderIds = [];
+  const orders = sheets.customerOrders;
+  if (orders.getLastRow() >= 2) {
+    orders.getRange(2, 2, orders.getLastRow() - 1, 3).getValues().forEach(function(row) {
+      let order = null;
+      try { order = JSON.parse(row[2] || '{}'); } catch (error) { return; }
+      if (!order || !order.id) return;
+      if (String(order._customerCapabilityHash || '').toLowerCase() !== capabilityHash) return;
+      if (orderIds.indexOf(String(order.id)) === -1) orderIds.push(String(order.id));
+    });
+  }
+  const groups = [];
+  (groupClaims || []).forEach(function(claim) {
+    if (!claim || typeof claim !== 'object') return;
+    const groupId = String(claim.groupId || '');
+    const actorId = String(claim.actorId || '');
+    const hash = String(claim.capabilityHash || '').toLowerCase();
+    if (!groupId || !actorId || !RECOVERY_HASH.test(hash)) return;
+    const participant = getParticipantRecord_(sheets, groupId, actorId, false);
+    if (!participant || String(participant.capabilityHash || '').toLowerCase() !== hash) return;
+    groups.push({ groupId: groupId, actorId: actorId, hash: hash });
+  });
+  const deals = [];
+  (dealClaims || []).forEach(function(claim) {
+    if (!claim || typeof claim !== 'object') return;
+    const dealId = String(claim.dealId || '');
+    const hash = String(claim.ownerCapabilityHash || '').toLowerCase();
+    if (!dealId || !RECOVERY_HASH.test(hash)) return;
+    const record = publicDealRecord_(sheets.publicDeals, dealId);
+    const deal = record && record.deal ? record.deal : null;
+    if (!ownerClaimMatchesDeal_({ dealId: dealId, ownerCapabilityHash: hash }, deal)) return;
+    deals.push({ dealId: dealId, hash: hash });
+  });
+  return { orderIds: orderIds, groups: groups, deals: deals };
+}
+
+function handleRecoveryCredentials_(payload) {
+  let lock = null;
+  try {
+    const operations = ['begin', 'finish', 'enroll', 'redeem'];
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)
+        || operations.indexOf(payload.operation) === -1) {
+      throw recoveryError_('invalid_recovery_request');
+    }
+    const identityKey = String(payload.identityKey || '');
+    if (!RECOVERY_IDENTITY_KEY.test(identityKey)) throw recoveryError_('invalid_recovery_request');
+
+    let properties;
+    try { properties = PropertiesService.getScriptProperties(); }
+    catch (error) { throw recoveryError_('recovery_store_unavailable'); }
+
+    if (payload.operation === 'begin' || payload.operation === 'finish') {
+      const clientKey = String(payload.clientKey || '');
+      if (!/^[a-f0-9]{32}$/.test(clientKey)) throw recoveryError_('invalid_recovery_request');
+      lock = acquireScriptLock_();
+      const limitOperation = payload.operation === 'begin'
+        ? 'rate_begin'
+        : (payload.outcome === 'success' ? 'rate_success' : 'rate_failure');
+      const limited = handleAdminAuthRateLimit_(
+        properties, limitOperation, clientKey, RECOVERY_RATE_LIMIT_PROPERTY_KEY, true
+      );
+      if (payload.operation !== 'begin' || limited.allowed !== true) return json_(limited);
+      // 검증자는 예약에 성공한 요청에만, 잠긴 같은 요청 안에서만 돌려준다.
+      // 별도의 읽기 오퍼레이션을 두면 저엔트로피 확인번호가 오프라인 대입에 노출된다.
+      const record = recoveryIdentityRow_(ensureSheets_(), identityKey);
+      return json_(Object.assign({}, limited, {
+        verifier: record && validAdminCredentialVerifier_(record.verifier) ? record.verifier : null
+      }));
+    }
+
+    const sheets = ensureSheets_();
+    const clientMutationId = String(payload.clientMutationId || '');
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{7,127}$/.test(clientMutationId)) {
+      throw recoveryError_('invalid_client_mutation_id');
+    }
+    lock = acquireScriptLock_();
+    const existing = recoveryIdentityRow_(sheets, identityKey);
+
+    if (payload.operation === 'enroll') {
+      const capabilityHash = String(payload.capabilityHash || '').toLowerCase();
+      if (!RECOVERY_HASH.test(capabilityHash)) throw recoveryError_('invalid_recovery_capability');
+      if (!validAdminCredentialVerifier_(payload.verifier)) throw recoveryError_('invalid_recovery_verifier');
+      const actorId = String(payload.actorId || '');
+      if (!validVisitorId_(actorId)) throw recoveryError_('invalid_actor_id');
+      if (existing && existing.lastMutationId === clientMutationId) {
+        return json_({ ok: true, duplicate: true, version: existing.version });
+      }
+      const bound = recoveryBoundSet_(sheets, capabilityHash, payload.groups, payload.deals);
+      // 소유를 하나도 증명하지 못하면 등록하지 않는다. 등록 자체가 권한 근거가 되므로
+      // 아무 키나 등록해 두고 나중에 남의 것을 가져가는 경로를 막는다.
+      if (!bound.orderIds.length && !bound.groups.length && !bound.deals.length) {
+        throw recoveryError_('recovery_nothing_to_bind');
+      }
+      const now = new Date().toISOString();
+      const values = [
+        existing ? existing.createdAt || now : now, now, identityKey,
+        JSON.stringify(payload.verifier), capabilityHash, capabilityHash,
+        JSON.stringify(bound.orderIds), JSON.stringify(bound.groups), JSON.stringify(bound.deals),
+        actorId, (existing ? existing.version : 0) + 1, clientMutationId
+      ];
+      if (existing) {
+        sheets.recovery.getRange(existing.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([values]);
+      } else {
+        sheets.recovery.appendRow(values);
+      }
+      return json_({
+        ok: true, version: (existing ? existing.version : 0) + 1,
+        bound: { orders: bound.orderIds.length, groups: bound.groups.length, deals: bound.deals.length }
+      });
+    }
+
+    // redeem: 확인번호 검증은 Vercel 에서 끝났고, 여기서는 승계만 기록한다.
+    if (!existing) throw recoveryError_('recovery_not_enrolled');
+    if (existing.lastMutationId === clientMutationId) {
+      return json_({ ok: true, duplicate: true, version: existing.version, actorId: existing.actorId });
+    }
+    if (payload.redeemAssertion !== true) throw recoveryError_('forbidden');
+    const newHash = String(payload.capabilityHash || '').toLowerCase();
+    if (!RECOVERY_HASH.test(newHash)) throw recoveryError_('invalid_recovery_capability');
+    const now = new Date().toISOString();
+    sheets.recovery.getRange(existing.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([[
+      existing.createdAt || now, now, identityKey, JSON.stringify(existing.verifier),
+      existing.boundHash, newHash, JSON.stringify(existing.boundOrderIds),
+      JSON.stringify(existing.boundGroups), JSON.stringify(existing.boundDeals),
+      existing.actorId, existing.version + 1, clientMutationId
+    ]]);
+    return json_({
+      ok: true, version: existing.version + 1, actorId: existing.actorId,
+      bound: {
+        orders: (existing.boundOrderIds || []).length,
+        groups: (existing.boundGroups || []).length,
+        deals: (existing.boundDeals || []).length
+      },
+      groups: existing.boundGroups || []
+    });
+  } catch (error) {
+    return json_({ ok: false, error: error.code || 'recovery_failed' });
+  } finally {
+    if (lock) { try { lock.releaseLock(); } catch (error) {} }
+  }
+}
+
 function recoveryRowValue_(row, rowNumber) {
   const parse = function(value, fallback) {
     try {
@@ -3924,6 +4100,7 @@ function recoveryRowValue_(row, rowNumber) {
   };
   return {
     rowNumber: rowNumber,
+    createdAt: String(row[0] || ''),
     identityKey: String(row[2] || ''),
     verifier: parse(row[3], null),
     boundHash: String(row[4] || '').toLowerCase(),

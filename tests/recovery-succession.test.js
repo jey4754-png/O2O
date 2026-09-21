@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { adminStore } from './helpers/admin-store.js';
 import { fakeSheet } from './helpers/product-image-store.js';
+import { readFileSync } from 'node:fs';
 
 const PHONE = '01011112222';
 const OLD = 'a'.repeat(64);
@@ -102,4 +103,21 @@ test('승계 기록이 없으면 기존 동작이 그대로 유지된다', () =>
   const mine = order('order-1700000000507', OLD);
   data.customerOrders.rows.push(['', mine.id, PHONE, JSON.stringify(mine)]);
   assert.deepEqual(read(context, OLD).ids, [mine.id]);
+});
+
+test('복구 레이트리밋은 관리자 자격증명을 절대 돌려주지 않는다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // rate_begin 은 관리자 버킷일 때만 verifier 를 싣는다. 복구가 같은 리미터를
+  // 재사용하므로 이 게이트가 없으면 관리자 PIN 검증자가 복구 응답으로 샌다.
+  assert.match(source, /if \(operation === 'rate_begin'\s*\n\s*&& \(propertyKey \|\| ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY\) === ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY\) \{\s*\n\s*result\.credential = readAdminCredential_\(properties\);/);
+  assert.match(source, /const RECOVERY_RATE_LIMIT_PROPERTY_KEY = 'O2O_RECOVERY_AUTH_RATE_LIMIT_V1';/);
+  assert.equal(/RECOVERY_RATE_LIMIT_PROPERTY_KEY === ADMIN_AUTH_RATE_LIMIT_PROPERTY_KEY/.test(source), false);
+});
+
+test('등록은 소유를 증명하지 못하면 거부한다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  assert.match(source, /if \(!bound\.orderIds\.length && !bound\.groups\.length && !bound\.deals\.length\) \{\s*\n\s*throw recoveryError_\('recovery_nothing_to_bind'\);/);
+  // 결박 집합은 전화번호가 아니라 제시된 해시의 실제 소유로만 만든다.
+  assert.match(source, /if \(String\(order\._customerCapabilityHash \|\| ''\)\.toLowerCase\(\) !== capabilityHash\) return;/);
+  assert.equal(/recoveryBoundSet_\(sheets, phone/.test(source), false, '전화번호로 결박 집합을 만들지 않는다');
 });
