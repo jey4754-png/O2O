@@ -3386,9 +3386,7 @@ function publishCustomerOrder_(
     return json_({ ok: false, error: 'invalid_order_id' });
   }
   const visitorId = String(visitorIdValue || '');
-  if (!validVisitorId_(visitorId) || String(order.visitorId || '') !== visitorId) {
-    return json_({ ok: false, error: 'invalid_order_owner' });
-  }
+  if (!validVisitorId_(visitorId)) return json_({ ok: false, error: 'invalid_order_owner' });
   const orderGroupId = String(order.groupId || '');
   const orderDealId = String(order.dealId || (order.deal && order.deal.id) || '');
   if (orderGroupId && (!validVisitorId_(orderGroupId) || orderGroupId !== orderDealId)) {
@@ -3399,6 +3397,15 @@ function publishCustomerOrder_(
     incomingHash = privateCapabilityHash_(customerCapabilityHash, 'invalid_customer_capability');
   } catch (error) {
     return json_({ ok: false, error: error.code || 'invalid_customer_capability' });
+  }
+  if (String(order.visitorId || '') !== visitorId) {
+    // 복구한 기기는 등록 당시의 참여자ID로 행세할 수 있다. 기기가 자기 식별자를
+    // 바꾸게 하면 아직 들고 있는 그룹 자격이 전부 조회 불능이 되기 때문이다.
+    const storedForOwner = String(order._customerCapabilityHash || '').toLowerCase();
+    if (recoveryBoundActorId_(ensureSheets_(), incomingHash, storedForOwner, order.id)
+      !== String(order.visitorId || '')) {
+      return json_({ ok: false, error: 'invalid_order_owner' });
+    }
   }
   const phone = normalizePhone_(order.customerPhone);
   if (phone.length < 8) return json_({ ok: false, error: 'invalid_customer_phone' });
@@ -4034,8 +4041,7 @@ function recoveryBoundSet_(sheets, capabilityHash, groupClaims, dealClaims) {
     const dealId = String(claim.dealId || '');
     const hash = String(claim.ownerCapabilityHash || '').toLowerCase();
     if (!dealId || !RECOVERY_HASH.test(hash)) return;
-    const record = publicDealRecord_(sheets.publicDeals, dealId);
-    const deal = record && record.deal ? record.deal : null;
+    const deal = publicDealRecord_(sheets.publicDeals, dealId);
     if (!ownerClaimMatchesDeal_({ dealId: dealId, ownerCapabilityHash: hash }, deal)) return;
     deals.push({ dealId: dealId, hash: hash });
   });
@@ -4182,9 +4188,7 @@ function handleRecoveryCredentials_(payload) {
       const bucketKey = enrolling
         ? RECOVERY_ENROLL_RATE_LIMIT_PROPERTY_KEY
         : RECOVERY_RATE_LIMIT_PROPERTY_KEY;
-      const limitOperation = payload.operation === 'begin'
-        ? 'rate_begin'
-        : (!enrolling && payload.outcome === 'success' ? 'rate_success' : 'rate_failure');
+      const limitOperation = payload.operation === 'begin' ? 'rate_begin' : 'rate_failure';
       const limited = handleAdminAuthRateLimit_(
         properties, limitOperation, clientKey, bucketKey, true
       );
@@ -4335,6 +4339,12 @@ function recoveryRows_(sheets) {
 // 제시된 해시가 승계한 옛 해시를 돌려준다. 승계가 없으면 null.
 // 이 해시가 특정 주문에 대해 '결박 당시 해시'로 행세할 수 있는지 본다.
 // 읽기와 같은 근거를 쓰기 경로에도 적용해야 복구가 조회 전용으로 끝나지 않는다.
+function recoveryBoundActorId_(sheets, presentedHash, storedHash, orderId) {
+  if (!recoveryActsAsHash_(sheets, presentedHash, storedHash, orderId)) return '';
+  const succession = recoverySuccession_(sheets, String(presentedHash || '').toLowerCase());
+  return succession ? String(succession.actorId || '') : '';
+}
+
 function recoveryActsAsHash_(sheets, presentedHash, storedHash, orderId) {
   const presented = String(presentedHash || '').toLowerCase();
   const stored = String(storedHash || '').toLowerCase();
@@ -5243,7 +5253,10 @@ function authorizeCustomerOrderCancellation_(sheets, record, payload, actorId, g
     throw groupOperationError_('forbidden');
   }
   // 복구한 기기는 등록 당시의 참여자ID를 물려받으므로 이 검사는 그대로 성립한다.
-  if (String(order.visitorId || '') !== actorId) throw groupOperationError_('order_owner_conflict');
+  if (String(order.visitorId || '') !== actorId
+    && recoveryBoundActorId_(sheets, suppliedHash, storedHash, order.id) !== String(order.visitorId || '')) {
+    throw groupOperationError_('order_owner_conflict');
+  }
   const orderGroupId = String(order.groupId || '');
   const orderDealId = String(order.dealId || (order.deal && order.deal.id) || '');
   const participantActorId = String(order.participantActorId || order.visitorId || '');

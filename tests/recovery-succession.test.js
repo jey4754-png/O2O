@@ -353,8 +353,30 @@ test('등록은 별도 버킷에서 결과와 무관하게 슬롯을 소모한�
   assert.match(source, /const RECOVERY_ENROLL_RATE_LIMIT_PROPERTY_KEY = 'O2O_RECOVERY_ENROLL_RATE_LIMIT_V1';/);
   assert.match(source, /const enrolling = payload\.scope === 'enroll';/);
   assert.match(source, /\? RECOVERY_ENROLL_RATE_LIMIT_PROPERTY_KEY\s*\n\s*: RECOVERY_RATE_LIMIT_PROPERTY_KEY;/);
-  assert.match(source, /\(!enrolling && payload\.outcome === 'success' \? 'rate_success' : 'rate_failure'\)/);
   assert.match(source, /if \(enrolling\) return json_\(limited\);/);
+  // 어떤 결과로도 리셋되지 않는다. 이 리미터는 성공을 기록하면 실패 카운터를
+  // 0 으로 되돌리고 버킷은 호출자 기준이라, 자기 확인번호를 아는 등록 하나를
+  // 성공시킬 때마다 남의 번호에 쌓인 실패가 통째로 지워진다.
+  assert.match(source, /const limitOperation = payload\.operation === 'begin' \? 'rate_begin' : 'rate_failure';/);
+  assert.equal(/rate_success/.test(source.slice(source.indexOf('function handleRecoveryCredentials_'))), false,
+    '복구 흐름은 rate_success 를 쓰지 않는다');
+});
+
+test('사장님 상품 결박이 실제로 성립한다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // publicDealRecord_ 는 거래 객체를 그대로 돌려준다. .deal 래퍼를 기대하면
+  // 조건이 늘 거짓이 되어 bound.deals 가 영원히 0 이 된다.
+  assert.match(source, /const deal = publicDealRecord_\(sheets\.publicDeals, dealId\);/);
+  assert.equal(/record && record\.deal \? record\.deal : null/.test(source), false);
+});
+
+test('복구한 기기는 자기 식별자를 바꾸지 않고도 쓰기가 된다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // 식별자를 교체하게 하면 이 브라우저가 아직 들고 있는 그룹 자격이 전부
+  // (그룹, 참여자) 키에서 어긋나 조회 불능이 된다.
+  assert.match(source, /function recoveryBoundActorId_\(sheets, presentedHash, storedHash, orderId\) \{/);
+  assert.match(source, /if \(recoveryBoundActorId_\(ensureSheets_\(\), incomingHash, storedForOwner, order\.id\)\s*\n\s*!== String\(order\.visitorId \|\| ''\)\) \{/);
+  assert.match(source, /&& recoveryBoundActorId_\(sheets, suppliedHash, storedHash, order\.id\) !== String\(order\.visitorId \|\| ''\)\) \{/);
 });
 
 test('승계는 쓰기 경로에서도 인정되어 조회 전용 복구로 끝나지 않는다', () => {
