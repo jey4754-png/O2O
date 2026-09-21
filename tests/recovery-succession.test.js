@@ -344,3 +344,33 @@ test('복구는 Vercel 이 맞춘 검증자의 행에만 적용된다', () => {
   // 승계 기록 뒤에는 캐시를 반드시 비운다. 안 그러면 복구가 한동안 반영되지 않는다.
   assert.match(source, /existing\.actorId, existing\.version \+ 1, clientMutationId\s*\n\s*\]\]\);\s*\n\s*invalidateRecoveryRows_\(\);/);
 });
+
+test('등록은 별도 버킷에서 결과와 무관하게 슬롯을 소모한다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // 실패 리미터는 성공하는 오퍼레이션에 상한을 주지 못한다. rate_success 가
+  // 실패 카운터를 0 으로 되돌려, 성공하는 등록을 끼워 넣으면 확인번호 대입
+  // 횟수까지 초기화된다.
+  assert.match(source, /const RECOVERY_ENROLL_RATE_LIMIT_PROPERTY_KEY = 'O2O_RECOVERY_ENROLL_RATE_LIMIT_V1';/);
+  assert.match(source, /const enrolling = payload\.scope === 'enroll';/);
+  assert.match(source, /\? RECOVERY_ENROLL_RATE_LIMIT_PROPERTY_KEY\s*\n\s*: RECOVERY_RATE_LIMIT_PROPERTY_KEY;/);
+  assert.match(source, /\(!enrolling && payload\.outcome === 'success' \? 'rate_success' : 'rate_failure'\)/);
+  assert.match(source, /if \(enrolling\) return json_\(limited\);/);
+});
+
+test('승계는 쓰기 경로에서도 인정되어 조회 전용 복구로 끝나지 않는다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  assert.match(source, /function recoveryActsAsHash_\(sheets, presentedHash, storedHash, orderId\) \{/);
+  // 게시와 취소 양쪽이 같은 근거를 쓴다.
+  assert.match(source, /if \(existingHash !== incomingHash\s*\n\s*&& !recoveryActsAsHash_\(sheets, incomingHash, existingHash, existingOrder\.id\)\) \{/);
+  assert.match(source, /if \(storedHash !== suppliedHash\s*\n\s*&& !recoveryActsAsHash_\(sheets, suppliedHash, storedHash, order\.id\)\) \{/);
+  // 결박된 주문에만 적용된다.
+  assert.match(source, /return \(succession\.boundOrderIds \|\| \[\]\)\.some\(function\(id\) \{/);
+});
+
+test('한 키가 두 등록을 승계하는 상태를 만들지 않는다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // recoverySuccession_ 은 모호하면 null 을 돌려주므로, 두 번째 승계가 기록되면
+  // 그 키가 이미 되살린 접근까지 한꺼번에 사라진다.
+  assert.match(source, /const ambiguous = recoveryRowsRaw_\(sheets\)\.some\(function\(row\) \{/);
+  assert.match(source, /if \(ambiguous\) throw recoveryError_\('recovery_succession_exists'\);/);
+});

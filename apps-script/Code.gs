@@ -3450,7 +3450,10 @@ function publishCustomerOrder_(
     if (existingOrder) {
       const existingHash = String(existingOrder._customerCapabilityHash || '').toLowerCase();
       if (/^[a-f0-9]{64}$/.test(existingHash)) {
-        if (existingHash !== incomingHash) return json_({ ok: false, error: 'forbidden' });
+        if (existingHash !== incomingHash
+          && !recoveryActsAsHash_(sheets, incomingHash, existingHash, existingOrder.id)) {
+          return json_({ ok: false, error: 'forbidden' });
+        }
       } else if (existingHash) {
         return json_({ ok: false, error: 'order_ownership_unclaimable' });
       } else {
@@ -3958,6 +3961,11 @@ function customerOrderOwnership_(orders) {
 // 화면에 노출되므로 소유 증명이 될 수 없다. 전화번호를 근거로 삼으면 남의 번호로 주문
 // 한 건을 만든 뒤 그 번호 전체를 인수할 수 있다.
 const RECOVERY_RATE_LIMIT_PROPERTY_KEY = 'O2O_RECOVERY_AUTH_RATE_LIMIT_V1';
+// 등록은 성공하는 것이 정상이라 실패 리미터로는 상한이 걸리지 않는다. rate_success 가
+// 실패 카운터를 0 으로 되돌리기 때문이다. 같은 버킷을 쓰면 성공하는 등록을 끼워 넣어
+// 확인번호 대입 횟수까지 초기화할 수 있다. 등록은 별도 버킷에서 결과와 무관하게
+// 한 건씩 소모하도록 둔다.
+const RECOVERY_ENROLL_RATE_LIMIT_PROPERTY_KEY = 'O2O_RECOVERY_ENROLL_RATE_LIMIT_V1';
 const RECOVERY_IDENTITY_KEY = /^[a-f0-9]{64}$/;
 const RECOVERY_HASH = /^[a-f0-9]{64}$/;
 
@@ -4168,13 +4176,21 @@ function handleRecoveryCredentials_(payload) {
       const clientKey = String(payload.clientKey || '');
       if (!/^[a-f0-9]{32}$/.test(clientKey)) throw recoveryError_('invalid_recovery_request');
       lock = acquireScriptLock_();
+      // 등록 흐름은 자기 버킷을 쓰고, 확정은 항상 슬롯을 소모한다. 성공으로
+      // 확정하면 상한이 사라지고 복구 대입 횟수까지 함께 초기화된다.
+      const enrolling = payload.scope === 'enroll';
+      const bucketKey = enrolling
+        ? RECOVERY_ENROLL_RATE_LIMIT_PROPERTY_KEY
+        : RECOVERY_RATE_LIMIT_PROPERTY_KEY;
       const limitOperation = payload.operation === 'begin'
         ? 'rate_begin'
-        : (payload.outcome === 'success' ? 'rate_success' : 'rate_failure');
+        : (!enrolling && payload.outcome === 'success' ? 'rate_success' : 'rate_failure');
       const limited = handleAdminAuthRateLimit_(
-        properties, limitOperation, clientKey, RECOVERY_RATE_LIMIT_PROPERTY_KEY, true
+        properties, limitOperation, clientKey, bucketKey, true
       );
       if (payload.operation !== 'begin' || limited.allowed !== true) return json_(limited);
+      // 등록은 확인번호를 맞출 일이 없다. 검증자를 건네면 대입 표면만 넓어진다.
+      if (enrolling) return json_(limited);
       // 검증자는 예약에 성공한 요청에만, 잠긴 같은 요청 안에서만 돌려준다.
       // 별도의 읽기 오퍼레이션을 두면 저엔트로피 확인번호가 오프라인 대입에 노출된다.
       const candidates = recoveryIdentityRows_(ensureSheets_(), identityKey)
@@ -4253,6 +4269,15 @@ function handleRecoveryCredentials_(payload) {
     if (payload.redeemAssertion !== true) throw recoveryError_('forbidden');
     const newHash = String(payload.capabilityHash || '').toLowerCase();
     if (!RECOVERY_HASH.test(newHash)) throw recoveryError_('invalid_recovery_capability');
+    // 한 키가 두 등록을 승계하면 recoverySuccession_ 이 모호로 판정해 null 을
+    // 돌려주고, 그 키가 이미 되살린 접근까지 한꺼번에 사라진다. 관리자 경로는
+    // 이미 같은 이유로 막고 있다. 같은 보호를 여기에도 둔다.
+    const ambiguous = recoveryRowsRaw_(sheets).some(function(row) {
+      return row.rowNumber !== existing.rowNumber
+        && String(row.currentHash || '').toLowerCase() === newHash
+        && String(row.boundHash || '').toLowerCase() !== newHash;
+    });
+    if (ambiguous) throw recoveryError_('recovery_succession_exists');
     const now = new Date().toISOString();
     sheets.recovery.getRange(existing.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([[
       existing.createdAt || now, now, identityKey, JSON.stringify(existing.verifier),
@@ -4308,6 +4333,19 @@ function recoveryRows_(sheets) {
 }
 
 // 제시된 해시가 승계한 옛 해시를 돌려준다. 승계가 없으면 null.
+// 이 해시가 특정 주문에 대해 '결박 당시 해시'로 행세할 수 있는지 본다.
+// 읽기와 같은 근거를 쓰기 경로에도 적용해야 복구가 조회 전용으로 끝나지 않는다.
+function recoveryActsAsHash_(sheets, presentedHash, storedHash, orderId) {
+  const presented = String(presentedHash || '').toLowerCase();
+  const stored = String(storedHash || '').toLowerCase();
+  if (!presented || !stored || presented === stored) return presented === stored;
+  const succession = recoverySuccession_(sheets, presented);
+  if (!succession || succession.boundHash !== stored) return false;
+  return (succession.boundOrderIds || []).some(function(id) {
+    return String(id) === String(orderId);
+  });
+}
+
 function recoverySuccession_(sheets, capabilityHash) {
   const hash = String(capabilityHash || '').toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(hash)) return null;
@@ -5200,7 +5238,11 @@ function authorizeCustomerOrderCancellation_(sheets, record, payload, actorId, g
   if (!/^[a-f0-9]{64}$/.test(storedHash)) {
     throw groupOperationError_('order_ownership_unclaimable');
   }
-  if (storedHash !== suppliedHash) throw groupOperationError_('forbidden');
+  if (storedHash !== suppliedHash
+    && !recoveryActsAsHash_(sheets, suppliedHash, storedHash, order.id)) {
+    throw groupOperationError_('forbidden');
+  }
+  // 복구한 기기는 등록 당시의 참여자ID를 물려받으므로 이 검사는 그대로 성립한다.
   if (String(order.visitorId || '') !== actorId) throw groupOperationError_('order_owner_conflict');
   const orderGroupId = String(order.groupId || '');
   const orderDealId = String(order.dealId || (order.deal && order.deal.id) || '');
