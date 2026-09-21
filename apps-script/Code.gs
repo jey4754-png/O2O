@@ -2277,12 +2277,21 @@ function publishPublicDeal_(deal, ownerCapabilityHash) {
       }
     }
     let idempotentPublishReplay = false;
+    // 승계로 인가된 쓰기는 상품 행의 소유 표시를 그대로 둔다. 주문 축과 같은
+    // 원칙이고, 여기서는 사장님이 아직 들고 있는 옛 기기와 상품에 딸린 그룹
+    // 기록이 서로 다른 해시를 보게 되는 것을 막는다.
+    let inheritedOwnerHash = '';
     if (existingDeal) {
       const existingHash = String(existingDeal._ownerCapabilityHash || '').toLowerCase();
       if (!/^[a-f0-9]{64}$/.test(existingHash)) {
         return json_({ ok: false, error: 'deal_ownership_unclaimable' });
       }
-      if (existingHash !== incomingHash) return json_({ ok: false, error: 'forbidden' });
+      if (existingHash !== incomingHash) {
+        if (recoveryDealSuccessionHash_(sheets, deal.id, incomingHash) !== existingHash) {
+          return json_({ ok: false, error: 'forbidden' });
+        }
+        inheritedOwnerHash = existingHash;
+      }
       if (String(existingDeal.visibility || '') === 'deleted') {
         return json_({ ok: false, error: 'deal_deleted' });
       }
@@ -2440,7 +2449,7 @@ function publishPublicDeal_(deal, ownerCapabilityHash) {
       visibility: 'public',
       syncedAt: publishNow,
       publishVersion: currentPublishVersion + 1,
-      _ownerCapabilityHash: incomingHash,
+      _ownerCapabilityHash: inheritedOwnerHash || incomingHash,
       _lastDealPublishMutationId: publishMutationId,
       _lastDealPublishMutationContract: publishMutationContract
     });
@@ -2649,7 +2658,8 @@ function deletePublicDeal_(dealId, ownerCapabilityHash, expectedPublishVersionVa
   });
   const lock = acquireScriptLock_();
   try {
-    const sheet = ensureSheets_().publicDeals;
+    const sheets = ensureSheets_();
+    const sheet = sheets.publicDeals;
     if (sheet.getLastRow() < 2) return json_({ ok: true, deleted: false });
     const match = sheet.getRange(2, 2, sheet.getLastRow() - 1, 1)
       .createTextFinder(String(dealId)).matchEntireCell(true).findNext();
@@ -2663,7 +2673,10 @@ function deletePublicDeal_(dealId, ownerCapabilityHash, expectedPublishVersionVa
     if (!/^[a-f0-9]{64}$/.test(existingHash)) {
       return json_({ ok: false, error: 'deal_ownership_unclaimable' });
     }
-    if (existingHash !== incomingHash) return json_({ ok: false, error: 'forbidden' });
+    if (existingHash !== incomingHash
+      && recoveryDealSuccessionHash_(sheets, dealId, incomingHash) !== existingHash) {
+      return json_({ ok: false, error: 'forbidden' });
+    }
     if (String(existingDeal._lastDealDeleteMutationId || '') === clientMutationId) {
       if (String(existingDeal._lastDealDeleteMutationContract || '') !== deleteContract) {
         return json_({ ok: false, error: 'client_mutation_conflict' });
@@ -3020,17 +3033,31 @@ function selectCustomerOrderReservation_(history, boundMutationIds, order, parti
   };
 }
 
-function requireParticipantCapability_(participant, participantCapabilityHashValue) {
+function requireParticipantCapability_(
+  participant,
+  participantCapabilityHashValue,
+  sheets,
+  groupId,
+  actorId
+) {
   const participantCapabilityHash = privateCapabilityHash_(
     participantCapabilityHashValue,
     'invalid_participant_capability'
   );
-  // 복구한 기기는 등록 당시 결박된 그룹에 한해 옛 해시로 행세할 수 있다.
-
-  // 여기서만 해석하지 않으면 그룹 주문 게시가 막혀 반쪽 복구가 된다.
-  if (!participant || !participant.capabilityHash
-    || participant.capabilityHash !== participantCapabilityHash) {
+  if (!participant || !participant.capabilityHash) {
     throw groupOperationError_('invalid_participant_capability');
+  }
+  if (participant.capabilityHash !== participantCapabilityHash) {
+    // 복구한 기기는 등록 당시 결박된 그룹에 한해 옛 해시로 행세할 수 있다.
+    // 여기서 해석하지 않으면 방은 열리는데 그 그룹의 주문 게시만 막혀
+    // 조회 전용 복구가 된다. 결박 당시 해시가 지금 참여자 행의 값과 아직
+    // 같을 때만 인정한다.
+    const inherited = sheets
+      ? recoveryGroupSuccessionHash_(sheets, groupId, actorId, participantCapabilityHash)
+      : '';
+    if (!inherited || inherited !== participant.capabilityHash) {
+      throw groupOperationError_('invalid_participant_capability');
+    }
   }
   return participantCapabilityHash;
 }
@@ -3078,7 +3105,7 @@ function bindInitialGroupOrderReservation_(sheets, order, visitorId, participant
   if (!participant || !participant.counted || participant.selectedQuantity < requireSecureOrderQuantity_(order)) {
     throw groupOperationError_('order_reservation_unverified');
   }
-  requireParticipantCapability_(participant, participantCapabilityHashValue);
+  requireParticipantCapability_(participant, participantCapabilityHashValue, sheets, groupId, visitorId);
   const reservation = selectCustomerOrderReservation_(
     customerOrderReservationHistory_(sheets, groupId, visitorId),
     boundCustomerOrderReservations_(sheets.customerOrders, order.id),

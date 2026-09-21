@@ -424,3 +424,140 @@ test('미끼 검증자가 실제 등록과 구분되지 않는다', () => {
   // 순서도 정보가 되지 않아야 한다.
   assert.match(source, /candidates\.sort\(function\(left, right\) \{ return left\.ref < right\.ref \? -1 : 1; \}\);/);
 });
+
+// ── 그룹·상품 축의 쓰기 경로 ────────────────────────────────────────────────
+// 읽기만 승계하면 복구한 기기는 방과 상품 목록은 보이는데 주문 게시·상품 수정이
+// 막히는 조회 전용 상태가 된다. 주문 축과 같은 근거로 쓰기까지 인정해야 한다.
+
+const storedDeal = (data, dealId) => JSON.parse(
+  data.publicDeals.rows.find((row) => row[1] === dealId)[6]);
+
+const publish = (context, deal, hash, overrides = {}) => context.publishPublicDeal_(
+  Object.assign({}, deal, {
+    expectedPublishVersion: Number(deal.publishVersion || 0),
+    publishMutationId: 'publish-succession-0001',
+  }, overrides),
+  hash
+);
+
+const remove = (context, dealId, hash, expectedPublishVersion) => context.deletePublicDeal_(
+  dealId, hash, expectedPublishVersion, 'delete-succession-0001');
+
+const participantCapability = (context, participant, hash, groupId) => {
+  try {
+    return {
+      ok: true,
+      hash: context.requireParticipantCapability_(
+        participant, hash, context.ensureSheets_(), groupId, 'member-test'),
+    };
+  } catch (error) {
+    return { ok: false, error: error.code || String(error && error.message) };
+  }
+};
+
+test('승계한 키는 결박된 상품을 수정하고 삭제할 수 있다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId, hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  const published = publish(context, storedDeal(data, dealId), RECOVERED, { title: '복구 후 수정' });
+  assert.equal(published.ok, true, published.error);
+  assert.equal(storedDeal(data, dealId).title, '복구 후 수정');
+
+  const deleted = remove(context, dealId, RECOVERED, storedDeal(data, dealId).publishVersion);
+  assert.equal(deleted.ok, true, deleted.error);
+  assert.equal(storedDeal(data, dealId).visibility, 'deleted');
+});
+
+test('결박되지 않은 상품은 승계 키로 수정되지 않는다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId: 'owner-some-other-product', hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  assert.equal(publish(context, storedDeal(data, dealId), RECOVERED).error, 'forbidden');
+  assert.equal(remove(context, dealId, RECOVERED, 1).error, 'forbidden',
+    '결박 목록에 없는 상품은 같은 등록의 키로도 지울 수 없다');
+});
+
+test('제3자 키는 상품을 수정하지 못한다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId, hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  assert.equal(publish(context, storedDeal(data, dealId), STRANGER).error, 'forbidden');
+  assert.equal(remove(context, dealId, STRANGER, 1).error, 'forbidden');
+});
+
+test('승계로 인가된 상품 쓰기는 저장된 소유 표시를 바꾸지 않는다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId, hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  assert.equal(publish(context, storedDeal(data, dealId), RECOVERED, { title: '복구 후 수정' }).ok, true);
+  assert.equal(storedDeal(data, dealId)._ownerCapabilityHash, DEAL_OWNER,
+    '승계 쓰기가 소유 표시를 새 키로 갈아치우면 옛 기기와 딸린 그룹 기록이 어긋난다');
+  // 소유 표시가 그대로이므로 승계는 다음 쓰기에도 계속 성립한다.
+  const again = publish(context, storedDeal(data, dealId), RECOVERED,
+    { title: '두 번째 수정', publishMutationId: 'publish-succession-0002' });
+  assert.equal(again.ok, true, again.error);
+});
+
+test('승계한 키는 결박된 그룹에서 참여자 자격으로 쓰기가 인정된다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    groups: [{ groupId: dealId, actorId: 'member-test', hash: PARTICIPANT }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+  const participant = { capabilityHash: PARTICIPANT };
+
+  assert.equal(participantCapability(context, participant, RECOVERED, dealId).ok, true);
+  assert.equal(participantCapability(context, participant, PARTICIPANT, dealId).ok, true,
+    '원래 키도 그대로 동작한다');
+});
+
+test('결박되지 않은 그룹에서는 참여자 자격이 승계되지 않는다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  addGroup(data, SECOND_GROUP, PARTICIPANT);
+  enroll(data.recovery, {
+    groups: [{ groupId: dealId, actorId: 'member-test', hash: PARTICIPANT }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+  const participant = { capabilityHash: PARTICIPANT };
+
+  assert.equal(participantCapability(context, participant, RECOVERED, SECOND_GROUP).error,
+    'invalid_participant_capability',
+    '같은 참여자·같은 해시라도 등록 시점에 증명되지 않은 그룹은 쓰기가 되지 않는다');
+});
+
+test('결박 당시 해시가 바뀐 그룹은 참여자 자격 승계가 무효다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    groups: [{ groupId: dealId, actorId: 'member-test', hash: PARTICIPANT }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+  // 등록 이후 정상 경로로 참여자 권한 토큰이 교체된 상황.
+  const participant = { capabilityHash: ROTATED };
+
+  assert.equal(participantCapability(context, participant, RECOVERED, dealId).error,
+    'invalid_participant_capability');
+  assert.equal(participantCapability(context, participant, ROTATED, dealId).ok, true);
+  assert.equal(participantCapability(context, participant, STRANGER, dealId).error,
+    'invalid_participant_capability');
+});
+
+test('그룹 주문 결박은 참여자 자격 확인에 승계 근거를 넘겨준다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // sheets 를 넘기지 않으면 함수가 승계표를 못 읽어 조용히 옛 동작으로 돌아간다.
+  assert.match(
+    source,
+    /requireParticipantCapability_\(participant, participantCapabilityHashValue, sheets, groupId, visitorId\);/,
+  );
+});
