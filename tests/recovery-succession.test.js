@@ -26,10 +26,14 @@ const order = (id, hash, overrides = {}) => ({
   visitorId: 'member-test', _customerCapabilityHash: hash, ...overrides,
 });
 
-const enroll = (recovery, { bound = [], boundHash = OLD, currentHash = NEW } = {}) => {
+const enroll = (
+  recovery,
+  { bound = [], groups = [], deals = [], boundHash = OLD, currentHash = NEW } = {},
+) => {
   recovery.rows.push(['2026-09-20T00:00:00Z', '2026-09-20T00:00:00Z', 'identity-key',
     JSON.stringify({ algorithm: 'scrypt-v1' }), boundHash, currentHash,
-    JSON.stringify(bound), '[]', '[]', 'member-test', 1, 'mutation-0000001']);
+    JSON.stringify(bound), JSON.stringify(groups), JSON.stringify(deals),
+    'member-test', 1, 'mutation-0000001']);
 };
 
 const read = (context, hash) => {
@@ -120,4 +124,223 @@ test('등록은 소유를 증명하지 못하면 거부한다', () => {
   // 결박 집합은 전화번호가 아니라 제시된 해시의 실제 소유로만 만든다.
   assert.match(source, /if \(String\(order\._customerCapabilityHash \|\| ''\)\.toLowerCase\(\) !== capabilityHash\) return;/);
   assert.equal(/recoveryBoundSet_\(sheets, phone/.test(source), false, '전화번호로 결박 집합을 만들지 않는다');
+});
+
+// ── 그룹·상품 축 승계 ──────────────────────────────────────────────────────
+// adminStore 가 미리 넣어 두는 값들. 참여자 행의 권한 해시와 상품 행의 사장님
+// 해시는 고객 주문 해시와 서로 다른 토큰이므로 축마다 따로 결박된다.
+const PARTICIPANT = 'c'.repeat(64);
+const DEAL_OWNER = 'a'.repeat(64);
+// 등록 시점의 고객 키(결박해시)와 복구로 받은 새 키(현재해시).
+const BOUND = 'd'.repeat(64);
+const RECOVERED = 'e'.repeat(64);
+const STRANGER = 'f'.repeat(64);
+// 정상 경로로 권한 토큰이 교체된 뒤의 값.
+const ROTATED = '9'.repeat(64);
+const SECOND_GROUP = 'owner-second-group';
+
+const addGroup = (data, groupId, participantHash) => {
+  data.groups.rows.push([groupId, groupId, '다른 그룹', 'recruiting', 5, false,
+    'host-test', 0, 1, '', '', '', 'host-test', 'recruiting', 10]);
+  data.groupParticipants.rows.push([groupId, 'member-test', '검증 사용자', 'member', true,
+    'pending', 0, participantHash, 1, '', '', 1]);
+};
+
+const snapshot = (context, groupId, hash) => {
+  const result = context.handleGroupOperation_('snapshot', {
+    groupId, actorId: 'member-test', capabilityHash: hash,
+  });
+  return { ok: result.ok === true, error: result.error };
+};
+
+const ownerDeals = (context, claims) => {
+  const result = context.getOwnerPublicDealsResponse_(claims);
+  return { ok: result.ok, error: result.error, ids: Array.from(result.deals || [], (d) => String(d.id)) };
+};
+
+const dealRow = (data) => data.publicDeals.rows.find((row) => row[1] === 'owner-image-quality-regression');
+
+test('승계한 키는 결박된 그룹의 참여자로 인정된다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    groups: [{ groupId: dealId, actorId: 'member-test', hash: PARTICIPANT }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  const result = snapshot(context, dealId, RECOVERED);
+  assert.equal(result.ok, true, result.error);
+  assert.equal(snapshot(context, dealId, PARTICIPANT).ok, true, '원래 키도 그대로 동작한다');
+});
+
+test('결박되지 않은 그룹은 같은 참여자라도 승계되지 않는다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  addGroup(data, SECOND_GROUP, ROTATED);
+  enroll(data.recovery, {
+    groups: [{ groupId: dealId, actorId: 'member-test', hash: PARTICIPANT }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  assert.equal(snapshot(context, dealId, RECOVERED).ok, true);
+  assert.equal(snapshot(context, SECOND_GROUP, RECOVERED).error, 'invalid_capability',
+    '등록 시점에 증명되지 않은 그룹은 승계 대상이 아니다');
+});
+
+test('결박 당시 해시가 바뀐 그룹은 승계가 무효다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    groups: [{ groupId: dealId, actorId: 'member-test', hash: PARTICIPANT }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+  // 등록 이후 정상 경로로 참여자 권한 토큰이 교체된 상황.
+  data.groupParticipants.rows.at(-1)[7] = ROTATED;
+
+  assert.equal(snapshot(context, dealId, RECOVERED).error, 'invalid_capability',
+    '옛 등록이 이후의 정상 교체를 되돌리면 안 된다');
+  assert.equal(snapshot(context, dealId, ROTATED).ok, true, '교체된 현재 키는 동작한다');
+});
+
+test('제3자 키는 그룹에서 아무것도 얻지 못한다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    groups: [{ groupId: dealId, actorId: 'member-test', hash: PARTICIPANT }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  assert.equal(snapshot(context, dealId, STRANGER).error, 'invalid_capability',
+    '승계표에 없는 키는 actorId 가 맞아도 권한이 없다');
+});
+
+test('그룹 승계는 참여자 행을 다시 쓰지 않는다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    groups: [{ groupId: dealId, actorId: 'member-test', hash: PARTICIPANT }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+  const before = JSON.stringify(data.groupParticipants.rows);
+
+  assert.equal(snapshot(context, dealId, RECOVERED).ok, true);
+  assert.equal(JSON.stringify(data.groupParticipants.rows), before,
+    '승계는 읽기 시점 해석이므로 참여자 행의 권한 해시가 남아 있어야 한다');
+});
+
+test('승계한 키는 결박된 상품만 사장님 권한으로 인정된다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId, hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  const result = ownerDeals(context, [{ dealId, ownerCapabilityHash: RECOVERED }]);
+  assert.equal(result.ok, true, result.error);
+  assert.deepEqual(result.ids, [dealId]);
+});
+
+test('결박되지 않은 상품은 승계되지 않는다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId: 'owner-some-other-product', hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: RECOVERED }]).ids, [],
+    '같은 사장님 해시를 쓰는 상품이라도 결박 목록에 없으면 승계되지 않는다');
+});
+
+test('결박 당시 해시가 바뀐 상품은 승계가 무효다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId, hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+  const row = dealRow(data);
+  const deal = JSON.parse(row[6]);
+  deal._ownerCapabilityHash = ROTATED;
+  row[6] = JSON.stringify(deal);
+
+  assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: RECOVERED }]).ids, [],
+    '상품 행이 그 사이 바뀌었으면 결박 당시 해시는 더 이상 권한이 아니다');
+  assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: ROTATED }]).ids, [dealId]);
+});
+
+test('제3자 키는 상품에서 아무것도 얻지 못한다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId, hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+
+  assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: STRANGER }]).ids, [],
+    '승계표에 없는 키는 상품ID 를 알아도 권한이 없다');
+});
+
+test('상품 승계는 상품 행을 다시 쓰지 않는다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId, hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+  const before = JSON.stringify(data.publicDeals.rows);
+
+  assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: RECOVERED }]).ids, [dealId]);
+  assert.equal(JSON.stringify(data.publicDeals.rows), before);
+});
+
+test('승계 조회는 소유 주장이 많아도 복구 등록 시트를 한 번만 읽는다', () => {
+  const { context, data, dealId } = storeWithRecovery();
+  enroll(data.recovery, {
+    deals: [{ dealId, hash: DEAL_OWNER }],
+    boundHash: BOUND, currentHash: RECOVERED,
+  });
+  let reads = 0;
+  const getRange = data.recovery.getRange.bind(data.recovery);
+  data.recovery.getRange = (...args) => {
+    const range = getRange(...args);
+    const getValues = range.getValues.bind(range);
+    range.getValues = () => { reads += 1; return getValues(); };
+    return range;
+  };
+
+  // 사장님은 한 요청에 OWNER_CLAIM_LIMIT 개까지 주장을 실을 수 있다. 주장마다
+  // 승계표를 다시 읽으면 읽기 비용이 주장 수에 비례한다.
+  const claims = [{ dealId, ownerCapabilityHash: RECOVERED }];
+  for (let index = 1; index < 50; index += 1) {
+    claims.push({ dealId: `owner-filler-${index}`, ownerCapabilityHash: RECOVERED });
+  }
+  assert.deepEqual(ownerDeals(context, claims).ids, [dealId]);
+  assert.equal(reads, 1, `복구 등록 시트를 ${reads}번 읽었다`);
+});
+
+test('등록 행의 주인은 전화번호가 아니라 그 행을 만든 권한 키다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  // identityKey 만으로 행을 특정하면 번호만 아는 제3자가 남의 등록을 덮어써
+  // 이미 복구해 둔 접근까지 되돌릴 수 있다. 행은 (identityKey, boundHash) 로 잡는다.
+  assert.match(source, /function recoveryOwnRow_\(sheets, identityKey, boundHash\) \{/);
+  assert.match(source, /if \(rows\[index\]\.boundHash === boundHash\) return rows\[index\];/);
+  assert.equal(/function recoveryIdentityRow_\(/.test(source), false,
+    '전화번호 단독으로 등록 행을 특정하는 경로는 남아 있으면 안 된다');
+  assert.match(source, /const own = recoveryOwnRow_\(sheets, identityKey, capabilityHash\);/);
+  assert.match(source, /if \(own\) \{\s*\n\s*sheets\.recovery\.getRange\(own\.rowNumber/);
+  assert.match(source, /const RECOVERY_ROWS_PER_IDENTITY = 8;/);
+  assert.match(source, /throw recoveryError_\('recovery_enrollment_limit'\);/);
+});
+
+test('등록·복구 응답이 등록 여부나 횟수를 알려주지 않는다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  const handler = source.slice(source.indexOf('function handleRecoveryCredentials_'));
+  const body = handler.slice(0, handler.indexOf('\n}\n'));
+  assert.equal(/version: \(own \? own\.version : 0\) \+ 1/.test(body), false,
+    'enroll 응답의 version 은 그 번호의 등록 여부를 알려주는 열거 수단이다');
+  assert.equal(/duplicate: true, version:/.test(body), false);
+  // begin 은 검증자 개수를 고정 길이로 패딩한다.
+  assert.match(body, /while \(candidates\.length < RECOVERY_ROWS_PER_IDENTITY\) \{/);
+  assert.match(body, /recovery-decoy:/);
+  assert.match(body, /return json_\(Object\.assign\(\{\}, limited, \{ verifiers: candidates \}\)\);/);
+});
+
+test('복구는 Vercel 이 맞춘 검증자의 행에만 적용된다', () => {
+  const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
+  assert.match(source, /const existing = recoveryOwnRow_\(sheets, identityKey, String\(payload\.ref \|\| ''\)\.toLowerCase\(\)\);/);
+  assert.match(source, /if \(!existing\) throw recoveryError_\('recovery_not_enrolled'\);/);
+  // 승계 기록 뒤에는 캐시를 반드시 비운다. 안 그러면 복구가 한동안 반영되지 않는다.
+  assert.match(source, /existing\.actorId, existing\.version \+ 1, clientMutationId\s*\n\s*\]\]\);\s*\n\s*invalidateRecoveryRows_\(\);/);
 });

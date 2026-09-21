@@ -89,6 +89,11 @@ const LEGACY_RECOVERY_DEAL_IDS = [
   'customer-1785466024342'
 ];
 let RUNTIME_SHEETS_CACHE_ = null;
+// 승계 해석은 주문·그룹·상품 세 축의 읽기 경로에서 각각 필요하고, 사장님 경로는
+// 한 요청에 소유 주장을 최대 OWNER_CLAIM_LIMIT 개까지 싣는다. 실행 단위로 한 번만
+// 읽어 두지 않으면 '복구 등록' 읽기 비용이 주장 수에 비례해 늘어난다. 이 표는
+// 자기 자신을 쓰는 요청 밖에서는 바뀌지 않으므로, 그 쓰기에서만 캐시를 버린다.
+let RECOVERY_ROWS_CACHE_ = null;
 
 function acquireScriptLock_() {
   const lock = LockService.getScriptLock();
@@ -739,7 +744,19 @@ function authorizedOwnerDealIds_(sheets, claimsValue) {
   const authorized = Object.create(null);
   claims.forEach(function(claim) {
     const deal = records[claim.dealId] || null;
-    if (ownerClaimMatchesDeal_(claim, deal)) authorized[claim.dealId] = true;
+    if (ownerClaimMatchesDeal_(claim, deal)) {
+      authorized[claim.dealId] = true;
+      return;
+    }
+    // 승계도 직접 소유와 같은 판정기를 통과해야 한다. 결박 당시 해시를 주장으로
+    // 되돌려 ownerClaimMatchesDeal_ 에 그대로 태우면, 상품 행이 그 사이 바뀐
+    // 경우가 자동으로 걸러지고 두 경로의 기준이 갈라지지 않는다.
+    const inherited = recoveryDealSuccessionHash_(sheets, claim.dealId, claim.ownerCapabilityHash);
+    if (inherited && ownerClaimMatchesDeal_(
+      { dealId: claim.dealId, ownerCapabilityHash: inherited }, deal
+    )) {
+      authorized[claim.dealId] = true;
+    }
   });
   return authorized;
 }
@@ -3931,21 +3948,38 @@ const RECOVERY_HASH = /^[a-f0-9]{64}$/;
 
 function recoveryError_(code) { return groupOperationError_(code); }
 
-function recoveryIdentityRow_(sheets, identityKey) {
-  const rows = recoveryRowsRaw_(sheets);
+const RECOVERY_ROWS_PER_IDENTITY = 8;
+
+// 한 전화번호 아래에 여러 등록이 공존할 수 있다. 등록 행의 주인은 전화번호가
+// 아니라 그 행을 만든 권한 키다. 전화번호만으로 행을 특정하면, 번호만 아는
+// 제3자가 남의 등록을 덮어써 이미 복구해 둔 접근까지 되돌릴 수 있다.
+function recoveryIdentityRows_(sheets, identityKey) {
+  return recoveryRowsRaw_(sheets).filter(function(record) {
+    return record.identityKey === identityKey;
+  });
+}
+
+// 같은 키가 확인번호만 바꾸는 재등록은 허용한다. 그 키를 보유한 것 자체가
+// 소유 증명이기 때문이다. 다른 키의 행은 절대 건드리지 않는다.
+function recoveryOwnRow_(sheets, identityKey, boundHash) {
+  const rows = recoveryIdentityRows_(sheets, identityKey);
   for (let index = 0; index < rows.length; index += 1) {
-    if (rows[index].identityKey === identityKey) return rows[index];
+    if (rows[index].boundHash === boundHash) return rows[index];
   }
   return null;
 }
 
 function recoveryRowsRaw_(sheets) {
+  if (RECOVERY_ROWS_CACHE_) return RECOVERY_ROWS_CACHE_;
   const sheet = sheets && sheets.recovery;
-  if (!sheet || sheet.getLastRow() < 2) return [];
-  return sheet.getRange(2, 1, sheet.getLastRow() - 1, RECOVERY_HEADERS.length)
+  RECOVERY_ROWS_CACHE_ = !sheet || sheet.getLastRow() < 2 ? [] : sheet
+    .getRange(2, 1, sheet.getLastRow() - 1, RECOVERY_HEADERS.length)
     .getValues()
     .map(function(row, index) { return recoveryRowValue_(row, index + 2); });
+  return RECOVERY_ROWS_CACHE_;
 }
+
+function invalidateRecoveryRows_() { RECOVERY_ROWS_CACHE_ = null; }
 
 // 등록 시점에 살아있는 키가 실제로 소유한 항목만 모은다. 전화번호는 쓰지 않는다.
 function recoveryBoundSet_(sheets, capabilityHash, groupClaims, dealClaims) {
@@ -4013,10 +4047,21 @@ function handleRecoveryCredentials_(payload) {
       if (payload.operation !== 'begin' || limited.allowed !== true) return json_(limited);
       // 검증자는 예약에 성공한 요청에만, 잠긴 같은 요청 안에서만 돌려준다.
       // 별도의 읽기 오퍼레이션을 두면 저엔트로피 확인번호가 오프라인 대입에 노출된다.
-      const record = recoveryIdentityRow_(ensureSheets_(), identityKey);
-      return json_(Object.assign({}, limited, {
-        verifier: record && validAdminCredentialVerifier_(record.verifier) ? record.verifier : null
-      }));
+      const candidates = recoveryIdentityRows_(ensureSheets_(), identityKey)
+        .filter(function(record) { return validAdminCredentialVerifier_(record.verifier); })
+        .slice(0, RECOVERY_ROWS_PER_IDENTITY)
+        .map(function(record) { return { ref: record.boundHash, verifier: record.verifier }; });
+      // 미끼로 길이를 맞춘다. 검증자 개수가 곧 '이 번호가 몇 번 등록했는가'이고,
+      // 0개와 1개의 차이는 계정 열거가 된다. 미끼는 맞출 수 없는 값이며 호출자는
+      // 어느 쪽이든 같은 양의 파생 비용을 치른다.
+      while (candidates.length < RECOVERY_ROWS_PER_IDENTITY) {
+        const seed = sha256Hex_('recovery-decoy:' + identityKey + ':' + candidates.length + ':' + INGEST_TOKEN);
+        candidates.push({
+          ref: seed,
+          verifier: { algorithm: 'scrypt-v1', salt: seed.slice(0, 32), hash: seed + seed }
+        });
+      }
+      return json_(Object.assign({}, limited, { verifiers: candidates }));
     }
 
     const sheets = ensureSheets_();
@@ -4025,7 +4070,6 @@ function handleRecoveryCredentials_(payload) {
       throw recoveryError_('invalid_client_mutation_id');
     }
     lock = acquireScriptLock_();
-    const existing = recoveryIdentityRow_(sheets, identityKey);
 
     if (payload.operation === 'enroll') {
       const capabilityHash = String(payload.capabilityHash || '').toLowerCase();
@@ -4033,8 +4077,13 @@ function handleRecoveryCredentials_(payload) {
       if (!validAdminCredentialVerifier_(payload.verifier)) throw recoveryError_('invalid_recovery_verifier');
       const actorId = String(payload.actorId || '');
       if (!validVisitorId_(actorId)) throw recoveryError_('invalid_actor_id');
-      if (existing && existing.lastMutationId === clientMutationId) {
-        return json_({ ok: true, duplicate: true, version: existing.version });
+      const own = recoveryOwnRow_(sheets, identityKey, capabilityHash);
+      if (own && own.lastMutationId === clientMutationId) {
+        return json_({ ok: true, duplicate: true });
+      }
+      // 등록 수를 제한해 한 번호 아래에 행이 무한히 쌓이지 않게 한다.
+      if (!own && recoveryIdentityRows_(sheets, identityKey).length >= RECOVERY_ROWS_PER_IDENTITY) {
+        throw recoveryError_('recovery_enrollment_limit');
       }
       const bound = recoveryBoundSet_(sheets, capabilityHash, payload.groups, payload.deals);
       // 소유를 하나도 증명하지 못하면 등록하지 않는다. 등록 자체가 권한 근거가 되므로
@@ -4044,26 +4093,32 @@ function handleRecoveryCredentials_(payload) {
       }
       const now = new Date().toISOString();
       const values = [
-        existing ? existing.createdAt || now : now, now, identityKey,
-        JSON.stringify(payload.verifier), capabilityHash, capabilityHash,
+        own ? own.createdAt || now : now, now, identityKey,
+        JSON.stringify(payload.verifier), capabilityHash, own ? own.currentHash : capabilityHash,
         JSON.stringify(bound.orderIds), JSON.stringify(bound.groups), JSON.stringify(bound.deals),
-        actorId, (existing ? existing.version : 0) + 1, clientMutationId
+        actorId, (own ? own.version : 0) + 1, clientMutationId
       ];
-      if (existing) {
-        sheets.recovery.getRange(existing.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([values]);
+      if (own) {
+        sheets.recovery.getRange(own.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([values]);
       } else {
         sheets.recovery.appendRow(values);
       }
+      invalidateRecoveryRows_();
+      // 등록 여부·횟수를 응답으로 알려주지 않는다. 그 값이 '이 번호가 등록되어
+      // 있는가'를 무제한으로 조회하는 열거 수단이 된다.
       return json_({
-        ok: true, version: (existing ? existing.version : 0) + 1,
+        ok: true,
         bound: { orders: bound.orderIds.length, groups: bound.groups.length, deals: bound.deals.length }
       });
     }
 
     // redeem: 확인번호 검증은 Vercel 에서 끝났고, 여기서는 승계만 기록한다.
+    // 어느 등록 행인지는 Vercel 이 맞춘 검증자의 ref 로 지정된다. 미끼를 맞췄다면
+    // 그 ref 로는 행을 찾을 수 없으므로 자연히 거절된다.
+    const existing = recoveryOwnRow_(sheets, identityKey, String(payload.ref || '').toLowerCase());
     if (!existing) throw recoveryError_('recovery_not_enrolled');
     if (existing.lastMutationId === clientMutationId) {
-      return json_({ ok: true, duplicate: true, version: existing.version, actorId: existing.actorId });
+      return json_({ ok: true, duplicate: true, actorId: existing.actorId });
     }
     if (payload.redeemAssertion !== true) throw recoveryError_('forbidden');
     const newHash = String(payload.capabilityHash || '').toLowerCase();
@@ -4075,8 +4130,10 @@ function handleRecoveryCredentials_(payload) {
       JSON.stringify(existing.boundGroups), JSON.stringify(existing.boundDeals),
       existing.actorId, existing.version + 1, clientMutationId
     ]]);
+    invalidateRecoveryRows_();
+    invalidateRecoveryRows_();
     return json_({
-      ok: true, version: existing.version + 1, actorId: existing.actorId,
+      ok: true, actorId: existing.actorId,
       bound: {
         orders: (existing.boundOrderIds || []).length,
         groups: (existing.boundGroups || []).length,
@@ -4115,14 +4172,9 @@ function recoveryRowValue_(row, rowNumber) {
 }
 
 function recoveryRows_(sheets) {
-  const sheet = sheets && sheets.recovery;
-  if (!sheet || sheet.getLastRow() < 2) return [];
-  return sheet.getRange(2, 1, sheet.getLastRow() - 1, RECOVERY_HEADERS.length)
-    .getValues()
-    .map(function(row, index) { return recoveryRowValue_(row, index + 2); })
-    .filter(function(record) {
-      return /^[a-f0-9]{64}$/.test(record.boundHash) && /^[a-f0-9]{64}$/.test(record.currentHash);
-    });
+  return recoveryRowsRaw_(sheets).filter(function(record) {
+    return RECOVERY_HASH.test(record.boundHash) && RECOVERY_HASH.test(record.currentHash);
+  });
 }
 
 // 제시된 해시가 승계한 옛 해시를 돌려준다. 승계가 없으면 null.
@@ -4134,6 +4186,46 @@ function recoverySuccession_(sheets, capabilityHash) {
   });
   // 한 키가 여러 등록을 승계하는 것은 정상 경로로 생길 수 없다. 모호하면 승계하지 않는다.
   return matches.length === 1 ? matches[0] : null;
+}
+
+// 결박 목록에서 이 대상의 '결박 당시 해시'를 하나로 확정한다. 같은 대상에 서로 다른
+// 해시가 실려 있으면 어느 쪽이 진짜인지 정할 수 없으므로 승계하지 않는다.
+function recoveryBoundEntryHash_(entries, matches) {
+  if (!Array.isArray(entries)) return '';
+  let found = '';
+  let ambiguous = false;
+  entries.forEach(function(entry) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry) || !matches(entry)) return;
+    const hash = String(entry.hash || '').toLowerCase();
+    if (!RECOVERY_HASH.test(hash) || (found && found !== hash)) {
+      ambiguous = true;
+      return;
+    }
+    found = hash;
+  });
+  return ambiguous ? '' : found;
+}
+
+// 그룹 축 승계. 주문 축과 같은 원칙이다: 등록 시점에 살아있는 키로 증명된
+// (그룹, 참여자) 한 쌍에만 적용하고, 전화번호나 actorId 는 근거로 쓰지 않는다.
+// 호출자는 결박 당시 해시가 지금도 참여자 행의 값과 같은지 확인해야 한다.
+function recoveryGroupSuccessionHash_(sheets, groupId, actorId, capabilityHash) {
+  const succession = recoverySuccession_(sheets, capabilityHash);
+  if (!succession) return '';
+  return recoveryBoundEntryHash_(succession.boundGroups, function(entry) {
+    return String(entry.groupId || '') === String(groupId)
+      && String(entry.actorId || '') === String(actorId);
+  });
+}
+
+// 상품 축 승계. 돌려주는 값은 '결박 당시의 사장님 해시'일 뿐이고, 그 해시가 지금도
+// 상품 행에 그대로 있는지는 호출자가 ownerClaimMatchesDeal_ 로 확인한다.
+function recoveryDealSuccessionHash_(sheets, dealId, ownerCapabilityHash) {
+  const succession = recoverySuccession_(sheets, ownerCapabilityHash);
+  if (!succession) return '';
+  return recoveryBoundEntryHash_(succession.boundDeals, function(entry) {
+    return String(entry.dealId || '') === String(dealId);
+  });
 }
 
 function filterCustomerOrdersForProof_(orders, visitorId, customerCapabilityHash, succession) {
@@ -4566,8 +4658,16 @@ function authorizeGroupActor_(sheets, groupId, payload) {
     return { actorId: actorId, role: 'admin', participant: participant };
   }
   const suppliedHash = requireCapabilityHash_(payload.capabilityHash);
-  if (!participant || !participant.capabilityHash || participant.capabilityHash !== suppliedHash) {
-    throw groupOperationError_('invalid_capability');
+  if (!participant || !participant.capabilityHash) throw groupOperationError_('invalid_capability');
+  if (participant.capabilityHash !== suppliedHash) {
+    // 복구로 승계한 새 키는 결박 당시 증명된 (그룹, 참여자) 한 쌍에만 통한다.
+    // 결박 당시 해시가 지금 행의 값과 다르면 그 사이 정상 경로로 권한 토큰이
+    // 바뀐 것이므로 승계는 무효다 — 옛 등록이 이후의 정상 교체를 되돌리면 안 된다.
+    // actorId 일치는 증명이 아니다: actorId 는 사장님 주문 화면에 노출된다.
+    const inherited = recoveryGroupSuccessionHash_(sheets, groupId, actorId, suppliedHash);
+    if (!inherited || inherited !== participant.capabilityHash) {
+      throw groupOperationError_('invalid_capability');
+    }
   }
   return { actorId: actorId, role: participant.role, participant: participant };
 }
