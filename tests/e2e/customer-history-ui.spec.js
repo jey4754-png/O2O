@@ -128,9 +128,12 @@ test('첫 조회 실패와 권한 미연결 빈 결과는 구분하고 자동 �
     f.state.failReads = false;
     await page.getByRole('button', { name: '주문 이력 다시 불러오기', exact: true }).click();
     await expect(page.getByRole('heading', { name: '조회 가능한 참여 내역이 없습니다' })).toBeVisible();
-    await page.getByText('이전 주문이 보이지 않나요?', { exact: true }).click();
+    // A checked-but-empty list opens the recovery guidance and shows the code
+    // without any extra tap: a wiped mobile store leaves no other symptom.
     await expect(page.getByText(/이전 주문의 권한키가 없거나 연결되지 않은 기록은 여기서 자동 복구할 수 없습니다/)).toBeVisible();
-    await expect(page.getByRole('alert')).toHaveCount(0);
+    await expect(page.getByRole('alert')).toContainText('주문 확인 키가 사라진 상태입니다');
+    await expect(page.locator('.recovery-code')).toHaveText(/^[a-f0-9]{64}$/);
+    await expect(page.getByRole('button', { name: '복구 코드 보기' })).toHaveCount(0);
     expect(f.currentRows.length).toBe(3);
   } finally { await f.close(); }
 });

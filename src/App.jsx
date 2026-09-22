@@ -5302,12 +5302,17 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
   );
 }
 
-function CustomerHistoryNotice({ status, onRetry }) {
+function CustomerHistoryNotice({ status, onRetry, emptyList = false }) {
   // A key minted in this browser cannot authorize anything ordered earlier, so
   // an empty list is not a confirmed history. Saying otherwise made a lost
   // ownership key look like deleted orders.
   const capability = getCustomerOrderCapabilityState();
   const freshKey = capability.lostKey;
+  // When the browser wiped the whole site store, the local order cache went
+  // with the key, so `lostKey` cannot fire. A checked-but-empty list is then the
+  // only symptom, and the recovery code must be in plain sight rather than two
+  // taps deep behind a collapsed summary.
+  const showRecovery = emptyList && status === 'ready';
   return (
     <div className={`customer-history-notice${status === 'error' || freshKey || !capability.persisted ? ' has-error' : ''}`} aria-live="polite">
       {status === 'loading' ? <p role="status">이전 주문·참여 이력을 확인하고 있습니다.</p>
@@ -5322,16 +5327,19 @@ function CustomerHistoryNotice({ status, onRetry }) {
       <button type="button" className="secondary-button compact-button" disabled={status === 'loading'} onClick={onRetry}>
         {status === 'loading' ? '이력 확인 중…' : '주문 이력 다시 불러오기'}
       </button>
-      <details>
+      {showRecovery && !freshKey && (
+        <p role="alert">이전에 주문한 적이 있는데 목록이 비어 있다면, 브라우저가 이 사이트의 저장 공간을 비우면서 주문 확인 키가 사라진 상태입니다. 주문 기록은 그대로 남아 있고, 아래 복구 코드를 관리자에게 알려 주면 이 기기에서 다시 볼 수 있게 연결해 줍니다.</p>
+      )}
+      <details open={showRecovery}>
         <summary>이전 주문이 보이지 않나요?</summary>
         <p>이 브라우저와 현재 프로필에서 조회 권한이 확인된 이력만 표시합니다. 주문했던 같은 브라우저와 전화번호인지 확인해 주세요. 이전 주문의 권한키가 없거나 연결되지 않은 기록은 여기서 자동 복구할 수 없습니다. 브라우저 데이터를 지우지 말고 관리자에게 해당 주문 확인을 요청해 주세요.</p>
-        <CustomerRecoveryCode />
+        <CustomerRecoveryCode autoReveal={showRecovery} />
       </details>
     </div>
   );
 }
 
-function CustomerRecoveryCode() {
+function CustomerRecoveryCode({ autoReveal = false }) {
   const [code, setCode] = useState('');
   const [failed, setFailed] = useState(false);
   const reveal = async () => {
@@ -5343,6 +5351,10 @@ function CustomerRecoveryCode() {
       setFailed(true);
     }
   };
+  useEffect(() => {
+    if (autoReveal && !code) reveal();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoReveal]);
   return (
     <>
       <p>관리자가 전화나 대면으로 본인 확인을 한 뒤, 아래 복구 코드로 이 기기에 지난 주문을 다시 연결해 줄 수 있습니다. 이 코드는 이 기기를 가리키는 공개 식별자일 뿐이라 알려 줘도 주문 권한이 넘어가지 않습니다.</p>
@@ -5414,12 +5426,12 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
         <ShoppingBag size={22} />
       </header>
 
-      <CustomerHistoryNotice status={historyStatus} onRetry={onRetryHistory} />
+      <CustomerHistoryNotice status={historyStatus} onRetry={onRetryHistory} emptyList={orders.length === 0} />
       {orders.length === 0 && historyStatus === 'ready' && !getCustomerOrderCapabilityState().lostKey ? (
         <EmptyCustomerState
           icon={ShoppingBag}
           title="조회 가능한 참여 내역이 없습니다"
-          body="현재 브라우저에서 확인할 수 있는 기록이 없습니다. 이전 주문이 있었다면 위 안내를 확인해 주세요."
+          body="현재 브라우저에서 확인할 수 있는 기록이 없습니다. 이전 주문이 있었다면 위 안내의 복구 코드를 관리자에게 알려 주세요."
           actionLabel="공구 보러가기"
           onAction={() => onScreen('list')}
         />
