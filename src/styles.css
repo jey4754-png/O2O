@@ -3980,4 +3980,10 @@ code {
 .customer-history-notice p { margin: 0; font-size: inherit; line-height: inherit; }
 .customer-history-notice > button { margin: 7px 0; font-size: 12px; }
 .customer-history-notice summary { cursor: pointer; }
+.customer-history-notice .customer-recovery { margin: 8px 0; padding: 8px 10px; border: 1px solid #e0e5e9; border-radius: 8px; background: #fff; color: #536170; }
+.customer-history-notice .customer-recovery summary { font-weight: 800; color: #2b3542; }
+.customer-history-notice .customer-recovery .form-stack { padding: 8px 0 0; gap: 8px; }
+.customer-history-notice .customer-recovery label { font-size: 12px; }
+.customer-history-notice .customer-recovery input { min-height: 40px; font-size: 14px; }
+.customer-history-notice .customer-recovery button { align-self: flex-start; margin: 0; }
 .customer-history-notice details p { margin-top: 6px; }

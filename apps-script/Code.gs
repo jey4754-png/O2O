@@ -4321,7 +4321,11 @@ function handleRecoveryCredentials_(payload) {
     const existing = recoveryOwnRow_(sheets, identityKey, String(payload.ref || '').toLowerCase());
     if (!existing) throw recoveryError_('recovery_not_enrolled');
     if (existing.lastMutationId === clientMutationId) {
-      return json_({ ok: true, duplicate: true, actorId: existing.actorId });
+      // 응답이 유실된 재시도도 기기가 되살릴 그룹·상품 목록을 그대로 받아야 한다.
+      return json_({
+        ok: true, duplicate: true, actorId: existing.actorId,
+        groups: existing.boundGroups || [], deals: existing.boundDeals || []
+      });
     }
     if (payload.redeemAssertion !== true) throw recoveryError_('forbidden');
     const newHash = String(payload.capabilityHash || '').toLowerCase();
@@ -4351,7 +4355,8 @@ function handleRecoveryCredentials_(payload) {
         groups: (existing.boundGroups || []).length,
         deals: (existing.boundDeals || []).length
       },
-      groups: existing.boundGroups || []
+      groups: existing.boundGroups || [],
+      deals: existing.boundDeals || []
     });
   } catch (error) {
     return json_({ ok: false, error: error.code || 'recovery_failed' });

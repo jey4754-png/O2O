@@ -218,6 +218,14 @@ export function getGroupCredential(groupId, actorId) {
   return Object.values(credentials).find((credential) => credential?.groupId === groupId) || null;
 }
 
+// A redeemed recovery makes the new customer key stand in for the participant
+// key that was bound at enrollment. The room keeps its original actor id, so
+// the credential is stored under that id rather than this browser's visitor.
+export function adoptRecoveredGroupCredential(groupId, actorId, capabilityToken) {
+  if (!groupId || !actorId || typeof capabilityToken !== 'string' || capabilityToken.length < 32) return null;
+  return saveGroupCredential(groupId, { actorId, capabilityToken, role: 'member', recovered: true });
+}
+
 function saveGroupCredential(groupId, credential) {
   const credentials = getGroupCredentials();
   const key = credentialStorageKey(groupId, credential.actorId);

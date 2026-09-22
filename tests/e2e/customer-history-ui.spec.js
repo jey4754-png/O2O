@@ -10,7 +10,7 @@ const HASH = createHash('sha256').update(TOKEN).digest('hex');
 const OLD_ID = 'order-1234567890701';
 const NEW_ID = 'order-1234567890702';
 
-async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked = false, repairRequired = false } = {}) {
+async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked = false, repairRequired = false, recovery = null } = {}) {
   const fixture = customerHistoryStore({
     current: [historyOrder('1234567890702', { title: '새로 만든 합성 주문', _customerCapabilityHash: HASH }),
       historyOrder('1234567890703', { title: '다른 키의 주문', _customerCapabilityHash: 'b'.repeat(64) }),
@@ -23,7 +23,7 @@ async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked 
     fixture.currentRows.splice(1, 2);
     fixture.eventRows.splice(1);
   }
-  const state = { failReads, reads: [], writes: [], heldReads: 0, releasedReads: 0, releaseFirst: null };
+  const state = { failReads, reads: [], writes: [], recovery: [], heldReads: 0, releasedReads: 0, releaseFirst: null };
   let released = false;
   const gate = new Promise((resolve) => { state.releaseFirst = () => { released = true; resolve(); }; });
   const server = createServer(async (request, response) => {
@@ -54,6 +54,11 @@ async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked 
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const body = route.request().postDataJSON() || {};
+    if (path === '/api/recovery') {
+      state.recovery.push(body);
+      const reply = recovery ? recovery(body) : { status: 503, json: { ok: false, error: 'recovery_store_unavailable' } };
+      return route.fulfill({ status: reply.status || 200, json: reply.json });
+    }
     if (path !== '/api/customer-orders') return route.fulfill({ json: {
       ok: true, deals: [], orders: [], unreadCounts: {}, stats: {}, events: [],
     } });
@@ -135,6 +140,84 @@ test('첫 조회 실패와 권한 미연결 빈 결과는 구분하고 자동 �
     await expect(page.locator('.recovery-code')).toHaveText(/^[a-f0-9]{64}$/);
     await expect(page.getByRole('button', { name: '복구 코드 보기' })).toHaveCount(0);
     expect(f.currentRows.length).toBe(3);
+  } finally { await f.close(); }
+});
+
+test('빈 목록에서 확인번호로 되살리면 그룹·상품 권한을 이 브라우저에 넣고 이력을 다시 읽는다', async ({ page }) => {
+  let attempt = 0;
+  const f = await setup(page, { onlyUnlinked: true, recovery: (body) => {
+    attempt += 1;
+    if (attempt === 1) return { status: 403, json: { ok: false, error: 'invalid_recovery_pin' } };
+    return { json: { ok: true, actorId: 'customer-history-visitor', bound: { orders: 1, groups: 1, deals: 1 },
+      groups: [{ groupId: 'grp-recovered-room', actorId: 'customer-history-visitor' }], deals: ['owner-recovered-deal'] } };
+  } });
+  try {
+    await page.goto('/customer');
+    await openOrders(page);
+    await expect(page.getByRole('heading', { name: '조회 가능한 참여 내역이 없습니다' })).toBeVisible();
+    const readsBefore = f.state.reads.length;
+    await page.getByLabel('복구 확인번호').fill('000000');
+    await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
+    await expect(page.getByText('확인번호가 맞지 않습니다', { exact: false })).toBeVisible();
+    expect(f.state.reads.length).toBe(readsBefore);
+
+    await page.getByLabel('복구 확인번호').fill('482913');
+    await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: '주문 1건·그룹 1개·상품 1개를 이 브라우저에 다시 연결했습니다' })).toBeVisible();
+    await expect.poll(() => f.state.reads.length).toBe(readsBefore + 1);
+
+    const sent = f.state.recovery.at(-1);
+    expect(sent.action).toBe('redeem');
+    expect(sent.phone).toBe('01011112222');
+    expect(sent.pin).toBe('482913');
+    expect(sent.customerCapabilityToken).toBe(TOKEN);
+    const stored = await page.evaluate(() => ({
+      credentials: JSON.parse(localStorage.getItem('o2o_mvp_group_credentials_v1') || '{}'),
+      capabilities: JSON.parse(localStorage.getItem('o2o_mvp_public_deal_capabilities_v1') || '{}'),
+      scopes: JSON.parse(localStorage.getItem('o2o_mvp_owner_deal_scopes_v1') || '{}'),
+      visitor: localStorage.getItem('o2o_mvp_visitor_id'),
+    }));
+    // The recovered customer key now stands in for the bound room seat and deal.
+    expect(stored.credentials['grp-recovered-room::customer-history-visitor']?.capabilityToken).toBe(TOKEN);
+    expect(stored.capabilities['owner-recovered-deal']).toBe(TOKEN);
+    expect(stored.scopes['owner-recovered-deal']).toBe('phone:01011112222');
+    expect(stored.visitor).toBe('customer-history-visitor');
+  } finally { await f.close(); }
+});
+
+test('주문이 있으면 확인번호 등록을 권하고, 등록 뒤에는 새 주문이 생겼을 때만 다시 연다', async ({ page }) => {
+  const f = await setup(page, { recovery: () => ({ json: { ok: true, bound: { orders: 2, groups: 0, deals: 0 } } }) });
+  try {
+    await page.goto('/customer');
+    await openOrders(page);
+    await expect(page.locator('.order-card')).toHaveCount(2);
+    const enroll = page.locator('details.customer-recovery');
+    await expect(enroll).toHaveAttribute('open', '');
+    await expect(enroll.locator('summary')).toContainText('확인번호 등록 —');
+    await page.getByLabel('확인번호', { exact: true }).fill('482913');
+    await page.getByLabel('확인번호 다시 입력').fill('482914');
+    await page.getByRole('button', { name: '확인번호 등록', exact: true }).click();
+    await expect(page.getByRole('alert')).toContainText('확인번호 두 칸이 서로 다릅니다.');
+    expect(f.state.recovery.length).toBe(0);
+
+    await page.getByLabel('확인번호 다시 입력').fill('482913');
+    await page.getByRole('button', { name: '확인번호 등록', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: '등록했습니다. 주문 2건·그룹 0개·상품 0개' })).toBeVisible();
+    await expect(enroll.locator('summary')).toContainText('확인번호 등록됨');
+    const sent = f.state.recovery.at(-1);
+    expect(sent.action).toBe('enroll');
+    expect(sent.phone).toBe('01011112222');
+    expect(sent.customerCapabilityToken).toBe(TOKEN);
+    expect(sent.groups).toEqual([]);
+    expect(sent.deals).toEqual([]);
+    expect(JSON.stringify(sent)).not.toContain('history-test-seeded');
+
+    // A reload with the same two orders keeps the form closed; nothing new to bind.
+    await page.reload();
+    await openOrders(page);
+    await expect(page.locator('.order-card')).toHaveCount(2);
+    await expect(page.locator('details.customer-recovery')).not.toHaveAttribute('open', '');
+    await expect(page.locator('details.customer-recovery summary')).toContainText('확인번호 등록됨');
   } finally { await f.close(); }
 });
 

@@ -63,6 +63,8 @@ import {
   fetchGroupSnapshot,
   fetchUnreadCounts,
   getGroupCredential,
+  getGroupCredentials,
+  adoptRecoveredGroupCredential,
   hasLegacyCustomerGroupRecoveryState,
   isGroupBackedDeal,
   joinGroupRoom,
@@ -142,6 +144,7 @@ import {
   buildOwnerRecoveryCandidates,
   chunkOwnerCapabilities,
   isOwnerDealId,
+  isUsableOwnerCapability,
   isOwnerDealInScope,
   legacyOwnerScopeKey,
   localOwnerScopeCandidates,
@@ -160,6 +163,7 @@ import {
   getCustomerNumber,
   getProfile,
   getVisitorId,
+  adoptVisitorId,
   initAnalytics,
   saveProfile,
   track,
@@ -576,6 +580,110 @@ export async function getCustomerRecoveryCode() {
   const input = new TextEncoder().encode(getCustomerOrderCapability());
   const digest = await globalThis.crypto.subtle.digest('SHA-256', input);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+// ── 확인번호 복구 ────────────────────────────────────────────────────────────
+// The confirmation number is the only secret. It goes to the Vercel function
+// in one request and is never stored here; the collector only ever sees a
+// derived verifier. Claims are the tokens this browser still holds — the
+// server binds only those it can prove the live key owns.
+const RECOVERY_ENROLLMENT_KEY = 'o2o_mvp_recovery_enrollment_v1';
+const RECOVERY_MESSAGES = {
+  invalid_recovery_pin: '확인번호가 맞지 않습니다. 등록할 때 정한 숫자를 다시 확인해 주세요.',
+  invalid_recovery_pin_format: '확인번호는 숫자 6~12자리로 정해 주세요.',
+  invalid_recovery_phone: '010으로 시작하는 휴대폰 번호 11자리로 로그인되어 있어야 합니다.',
+  recovery_rate_limited: '시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.',
+  recovery_nothing_to_bind: '이 브라우저에서 확인된 주문·그룹·상품이 없어 등록할 것이 없습니다. 주문한 뒤 다시 등록해 주세요.',
+  recovery_enrollment_limit: '이 전화번호로 등록할 수 있는 횟수를 넘었습니다. 관리자에게 문의해 주세요.',
+  recovery_succession_exists: '이 브라우저는 이미 다른 등록을 되살린 상태라 한 번 더 되살릴 수 없습니다. 관리자에게 문의해 주세요.',
+  recovery_not_enrolled: '이 전화번호로 등록된 확인번호가 없습니다.',
+  recovery_store_unavailable: '복구 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.',
+  recovery_not_configured: '복구 기능이 아직 준비되지 않았습니다. 관리자에게 문의해 주세요.',
+};
+
+function recoveryMessage(code, fallback) {
+  return RECOVERY_MESSAGES[code] || fallback;
+}
+
+async function requestRecovery(action, fields) {
+  const response = await fetch('/api/recovery', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, ...fields }),
+  });
+  let result = {};
+  try { result = await response.json(); } catch { result = {}; }
+  if (!response.ok || result.ok !== true) {
+    const error = new Error(result.error || `recovery_${response.status}`);
+    error.code = result.error || 'recovery_failed';
+    error.status = response.status;
+    throw error;
+  }
+  return result;
+}
+
+function recoveryClaims() {
+  const groups = Object.values(getGroupCredentials())
+    .filter((credential) => credential?.groupId && credential?.actorId
+      && typeof credential.capabilityToken === 'string' && credential.capabilityToken.length >= 32
+      && !credential.capabilityToken.startsWith('local-'))
+    .slice(0, 20)
+    .map(({ groupId, actorId, capabilityToken }) => ({ groupId, actorId, capabilityToken }));
+  const deals = Object.entries(loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {}))
+    .filter(([dealId, capabilityToken]) => isOwnerDealId(dealId) && isUsableOwnerCapability(capabilityToken))
+    .slice(0, 50)
+    .map(([dealId, capabilityToken]) => ({ dealId, capabilityToken }));
+  return { groups, deals };
+}
+
+export function getRecoveryEnrollment() {
+  return loadJson(RECOVERY_ENROLLMENT_KEY, null);
+}
+
+async function enrollRecovery(pin, orderCount) {
+  const phone = normalizePhone(getProfile()?.phone);
+  const result = await requestRecovery('enroll', {
+    phone, pin, actorId: getVisitorId(), clientMutationId: createMutationId('recovery-enroll'),
+    customerCapabilityToken: getCustomerOrderCapability(), ...recoveryClaims(),
+  });
+  saveJson(RECOVERY_ENROLLMENT_KEY, {
+    enrolledAt: new Date().toISOString(), orderCount, bound: result.bound || null,
+  });
+  return result;
+}
+
+// The recovered key already authorizes the bound orders on the collector.
+// Groups and deals need this browser to present that same key for them, and
+// a wiped browser also takes back the participant id its rows were written
+// under so the rooms recognise it.
+function applyRecoveredAccess(result) {
+  const capabilityToken = getCustomerOrderCapability();
+  const phone = normalizePhone(getProfile()?.phone);
+  if (!Object.keys(getGroupCredentials()).length && result.actorId) adoptVisitorId(result.actorId);
+  (result.groups || []).forEach(({ groupId, actorId }) => {
+    adoptRecoveredGroupCredential(groupId, actorId, capabilityToken);
+  });
+  if ((result.deals || []).length) {
+    const capabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
+    let scopeByDeal = loadJson(OWNER_DEAL_SCOPES_KEY, {});
+    result.deals.forEach((dealId) => {
+      capabilities[dealId] = capabilityToken;
+      const assignment = assignOwnerDealScope(scopeByDeal, dealId, `phone:${phone}`);
+      if (assignment.allowed) scopeByDeal = assignment.scopeByDeal;
+    });
+    saveJson(PUBLIC_DEAL_CAPABILITIES_KEY, capabilities);
+    saveJson(OWNER_DEAL_SCOPES_KEY, scopeByDeal);
+  }
+}
+
+async function redeemRecovery(pin) {
+  const phone = normalizePhone(getProfile()?.phone);
+  const result = await requestRecovery('redeem', {
+    phone, pin, actorId: getVisitorId(), clientMutationId: createMutationId('recovery-redeem'),
+    customerCapabilityToken: getCustomerOrderCapability(),
+  });
+  applyRecoveredAccess(result);
+  return result;
 }
 
 async function fetchPublicDeals() {
@@ -5302,7 +5410,7 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
   );
 }
 
-function CustomerHistoryNotice({ status, onRetry, emptyList = false }) {
+function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount = 0 }) {
   // A key minted in this browser cannot authorize anything ordered earlier, so
   // an empty list is not a confirmed history. Saying otherwise made a lost
   // ownership key look like deleted orders.
@@ -5313,6 +5421,8 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false }) {
   // only symptom, and the recovery code must be in plain sight rather than two
   // taps deep behind a collapsed summary.
   const showRecovery = emptyList && status === 'ready';
+  // The redeem form unmounts while the list reloads, so its outcome lives here.
+  const [recovered, setRecovered] = useState(null);
   return (
     <div className={`customer-history-notice${status === 'error' || freshKey || !capability.persisted ? ' has-error' : ''}`} aria-live="polite">
       {status === 'loading' ? <p role="status">이전 주문·참여 이력을 확인하고 있습니다.</p>
@@ -5328,14 +5438,125 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false }) {
         {status === 'loading' ? '이력 확인 중…' : '주문 이력 다시 불러오기'}
       </button>
       {showRecovery && !freshKey && (
-        <p role="alert">이전에 주문한 적이 있는데 목록이 비어 있다면, 브라우저가 이 사이트의 저장 공간을 비우면서 주문 확인 키가 사라진 상태입니다. 주문 기록은 그대로 남아 있고, 아래 복구 코드를 관리자에게 알려 주면 이 기기에서 다시 볼 수 있게 연결해 줍니다.</p>
+        <p role="alert">이전에 주문한 적이 있는데 목록이 비어 있다면, 브라우저가 이 사이트의 저장 공간을 비우면서 주문 확인 키가 사라진 상태입니다. 주문 기록은 그대로 남아 있습니다. 확인번호를 등록해 두셨다면 아래에서 바로 되살릴 수 있고, 아니면 복구 코드를 관리자에게 알려 주면 이 기기에서 다시 볼 수 있게 연결해 줍니다.</p>
       )}
+      {recovered && (
+        <p role="status">{`주문 ${recovered.bound?.orders || 0}건·그룹 ${recovered.bound?.groups || 0}개·상품 ${recovered.bound?.deals || 0}개를 이 브라우저에 다시 연결했습니다. 목록을 새로 불러옵니다.`}</p>
+      )}
+      {showRecovery && <CustomerRecoveryRedeem onRecovered={(result) => { setRecovered(result); onRetry?.(); }} />}
+      {!emptyList && status === 'ready' && <CustomerRecoveryEnroll orderCount={orderCount} />}
       <details open={showRecovery}>
         <summary>이전 주문이 보이지 않나요?</summary>
         <p>이 브라우저와 현재 프로필에서 조회 권한이 확인된 이력만 표시합니다. 주문했던 같은 브라우저와 전화번호인지 확인해 주세요. 이전 주문의 권한키가 없거나 연결되지 않은 기록은 여기서 자동 복구할 수 없습니다. 브라우저 데이터를 지우지 말고 관리자에게 해당 주문 확인을 요청해 주세요.</p>
         <CustomerRecoveryCode autoReveal={showRecovery} />
       </details>
     </div>
+  );
+}
+
+function recoveryPinInput(props) {
+  return { type: 'password', inputMode: 'numeric', autoComplete: 'off', maxLength: 12, ...props };
+}
+
+// Enrollment binds what this browser's live key owns right now, so a fresh
+// order after enrolling is not covered until the number is registered again.
+// The stored order count is only there to say so; the server keeps no copy.
+function CustomerRecoveryEnroll({ orderCount }) {
+  const [enrollment, setEnrollment] = useState(() => getRecoveryEnrollment());
+  const [pin, setPin] = useState('');
+  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState(null);
+  const phone = normalizePhone(getProfile()?.phone);
+  const newSinceEnrollment = enrollment ? Math.max(0, orderCount - Number(enrollment.orderCount || 0)) : 0;
+  // Opens on its own only while there is something new to register; after a
+  // successful registration it stays open so the outcome can be read.
+  const [open, setOpen] = useState(() => !enrollment || newSinceEnrollment > 0);
+  const submit = async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    setError('');
+    if (!/^\d{6,12}$/.test(pin)) { setError(RECOVERY_MESSAGES.invalid_recovery_pin_format); return; }
+    if (pin !== confirm) { setError('확인번호 두 칸이 서로 다릅니다.'); return; }
+    setBusy(true);
+    try {
+      const response = await enrollRecovery(pin, orderCount);
+      setResult(response);
+      setEnrollment(getRecoveryEnrollment());
+      setPin('');
+      setConfirm('');
+    } catch (requestError) {
+      setError(recoveryMessage(requestError?.code, '확인번호를 등록하지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const summary = !enrollment
+    ? '확인번호 등록 — 기기가 바뀌거나 저장 공간이 비워져도 내 주문 유지'
+    : newSinceEnrollment > 0
+      ? `등록 이후 새 주문 ${newSinceEnrollment}건 — 확인번호를 다시 등록해 주세요`
+      : `확인번호 등록됨 · ${new Date(enrollment.enrolledAt).toLocaleDateString('ko-KR')}`;
+  return (
+    <details className="customer-recovery" open={open} onToggle={(event) => setOpen(event.target.open)}>
+      <summary>{summary}</summary>
+      <p>전화번호 {phone}와 지금 정하는 확인번호로, 이 브라우저에서 확인된 주문·그룹·상품을 묶어 둡니다. 나중에 다른 기기나 비워진 브라우저에서 같은 전화번호로 로그인하고 확인번호를 넣으면 그대로 되살아납니다. 확인번호는 서버에 원문으로 저장되지 않으니 잊지 않게 적어 두세요.</p>
+      <form className="form-stack compact-form" onSubmit={submit}>
+        <label>확인번호 (숫자 6~12자리)
+          <input {...recoveryPinInput({ 'aria-label': '확인번호', value: pin, disabled: busy,
+            onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) })} />
+        </label>
+        <label>확인번호 다시 입력
+          <input {...recoveryPinInput({ 'aria-label': '확인번호 다시 입력', value: confirm, disabled: busy,
+            onChange: (event) => setConfirm(event.target.value.replace(/\D/g, '')) })} />
+        </label>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {result && !error && (
+          <p role="status">{result.duplicate
+            ? '이미 같은 내용으로 등록되어 있습니다.'
+            : `등록했습니다. 주문 ${result.bound?.orders || 0}건·그룹 ${result.bound?.groups || 0}개·상품 ${result.bound?.deals || 0}개가 이 확인번호로 묶였습니다.`}</p>
+        )}
+        <button type="submit" className="secondary-button compact-button" disabled={busy}>
+          {busy ? '등록 중…' : enrollment ? '확인번호 다시 등록' : '확인번호 등록'}
+        </button>
+      </form>
+    </details>
+  );
+}
+
+function CustomerRecoveryRedeem({ onRecovered }) {
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const phone = normalizePhone(getProfile()?.phone);
+  const submit = async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    setError('');
+    if (!/^\d{6,12}$/.test(pin)) { setError(RECOVERY_MESSAGES.invalid_recovery_pin_format); return; }
+    setBusy(true);
+    try {
+      const response = await redeemRecovery(pin);
+      setPin('');
+      onRecovered?.(response);
+    } catch (requestError) {
+      setError(recoveryMessage(requestError?.code, '되살리지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form className="form-stack compact-form customer-recovery" onSubmit={submit}>
+      <p><strong>확인번호를 등록해 두셨나요?</strong> 전화번호 {phone}로 등록한 확인번호를 넣으면 그때 묶어 둔 주문·그룹·상품을 이 브라우저로 바로 되살립니다.</p>
+      <label>확인번호
+        <input {...recoveryPinInput({ 'aria-label': '복구 확인번호', value: pin, disabled: busy,
+          onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) })} />
+      </label>
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <button type="submit" className="secondary-button compact-button" disabled={busy}>
+        {busy ? '되살리는 중…' : '확인번호로 되살리기'}
+      </button>
+    </form>
   );
 }
 
@@ -5426,7 +5647,7 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
         <ShoppingBag size={22} />
       </header>
 
-      <CustomerHistoryNotice status={historyStatus} onRetry={onRetryHistory} emptyList={orders.length === 0} />
+      <CustomerHistoryNotice status={historyStatus} onRetry={onRetryHistory} emptyList={orders.length === 0} orderCount={orders.length} />
       {orders.length === 0 && historyStatus === 'ready' && !getCustomerOrderCapabilityState().lostKey ? (
         <EmptyCustomerState
           icon={ShoppingBag}

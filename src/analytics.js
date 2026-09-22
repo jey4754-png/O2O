@@ -208,6 +208,16 @@ export function getVisitorId() {
   return next;
 }
 
+// Recovery hands a wiped browser the participant id its orders and group
+// rows were written under. Only a browser holding no group credentials may
+// take it: an existing (group, actor) credential would fall out of key.
+export function adoptVisitorId(visitorId) {
+  const next = String(visitorId || '');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(next)) return false;
+  volatileVisitorId = next;
+  return setLocalItem(VISITOR_KEY, next);
+}
+
 export function getCustomerNumber(visitorId = getVisitorId()) {
   return `UP-${String(visitorId).replace(/[^a-zA-Z0-9]/g, '').slice(0, 8).toUpperCase()}`;
 }
