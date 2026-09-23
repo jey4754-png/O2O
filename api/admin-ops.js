@@ -3,7 +3,7 @@ import { callDataApiJson, fetchUpstreamJson } from './_data-upstream.js';
 import { sanitizeDealImage } from './public-deals.js';
 
 export const config = { maxDuration: 60 };
-const ACTIONS = new Set(['list', 'orders', 'delete', 'image', 'cancel_order', 'recovery_reassign']);
+const ACTIONS = new Set(['list', 'orders', 'delete', 'image', 'cancel_order', 'recovery_reassign', 'recovery_check']);
 const RECOVERY_ORDER_LIMIT = 50;
 const LOGGED_ERRORS = new Set([
   'forbidden_origin', 'payload_too_large', 'invalid_action', 'invalid_actor_id',
@@ -59,6 +59,33 @@ function normalizeAdminResult(value) {
     ...(result.deal ? { deal: normalizeAdminDealImage(result.deal) } : {}),
   };
 }
+// Read-only support check: what the central history returns to the device
+// behind a recovery code, for a given login phone. It is the same read the
+// customer's browser makes, so "restored but still empty" can be split into
+// a server answer and a screen problem without touching any record. The code
+// is a public hash; no raw token is ever accepted here.
+async function recoveryCheck(body) {
+  const phone = String(body.phone || '').replace(/\D/g, '');
+  if (!/^010\d{8}$/.test(phone)) fail('invalid_recovery_phone');
+  const capabilityHash = String(body.capabilityHash || '').trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(capabilityHash)) fail('invalid_recovery_capability');
+  if (!process.env.GOOGLE_SHEETS_COLLECTOR_URL || !process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN) fail('collector_not_configured', 503);
+  const { upstream, result } = await fetchUpstreamJson(process.env.GOOGLE_SHEETS_COLLECTOR_URL, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, redirect: 'follow', timeoutMs: 50000,
+    body: JSON.stringify({ action: 'customer_orders', token: process.env.GOOGLE_SHEETS_COLLECTOR_TOKEN,
+      phone, visitorId: 'admin-recovery-check', customerCapabilityHash: capabilityHash }),
+  });
+  if (!upstream.ok || result?.ok !== true || !Array.isArray(result.orders)) {
+    fail(result?.error === 'collector_busy' ? 'collector_busy' : 'recovery_store_unavailable', 503);
+  }
+  const orders = result.orders.map((order) => ({
+    id: String(order?.id || ''), title: String(order?.title || order?.deal?.title || '').slice(0, 80),
+    paymentStatus: String(order?.paymentStatus || ''), status: String(order?.status || ''),
+  }));
+  console.info('[admin-ops] recovery_check', JSON.stringify({ count: orders.length }));
+  return { ok: true, count: orders.length, orders };
+}
+
 export default async function handler(request, response) {
   response.setHeader('Cache-Control', 'no-store');
   if (request.method !== 'POST') return response.status(405).json({ ok: false, error: 'method_not_allowed' });
@@ -78,6 +105,10 @@ export default async function handler(request, response) {
     const credential = await verifyAdminPin(body.adminPin, request);
     phase = 'validation';
     if (!ACTIONS.has(body.action)) fail('invalid_action');
+    if (body.action === 'recovery_check') {
+      phase = 'operation';
+      return response.status(200).json(await recoveryCheck(body));
+    }
     const payload = { action: body.action, adminAssertion: true, adminCredentialVersion: credential?.version || 0,
       actorId: identifier(body.actorId, /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/, 'actor_id') };
     if (body.action !== 'list') payload.dealId = identifier(body.dealId, /^(owner|customer)-[a-zA-Z0-9-]{1,100}$/, 'deal_id');

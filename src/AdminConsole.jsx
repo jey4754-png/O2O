@@ -30,6 +30,7 @@ const MESSAGES = {
   pin_unchanged: '현재 PIN과 다른 새 PIN을 입력해 주세요.',
   // An Apps Script deployment older than the web app rejects actions it does
   // not know. That is a missing deployment, not a network problem.
+  invalid_recovery_phone: '010으로 시작하는 휴대폰 번호 11자리를 입력해 주세요.',
   invalid_action: '서버(Apps Script)가 이 기능을 모르는 이전 버전입니다. Apps Script를 최신 코드로 새 버전 배포한 뒤 다시 시도해 주세요.',
   invalid_recovery_capability: '복구 코드는 영문 소문자·숫자 64자리입니다. 상품 이름 아래의 customer-… 값은 상품 ID라 복구 코드가 아닙니다. 사용자 앱 내 주문 화면에 표시된 64자리 코드를 그대로 붙여넣어 주세요.',
   invalid_order_ids: '재연결할 주문을 1건 이상 50건 이하로 선택해 주세요.',
@@ -46,7 +47,7 @@ const MESSAGES = {
   TimeoutError: '서버 응답이 늦어 요청 결과를 확인하지 못했습니다. 잠시 후 같은 작업을 다시 시도해 주세요.',
 };
 export async function requestAdminOperation(pin, fields) {
-  const readOnly = fields.action === 'list' || fields.action === 'orders';
+  const readOnly = fields.action === 'list' || fields.action === 'orders' || fields.action === 'recovery_check';
   const body = JSON.stringify({ ...fields, actorId: `${getVisitorId()}_admin`, adminPin: pin });
   for (let attempt = 0; ; attempt += 1) {
     const response = await fetch('/api/admin-ops', {
@@ -70,7 +71,7 @@ export async function requestAdminOperation(pin, fields) {
       throw new Error(code);
     }
     if ((fields.action === 'list' && !Array.isArray(result.deals))
-      || (fields.action === 'orders' && !Array.isArray(result.orders))) {
+      || ((fields.action === 'orders' || fields.action === 'recovery_check') && !Array.isArray(result.orders))) {
       throw new Error('admin_response_invalid');
     }
     return result;
@@ -99,6 +100,9 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
   const [reason, setReason] = useState('');
   const [recoveryCode, setRecoveryCode] = useState('');
   const [recoverySelection, setRecoverySelection] = useState({});
+  const [checkPhone, setCheckPhone] = useState('');
+  const [checkCode, setCheckCode] = useState('');
+  const [checkResult, setCheckResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -197,6 +201,17 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
     setRecoveryCode(''); setRecoverySelection({});
     setMessage(`주문 ${Number(result.recovery?.orders || orderIds.length)}건을 복구 코드 …${capabilityHash.slice(-8)} 기기에 연결했습니다. 그 기기의 사용자 앱을 ${phones[0] || '주문할 때 쓴 번호'}로 로그인한 상태에서 내 주문 → “주문 이력 다시 불러오기”를 눌러야 보입니다. 다른 번호로 로그인되어 있거나 기기의 복구 코드가 바뀌었으면 보이지 않습니다.`);
   });
+  // Read-only: asks the server what it returns to the device behind a
+  // recovery code. Nothing is written, so no reason or confirmation is needed.
+  const checkRecovery = () => run(async () => {
+    setCheckResult(null);
+    const phone = checkPhone.replace(/\D/g, '');
+    if (!/^010\d{8}$/.test(phone)) { setError('010으로 시작하는 휴대폰 번호 11자리를 입력해 주세요.'); return; }
+    const capabilityHash = checkCode.trim().toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(capabilityHash)) { setError(MESSAGES.invalid_recovery_capability); return; }
+    const result = await requestAdminOperation(pin, { action: 'recovery_check', phone, capabilityHash });
+    setCheckResult({ code: capabilityHash, count: Number(result.count || 0), orders: result.orders || [] });
+  });
   const changePin = () => run(async () => {
     if (!currentPin) { setError('현재 PIN을 입력해 주세요.'); return; }
     if (!/^\d{8,12}$/.test(newPin)) { setError(MESSAGES.invalid_new_pin); return; }
@@ -277,6 +292,21 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
         </button>)}
       </div>
       {!deals.length && <p>조회된 상품이 없습니다.</p>}
+      <details className="admin-recovery-check">
+        <summary>복구 상태 점검 (읽기 전용)</summary>
+        <p>사용자 기기의 64자리 복구 코드와 그 기기에 로그인한 전화번호를 넣으면, 그 기기의 내 주문에 서버가 돌려주는 주문을 그대로 보여 줍니다. 아무 기록도 바꾸지 않습니다.</p>
+        <form className="admin-detail" onSubmit={(event) => { event.preventDefault(); checkRecovery(); }}>
+          <label>로그인 전화번호<input aria-label="점검 전화번호" inputMode="numeric" autoComplete="off" value={checkPhone} disabled={busy}
+            onChange={(event) => setCheckPhone(event.target.value)} placeholder="010-0000-0000" /></label>
+          <label>복구 코드 (64자리)<input aria-label="점검 복구 코드" autoComplete="off" spellCheck={false} maxLength={64} value={checkCode} disabled={busy}
+            onChange={(event) => setCheckCode(event.target.value)} /></label>
+          <button className="secondary-button" disabled={busy}>서버 응답 확인</button>
+        </form>
+        {checkResult && <div role="status">
+          <p><strong>복구 코드 …{checkResult.code.slice(-8)} 기기에 서버가 돌려주는 주문: {checkResult.count}건</strong></p>
+          {checkResult.orders.slice(0, 50).map((order) => <p key={order.id}><small>{order.id}</small> {order.title} · {{ pending: '입금대기', requested: '입금확인 요청', confirmed: '입금완료' }[order.paymentStatus] || order.status}</p>)}
+        </div>}
+      </details>
       <details>
         <summary>관리자 PIN 변경</summary>
         <form aria-label="관리자 PIN 변경" className="admin-detail" onSubmit={(event) => { event.preventDefault(); changePin(); }}>
