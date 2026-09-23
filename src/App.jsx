@@ -597,6 +597,7 @@ const RECOVERY_ENROLLMENT_KEY = 'o2o_mvp_recovery_enrollment_v1';
 const RECOVERY_MESSAGES = {
   invalid_recovery_pin: '확인번호가 맞지 않습니다. 등록할 때 정한 숫자를 다시 확인해 주세요.',
   invalid_recovery_pin_format: '확인번호는 숫자 6~12자리로 정해 주세요.',
+  recovery_pin_matches_phone: '전화번호나 그 일부는 확인번호로 쓸 수 없습니다. 전화번호·관리자 PIN과 다른 숫자를 새로 정해 주세요.',
   invalid_recovery_phone: '010으로 시작하는 휴대폰 번호 11자리로 로그인되어 있어야 합니다.',
   recovery_rate_limited: '시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.',
   recovery_nothing_to_bind: '이 브라우저에서 확인된 주문·그룹·상품이 없어 등록할 것이 없습니다. 주문한 뒤 다시 등록해 주세요.',
@@ -5515,6 +5516,7 @@ function CustomerRecoveryEnroll({ orderCount }) {
     setError('');
     if (!/^\d{6,12}$/.test(pin)) { setError(RECOVERY_MESSAGES.invalid_recovery_pin_format); return; }
     if (pin !== confirm) { setError('확인번호 두 칸이 서로 다릅니다.'); return; }
+    if (phone.includes(pin) || pin.includes(phone.slice(3))) { setError(RECOVERY_MESSAGES.recovery_pin_matches_phone); return; }
     setBusy(true);
     try {
       const response = await enrollRecovery(pin, orderCount);
@@ -5536,7 +5538,7 @@ function CustomerRecoveryEnroll({ orderCount }) {
   return (
     <details className="customer-recovery" open={open} onToggle={(event) => setOpen(event.target.open)}>
       <summary>{summary}</summary>
-      <p>전화번호 {phone}와 지금 정하는 확인번호로, 이 브라우저에서 확인된 주문·그룹·상품을 묶어 둡니다. 나중에 다른 기기나 비워진 브라우저에서 같은 전화번호로 로그인하고 확인번호를 넣으면 그대로 되살아납니다. 확인번호는 서버에 원문으로 저장되지 않으니 잊지 않게 적어 두세요.</p>
+      <p><strong>확인번호는 전화번호나 관리자 PIN이 아니라, 여기서 새로 정하는 숫자입니다.</strong> 전화번호 {phone}와 지금 정하는 확인번호로, 이 브라우저에서 확인된 주문·그룹·상품을 묶어 둡니다. 나중에 다른 기기나 비워진 브라우저에서 같은 전화번호로 로그인하고 확인번호를 넣으면 그대로 되살아납니다. 확인번호는 서버에 원문으로 저장되지 않으니 잊지 않게 적어 두세요.</p>
       <form className="form-stack compact-form" onSubmit={submit}>
         <label>확인번호 (숫자 6~12자리)
           <input {...recoveryPinInput({ 'aria-label': '확인번호', value: pin, disabled: busy,
@@ -5588,7 +5590,7 @@ function CustomerRecoveryRedeem({ onRecovered }) {
   };
   return (
     <form className="form-stack compact-form customer-recovery" onSubmit={submit}>
-      <p><strong>확인번호를 등록해 두셨나요?</strong> 전화번호 {phone}로 등록한 확인번호를 넣으면 그때 묶어 둔 주문·그룹·상품을 이 브라우저로 바로 되살립니다.</p>
+      <p><strong>확인번호를 등록해 두셨나요?</strong> 전화번호 {phone}로 등록할 때 <strong>새로 정한 숫자</strong>(전화번호·관리자 PIN 아님)를 넣으면 그때 묶어 둔 주문·그룹·상품을 이 브라우저로 바로 되살립니다. 등록한 기기의 내 주문 화면에서 등록한 자리 수를 확인할 수 있습니다.</p>
       <label>확인번호
         <input {...recoveryPinInput({ 'aria-label': '복구 확인번호', value: pin, disabled: busy,
           onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) }, visible)} />

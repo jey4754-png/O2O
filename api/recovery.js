@@ -214,7 +214,15 @@ function boundCounts(value) {
   };
 }
 
+// The phone number is shown to merchants and group members, so a number
+// derived from it is no secret at all. Customers also read "확인번호" as their
+// phone number, register something else, and then fail every restore.
+function pinRepeatsPhone(pin, phone) {
+  return phone.includes(pin) || pin.includes(phone.slice(3));
+}
+
 async function enroll(request, body) {
+  if (pinRepeatsPhone(body.pin, body.phone)) throw recoveryError('recovery_pin_matches_phone');
   const groups = groupClaims(body.groups);
   const deals = dealClaims(body.deals);
   const identity = identityKey(body.phone);
