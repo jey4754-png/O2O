@@ -605,6 +605,7 @@ const RECOVERY_MESSAGES = {
   recovery_succession_exists: '이 브라우저는 이미 다른 등록을 되살린 상태라 한 번 더 되살릴 수 없습니다. 관리자에게 문의해 주세요.',
   recovery_not_enrolled: '이 전화번호로 등록된 확인번호가 없습니다.',
   recovery_store_unavailable: '복구 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.',
+  recovery_redeem_incomplete: '확인번호는 맞았습니다. 서버가 바빠 마무리하지 못했으니 잠시 뒤 "확인번호로 되살리기"를 한 번 더 눌러 주세요. 틀린 횟수로 세지 않습니다.',
   recovery_not_configured: '복구 기능이 아직 준비되지 않았습니다. 관리자에게 문의해 주세요.',
 };
 

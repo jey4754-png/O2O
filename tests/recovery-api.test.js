@@ -241,3 +241,43 @@ test('등록한 기기에서 확인번호가 맞는지 복구 없이 확인할 �
   assert.equal(store.calls.some((call) => call.payload.operation === 'redeem'), false);
   assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)), []);
 });
+
+function busyOn(operation, times) {
+  const real = globalThis.fetch;
+  let left = times;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (body.payload?.operation === operation && left > 0) {
+      left -= 1;
+      return { status: 200, ok: true, json: async () => ({ ok: false, error: 'collector_busy' }) };
+    }
+    return real(url, options);
+  };
+  return () => { globalThis.fetch = real; };
+}
+
+test('수집기가 잠깐 바쁘면 되살리기 기록을 다시 보내 한 번에 끝낸다', async (t) => {
+  const store = fixture(t);
+  assert.equal((await invoke(enrollBody())).statusCode, 200);
+  const restore = busyOn('redeem', 2);
+  t.after(restore);
+  const response = await invoke(redeemBody());
+  restore();
+  assert.equal(response.statusCode, 200, JSON.stringify(response.body));
+  assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)), [ORDER]);
+});
+
+test('숫자가 맞았는데 기록이 끝나지 못하면 그렇게 알리고, 다시 눌러도 틀린 횟수로 세지 않는다', async (t) => {
+  const store = fixture(t);
+  assert.equal((await invoke(enrollBody())).statusCode, 200);
+  const restore = busyOn('redeem', 10);
+  t.after(restore);
+  const failed = await invoke(redeemBody());
+  restore();
+  assert.equal(failed.statusCode, 503);
+  assert.equal(failed.body.error, 'recovery_redeem_incomplete');
+  assert.equal(store.calls.some((call) => call.payload?.operation === 'finish'), false, '실패 횟수를 올리지 않는다');
+  const again = await invoke(redeemBody());
+  assert.equal(again.statusCode, 200, JSON.stringify(again.body));
+  assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)), [ORDER]);
+});

@@ -99,7 +99,10 @@ async function collector(payload) {
   const token = secret();
   if (!url) throw recoveryError('recovery_not_configured', 503);
   const body = JSON.stringify({ token, action: 'recovery_credentials', payload });
-  const retryDelays = [300, 700];
+  // collector_busy means the script lock was never taken, so nothing was read
+  // or written and any operation may be replayed. A restore at 16:47 on
+  // 2026-09-23 failed on exactly this while the collector was saturated.
+  const retryDelays = [300, 700, 1500];
   for (let attempt = 0; ; attempt += 1) {
     let upstream;
     let result;
@@ -113,7 +116,7 @@ async function collector(payload) {
     }
     // Only a `begin` that lost the lock race is safe to replay: it has not yet
     // reserved a slot, derived anything, or written a row.
-    if (attempt < retryDelays.length && payload.operation === 'begin'
+    if (attempt < retryDelays.length
       && upstream.status === 200 && result.ok === false && result.error === 'collector_busy') {
       await new Promise((resolve) => setTimeout(resolve, retryDelays[attempt]));
       continue;
@@ -121,7 +124,7 @@ async function collector(payload) {
     if (upstream.status >= 400 || result.ok !== true) {
       const code = String(result?.error || '');
       if (Object.hasOwn(COLLECTOR_STATUS, code)) throw recoveryError(code, COLLECTOR_STATUS[code]);
-      throw recoveryError('recovery_store_unavailable', 503);
+      throw Object.assign(recoveryError('recovery_store_unavailable', 503), { upstream: code.slice(0, 60) });
     }
     return result;
   }
@@ -272,10 +275,19 @@ async function verify(request, body) {
 
 async function redeem(request, body) {
   const { identity, matched } = await matchEnrollment(request, body);
-  const result = await collector({
-    operation: 'redeem', identityKey: identity, ref: matched, redeemAssertion: true,
-    clientMutationId: body.clientMutationId, capabilityHash: sha256(body.capabilityToken),
-  });
+  let result;
+  try {
+    result = await collector({
+      operation: 'redeem', identityKey: identity, ref: matched, redeemAssertion: true,
+      clientMutationId: body.clientMutationId, capabilityHash: sha256(body.capabilityToken),
+    });
+  } catch (error) {
+    // The number was right; only the write did not land. Saying so keeps the
+    // customer from doubting the digits, and pressing again is safe: the
+    // collector replays the same request as the same restore.
+    if (error?.status === 503) throw Object.assign(recoveryError('recovery_redeem_incomplete', 503), { upstream: error.upstream });
+    throw error;
+  }
   const actorId = typeof result.actorId === 'string' && ID.test(result.actorId) ? result.actorId : '';
   return {
     ok: true,
@@ -304,6 +316,12 @@ export default async function handler(request, response) {
         : await redeem(request, body);
     return response.status(200).json(result);
   } catch (error) {
+    // Stage and collector code only: never the phone, number, or tokens.
+    console.warn('[recovery] request_failure', JSON.stringify({
+      action: String(request.body?.action || 'unknown').slice(0, 20),
+      code: String(error?.code || 'recovery_failed'), status: Number(error?.status || 503),
+      ...(error?.upstream ? { upstream: error.upstream } : {}),
+    }));
     if (error?.status === 429) response.setHeader('Retry-After', String(error.retryAfter || 1));
     // Never echo the collector body, the phone number, or exception text. The
     // wait is safe to tell: it is the caller's own lock, not anyone's record.
