@@ -170,7 +170,7 @@ function parseBody(request) {
   catch { throw recoveryError('invalid_request'); }
   if (!body || typeof body !== 'object' || Array.isArray(body)) throw recoveryError('invalid_request');
   if (JSON.stringify(body).length > 32768) throw recoveryError('payload_too_large', 413);
-  if (!['enroll', 'redeem'].includes(body.action)) throw recoveryError('invalid_action');
+  if (!['enroll', 'redeem', 'verify'].includes(body.action)) throw recoveryError('invalid_action');
   const phone = String(body.phone ?? '').replace(/\D/g, '');
   if (!PHONE.test(phone)) throw recoveryError('invalid_recovery_phone');
   if (typeof body.pin !== 'string' || !PIN.test(body.pin)) throw recoveryError('invalid_recovery_pin_format');
@@ -239,7 +239,8 @@ async function enroll(request, body) {
   return { ok: true, bound: boundCounts(result.bound) };
 }
 
-async function redeem(request, body) {
+// Finds the enrollment the confirmation number opens, or records a failure.
+async function matchEnrollment(request, body) {
   const identity = identityKey(body.phone);
   const started = await begin(request, identity);
   const candidates = Array.isArray(started.verifiers) ? started.verifiers : [];
@@ -258,6 +259,19 @@ async function redeem(request, body) {
     await recordFailure(request, identity);
     throw recoveryError('invalid_recovery_pin', 403);
   }
+  return { identity, matched };
+}
+
+// Checks a number right after registering it, on the device that holds it,
+// without restoring anything. A pass there and a failure on another device
+// then points at the device or phone, never at the digits typed.
+async function verify(request, body) {
+  const { matched } = await matchEnrollment(request, body);
+  return { ok: true, verified: true, thisDevice: matched === sha256(body.capabilityToken) };
+}
+
+async function redeem(request, body) {
+  const { identity, matched } = await matchEnrollment(request, body);
   const result = await collector({
     operation: 'redeem', identityKey: identity, ref: matched, redeemAssertion: true,
     clientMutationId: body.clientMutationId, capabilityHash: sha256(body.capabilityToken),
@@ -285,7 +299,9 @@ export default async function handler(request, response) {
   try {
     if (!allowedOrigin(request)) throw recoveryError('forbidden_origin', 403);
     const body = parseBody(request);
-    const result = body.action === 'enroll' ? await enroll(request, body) : await redeem(request, body);
+    const result = body.action === 'enroll' ? await enroll(request, body)
+      : body.action === 'verify' ? await verify(request, body)
+        : await redeem(request, body);
     return response.status(200).json(result);
   } catch (error) {
     if (error?.status === 429) response.setHeader('Retry-After', String(error.retryAfter || 1));

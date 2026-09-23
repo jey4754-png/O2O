@@ -195,7 +195,11 @@ test('빈 목록에서 확인번호로 되살리면 그룹·상품 권한을 이
 });
 
 test('주문이 있으면 확인번호 등록을 권하고, 등록 뒤에는 새 주문이 생겼을 때만 다시 연다', async ({ page }) => {
-  const f = await setup(page, { recovery: () => ({ json: { ok: true, bound: { orders: 2, groups: 0, deals: 0 } } }) });
+  const f = await setup(page, { recovery: (body) => (body.action === 'verify'
+    ? (body.pin === '482913'
+      ? { json: { ok: true, verified: true, thisDevice: true } }
+      : { status: 403, json: { ok: false, error: 'invalid_recovery_pin' } })
+    : { json: { ok: true, bound: { orders: 2, groups: 0, deals: 0 } } }) });
   try {
     await page.goto('/customer');
     await openOrders(page);
@@ -214,7 +218,15 @@ test('주문이 있으면 확인번호 등록을 권하고, 등록 뒤에는 새
     await expect(page.getByRole('status').filter({ hasText: '6자리 확인번호로 등록했습니다. 주문 2건·그룹 0개·상품 0개' })).toBeVisible();
     await expect(enroll.locator('summary')).toContainText('확인번호(6자리) 등록됨');
     expect(await page.evaluate(() => localStorage.getItem('o2o_mvp_recovery_enrollment_v1'))).not.toContain('482913');
-    const sent = f.state.recovery.at(-1);
+    // The registering device can check the number without restoring anything.
+    await page.getByLabel('확인할 확인번호').fill('482914');
+    await page.getByRole('button', { name: '맞는지 확인', exact: true }).click();
+    await expect(page.getByRole('alert').filter({ hasText: '등록한 숫자와 다릅니다(방금 넣은 숫자 6자리)' })).toBeVisible();
+    await page.getByLabel('확인할 확인번호').fill('482913');
+    await page.getByRole('button', { name: '맞는지 확인', exact: true }).click();
+    await expect(page.getByRole('status').filter({ hasText: '맞습니다. 이 기기에서 등록한 6자리 숫자입니다' })).toBeVisible();
+    expect(f.state.recovery.at(-1).action).toBe('verify');
+    const sent = f.state.recovery.find((body) => body.action === 'enroll');
     expect(sent.action).toBe('enroll');
     expect(sent.phone).toBe('01011112222');
     expect(sent.customerCapabilityToken).toBe(TOKEN);

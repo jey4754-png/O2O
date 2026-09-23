@@ -224,3 +224,20 @@ test('같은 기기에서 확인번호를 다시 등록하면 새 숫자로만 �
   assert.equal(fresh.statusCode, 200, JSON.stringify(fresh.body));
   assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)), [ORDER]);
 });
+
+test('등록한 기기에서 확인번호가 맞는지 복구 없이 확인할 수 있다', async (t) => {
+  const store = fixture(t);
+  assert.equal((await invoke(enrollBody())).statusCode, 200);
+  const rowsBefore = JSON.stringify(store.recovery.rows);
+  const ok = await invoke({ ...redeemBody(), action: 'verify', customerCapabilityToken: TOKEN, clientMutationId: 'recovery-verify-0001' });
+  assert.equal(ok.statusCode, 200, JSON.stringify(ok.body));
+  assert.deepEqual(ok.body, { ok: true, verified: true, thisDevice: true });
+  const other = await invoke({ ...redeemBody(), action: 'verify', clientMutationId: 'recovery-verify-0002' });
+  assert.deepEqual(other.body, { ok: true, verified: true, thisDevice: false });
+  const wrong = await invoke({ ...redeemBody(), action: 'verify', pin: '000000', clientMutationId: 'recovery-verify-0003' });
+  assert.equal(wrong.statusCode, 403);
+  assert.equal(wrong.body.error, 'invalid_recovery_pin');
+  assert.equal(JSON.stringify(store.recovery.rows), rowsBefore, '확인은 승계를 기록하지 않는다');
+  assert.equal(store.calls.some((call) => call.payload.operation === 'redeem'), false);
+  assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)), []);
+});

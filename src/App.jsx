@@ -686,6 +686,14 @@ function applyRecoveredAccess(result) {
   }
 }
 
+async function verifyRecovery(pin) {
+  const phone = normalizePhone(getProfile()?.phone);
+  return requestRecovery('verify', {
+    phone, pin, actorId: getVisitorId(), clientMutationId: createMutationId('recovery-verify'),
+    customerCapabilityToken: getCustomerOrderCapability(),
+  });
+}
+
 async function redeemRecovery(pin) {
   const phone = normalizePhone(getProfile()?.phone);
   const result = await requestRecovery('redeem', {
@@ -5560,7 +5568,50 @@ function CustomerRecoveryEnroll({ orderCount }) {
           {busy ? '등록 중…' : enrollment ? '확인번호 다시 등록' : '확인번호 등록'}
         </button>
       </form>
+      {enrollment && <CustomerRecoveryVerify />}
     </details>
+  );
+}
+
+function CustomerRecoveryVerify() {
+  const [pin, setPin] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [visible, setVisible] = useState(false);
+  const [outcome, setOutcome] = useState(null);
+  const submit = async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    if (!/^\d{6,12}$/.test(pin)) { setOutcome({ ok: false, message: RECOVERY_MESSAGES.invalid_recovery_pin_format }); return; }
+    setBusy(true);
+    setOutcome(null);
+    try {
+      const result = await verifyRecovery(pin);
+      setOutcome({ ok: true, message: result.thisDevice
+        ? `맞습니다. 이 기기에서 등록한 ${pin.length}자리 숫자입니다. 다른 기기에서 같은 전화번호로 로그인한 뒤 이 숫자를 그대로 넣으면 됩니다.`
+        : `맞습니다. 이 전화번호로 등록된 ${pin.length}자리 숫자입니다.` });
+    } catch (requestError) {
+      setOutcome({ ok: false, message: requestError?.code === 'invalid_recovery_pin'
+        ? `등록한 숫자와 다릅니다(방금 넣은 숫자 ${pin.length}자리). 위에서 확인번호를 다시 등록한 뒤 다시 확인해 주세요.`
+        : requestError?.code === 'recovery_rate_limited' && requestError.retryAfter
+          ? `틀린 입력이 여러 번 쌓여 잠시 막혔습니다. ${new Date(Date.now() + requestError.retryAfter * 1000).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })} 이후에 다시 확인해 주세요.`
+          : recoveryMessage(requestError?.code, '확인하지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.') });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <form className="form-stack compact-form" onSubmit={submit}>
+      <p><strong>등록한 숫자 확인</strong> — 다른 기기에서 넣기 전에, 여기서 한 번 넣어 맞는지 확인해 두세요. 아무것도 바뀌지 않습니다.</p>
+      <label>확인할 확인번호
+        <input {...recoveryPinInput({ 'aria-label': '확인할 확인번호', value: pin, disabled: busy,
+          onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) }, visible)} />
+      </label>
+      <RecoveryPinVisibility visible={visible} onChange={setVisible} disabled={busy} />
+      {outcome && <p role={outcome.ok ? 'status' : 'alert'} className={outcome.ok ? '' : 'form-error'}>{outcome.message}</p>}
+      <button type="submit" className="secondary-button compact-button" disabled={busy}>
+        {busy ? '확인 중…' : '맞는지 확인'}
+      </button>
+    </form>
   );
 }
 
