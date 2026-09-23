@@ -10,7 +10,7 @@ const HASH = createHash('sha256').update(TOKEN).digest('hex');
 const OLD_ID = 'order-1234567890701';
 const NEW_ID = 'order-1234567890702';
 
-async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked = false, repairRequired = false, recovery = null } = {}) {
+async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked = false, repairRequired = false, recovery = null, localOrders = [] } = {}) {
   const fixture = customerHistoryStore({
     current: [historyOrder('1234567890702', { title: '새로 만든 합성 주문', _customerCapabilityHash: HASH }),
       historyOrder('1234567890703', { title: '다른 키의 주문', _customerCapabilityHash: 'b'.repeat(64) }),
@@ -39,7 +39,7 @@ async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked 
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   Object.assign(process.env, { O2O_DATA_API_ORIGIN: '', O2O_DATA_API_TOKEN: '',
     GOOGLE_SHEETS_COLLECTOR_URL: `http://127.0.0.1:${server.address().port}`, GOOGLE_SHEETS_COLLECTOR_TOKEN: 'REPLACE_WITH_RANDOM_TOKEN' });
-  await page.addInitScript(({ token }) => {
+  await page.addInitScript(({ token, localOrders }) => {
     if (localStorage.getItem('history-test-seeded')) return;
     localStorage.setItem('history-test-seeded', 'yes');
     const profile = { name: '고객 이력 검증', phone: '010-1111-2222', testerType: '사용자',
@@ -47,10 +47,11 @@ async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked 
     localStorage.setItem('o2o_mvp_profile', JSON.stringify(profile));
     localStorage.setItem('o2o_mvp_visitor_id', 'customer-history-visitor');
     localStorage.setItem('o2o_mvp_customer_order_capability_v1', token);
+    if (localOrders.length) localStorage.setItem('o2o_mvp_customer_orders', JSON.stringify(localOrders));
     sessionStorage.setItem('o2o_mvp_active_app_session_v1', JSON.stringify({
       profileKey: '사용자:01011112222', startedAt: Date.now(),
     }));
-  }, { token: TOKEN });
+  }, { token: TOKEN, localOrders });
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const body = route.request().postDataJSON() || {};
@@ -65,6 +66,10 @@ async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked 
     // This fixture is read-only: background sync cannot change synthetic rows.
     if (body.action !== 'list') {
       state.writes.push(body);
+      // Production rejects a new order on a listing it never published.
+      if (body.order?.dealId === 'deal-cafe') {
+        return route.fulfill({ status: 404, json: { ok: false, error: 'deal_not_found' } });
+      }
       return route.fulfill({ status: 403, json: { ok: false, error: 'fixture_read_only' } });
     }
     state.reads.push({ phone: body.phone, action: body.action });
@@ -218,6 +223,27 @@ test('주문이 있으면 확인번호 등록을 권하고, 등록 뒤에는 새
     await expect(page.locator('.order-card')).toHaveCount(2);
     await expect(page.locator('details.customer-recovery')).not.toHaveAttribute('open', '');
     await expect(page.locator('details.customer-recovery summary')).toContainText('확인번호 등록됨');
+  } finally { await f.close(); }
+});
+
+test('내 주문은 로그인 번호를 밝히고, 서버가 거절한 예시 상품 주문은 실패 대신 체험용으로 안내한다', async ({ page }) => {
+  const sample = { ...historyOrder('1234567890799', { title: '아메리카노 10잔 번들', _customerCapabilityHash: HASH }),
+    dealId: 'deal-cafe', customerPhone: '01011112222', visitorId: 'customer-history-visitor', groupId: '' };
+  delete sample._customerCapabilityHash;
+  const f = await setup(page, { localOrders: [sample] });
+  try {
+    await page.goto('/customer');
+    await openOrders(page);
+    await expect(page.locator('.customer-history-phone')).toContainText('010-1111-2222');
+    const card = page.locator('.order-card').filter({ hasText: '아메리카노 10잔 번들' });
+    await expect(card).toContainText('체험용 예시 상품');
+    await expect(card).not.toContainText('주문 서버 반영 확인 필요');
+    await expect(card).not.toContainText('입금대기');
+    await expect(page.locator('.order-card')).toHaveCount(3);
+    await page.getByRole('button', { name: '주문 이력 다시 불러오기', exact: true }).click();
+    await expect(page.getByText('조회 가능한 주문 이력을 확인했습니다.', { exact: true })).toBeVisible();
+    // One rejected attempt, and the terminal rejection is not replayed.
+    expect(f.state.writes.filter((body) => body.order?.id === sample.id)).toHaveLength(1);
   } finally { await f.close(); }
 });
 

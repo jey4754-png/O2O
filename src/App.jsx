@@ -382,6 +382,11 @@ const isEventVisibleInRelease = (eventName) => (
   Number(EVENT_MIN_RELEASE_PHASE[eventName] || 1) <= RELEASE_FEATURES.phase
 );
 let memoryCustomerOrderCapability = '';
+// Built-in example listings ship in this bundle. Unless one was also
+// published centrally, the store rejects a new order on it as deal_not_found;
+// that order can never be delivered and must not be reported as a failure the
+// customer should chase.
+const SAMPLE_DEAL_IDS = new Set([...sampleDeals, ...sampleCommunityGroups].map((deal) => deal.id));
 let customerOrderCapabilityState = { created: false, persisted: true, lostKey: false };
 const visibleEventDefinitions = eventDefinitions.filter((event) => isEventVisibleInRelease(event.name));
 const DEFAULT_LOCATION = {
@@ -5421,6 +5426,11 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
   // only symptom, and the recovery code must be in plain sight rather than two
   // taps deep behind a collapsed summary.
   const showRecovery = emptyList && status === 'ready';
+  // The central read is scoped to the logged-in phone before any key is
+  // checked. Logging in with another number on the same device, or on a new
+  // one, silently shows a different (often empty) history, so say which
+  // number this list belongs to.
+  const loginPhone = formatKoreanMobilePhoneInput(getProfile()?.phone);
   // The redeem form unmounts while the list reloads, so its outcome lives here.
   const [recovered, setRecovered] = useState(null);
   return (
@@ -5428,6 +5438,9 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
       {status === 'loading' ? <p role="status">이전 주문·참여 이력을 확인하고 있습니다.</p>
         : status === 'error' ? <p role="alert">이전 이력을 불러오지 못했습니다. 현재 표시된 목록은 유지되며, 이전 주문이 없는 것으로 확정된 것은 아닙니다.</p>
           : <p>조회 가능한 주문 이력을 확인했습니다.</p>}
+      {loginPhone && (
+        <p className="customer-history-phone">로그인 번호 <strong>{loginPhone}</strong>로 넣은 주문만 표시합니다. 주문할 때 다른 번호를 썼다면 그 번호로 다시 로그인해야 보입니다.</p>
+      )}
       {freshKey && (
         <p role="alert">이 브라우저의 주문 확인 키가 사라져 새로 만들었습니다. 브라우저가 저장소를 비웠을 때 생기며, 이전 주문은 이 키로는 조회되지 않습니다. 없어진 것이 아니라 이 브라우저에서 확인할 수 없는 상태이니 원래 사용하던 브라우저에서 확인하거나 관리자 앱으로 조회해 주세요.</p>
       )}
@@ -5660,7 +5673,12 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
         <div className="order-card-list">
           {orders.map((order) => {
             const deal = resolveOrderLinkedDeal(order, dealById.get(order.dealId));
-            const syncIssue = orderSyncIssues[order.id] || null;
+            const rawSyncIssue = orderSyncIssues[order.id] || null;
+            // Only the server's own answer marks an order as an example-listing
+            // order: some example groups can exist centrally and sync normally.
+            const sampleOrder = SAMPLE_DEAL_IDS.has(String(order.dealId || ''))
+              && rawSyncIssue?.state === 'failed' && rawSyncIssue?.code === 'deal_not_found';
+            const syncIssue = sampleOrder ? null : rawSyncIssue;
             const cancelled = isCancelledOrder(order);
             const orderStage = getOrderStage(order);
             const paymentStatus = getOrderPaymentStatus(order);
@@ -5669,7 +5687,7 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
               : paymentStatus === 'requested' ? '입금확인요청 전송 완료' : '입금대기';
             const paymentHistoryUnconfirmed = historyStatus !== 'ready';
             const paymentNeedsRepair = order.paymentSyncStatus === 'repair_required';
-            const tracksPayment = order.type === 'purchase' || Boolean(order.groupId);
+            const tracksPayment = !sampleOrder && (order.type === 'purchase' || Boolean(order.groupId));
             const orderStageIndex = ORDER_STAGES.findIndex((stage) => stage.id === orderStage.id);
             const groupRole = dealHasGroupRoom(deal)
               ? getGroupCredential(
@@ -5714,6 +5732,12 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
                   <span>{cancelled ? '취소 전 ' : ''}{formatWon(order.total ?? discountedPrice(deal?.originalPrice, deal?.discountRate))}</span>
                   <span>{order.time || order.deadline || deal?.deadline}</span>
                 </div>
+                {sampleOrder && (
+                  <div className="customer-payment-state sample" role="note">
+                    <strong>체험용 예시 상품</strong>
+                    <span>앱에 기본으로 들어 있는 예시 상품이라 이 주문은 서버에 저장되지 않고 이 기기에만 남습니다. 사장님·관리자 화면과 다른 기기에는 보이지 않습니다.</span>
+                  </div>
+                )}
                 {syncIssue ? (
                   <div className={`customer-payment-state sync-${syncIssue.state === 'failed' ? 'failed' : 'pending'}`}>
                     <strong>{syncIssue.state === 'failed' ? '주문 서버 반영 확인 필요' : '주문 서버 반영 중'}</strong>

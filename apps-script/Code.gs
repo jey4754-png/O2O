@@ -6863,8 +6863,7 @@ function ensureSheets_() {
     publicDeals.getRange(1, 1, 1, PUBLIC_DEAL_HEADERS.length).setValues([PUBLIC_DEAL_HEADERS]);
     publicDeals.setFrozenRows(1);
   }
-  let recovery = spreadsheet.getSheetByName('복구 등록');
-  if (!recovery) recovery = spreadsheet.insertSheet('복구 등록');
+  const recovery = sheetByNameOrInsert_(spreadsheet, '복구 등록');
   ensureHeader_(recovery, RECOVERY_HEADERS);
   let customerOrders = spreadsheet.getSheetByName('주문 내역');
   if (!customerOrders) customerOrders = spreadsheet.insertSheet('주문 내역');
@@ -6889,6 +6888,22 @@ function ensureSheets_() {
     groups, groupParticipants, groupChat, groupHistory, recovery,
   };
   return RUNTIME_SHEETS_CACHE_;
+}
+
+// The first requests after a deployment race to create a sheet that does not
+// exist yet; the loser's insertSheet throws "이미 있습니다" and failed the
+// whole request (seen 2026-09-23 12:19:58 on public-deals and customer-orders).
+// Losing that race still leaves the sheet in place, so read it back.
+function sheetByNameOrInsert_(spreadsheet, name) {
+  const existing = spreadsheet.getSheetByName(name);
+  if (existing) return existing;
+  try {
+    return spreadsheet.insertSheet(name);
+  } catch (error) {
+    const created = spreadsheet.getSheetByName(name);
+    if (created) return created;
+    throw error;
+  }
 }
 
 function ensureHeader_(sheet, headers) {

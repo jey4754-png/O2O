@@ -1,4 +1,5 @@
 import React, { useRef, useState } from 'react';
+import { maskedOrderPhone } from './adminRecovery';
 import { createMutationId, isGroupBackedDeal } from './groupApi';
 import { getVisitorId } from './analytics';
 import { canonicalOrderVersion } from './orderMerge';
@@ -27,7 +28,10 @@ const MESSAGES = {
   invalid_new_pin: '새 PIN은 숫자 8~12자리로 입력해 주세요.',
   pin_mismatch: '새 PIN과 확인 입력이 일치하지 않습니다.',
   pin_unchanged: '현재 PIN과 다른 새 PIN을 입력해 주세요.',
-  invalid_recovery_capability: '복구 코드는 영문 소문자·숫자 64자리입니다. 사용자 화면의 “복구 코드 보기”에서 나온 값을 그대로 붙여넣어 주세요.',
+  // An Apps Script deployment older than the web app rejects actions it does
+  // not know. That is a missing deployment, not a network problem.
+  invalid_action: '서버(Apps Script)가 이 기능을 모르는 이전 버전입니다. Apps Script를 최신 코드로 새 버전 배포한 뒤 다시 시도해 주세요.',
+  invalid_recovery_capability: '복구 코드는 영문 소문자·숫자 64자리입니다. 상품 이름 아래의 customer-… 값은 상품 ID라 복구 코드가 아닙니다. 사용자 앱 내 주문 화면에 표시된 64자리 코드를 그대로 붙여넣어 주세요.',
   invalid_order_ids: '재연결할 주문을 1건 이상 50건 이하로 선택해 주세요.',
   recovery_mixed_ownership: '선택한 주문들의 이전 기기가 서로 다릅니다. 한 기기에는 한 번의 재연결만 기록할 수 있으니, 같은 기기에서 넣은 주문끼리만 선택해 주세요.',
   recovery_already_owned: '선택한 주문은 이미 이 복구 코드의 기기가 조회할 수 있습니다.',
@@ -177,16 +181,21 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
     if (!/^[a-f0-9]{64}$/.test(capabilityHash)) { setError(MESSAGES.invalid_recovery_capability); return; }
     const orderIds = orders.filter((order) => recoverySelection[order.id]).map((order) => order.id);
     if (!orderIds.length) { setError('재연결할 주문을 한 건 이상 선택해 주세요.'); return; }
+    const phones = [...new Set(orders.filter((order) => recoverySelection[order.id]).map(maskedOrderPhone).filter(Boolean))];
+    if (phones.length > 1) {
+      setError(`선택한 주문의 전화번호가 서로 다릅니다(${phones.join(', ')}). 사용자 앱은 로그인한 번호의 주문만 보여 주므로, 같은 번호의 주문끼리만 재연결해 주세요.`);
+      return;
+    }
     const fields = { action: 'recovery_reassign', dealId: selected.id, reason: reason.trim(), capabilityHash, orderIds };
     const contract = JSON.stringify(fields);
     if (!pending.current || pending.current.contract !== contract) {
-      if (!window.confirm(`대면 또는 유선으로 본인 확인을 마쳤습니까?\n선택한 주문 ${orderIds.length}건을 복구 코드 …${capabilityHash.slice(-8)} 기기에서 조회할 수 있게 합니다. 주문·입금 기록 자체는 변경되지 않으며, 변경 사유가 상태 이력에 남습니다.`)) return;
+      if (!window.confirm(`대면 또는 유선으로 본인 확인을 마쳤습니까?\n선택한 주문 ${orderIds.length}건을 복구 코드 …${capabilityHash.slice(-8)} 기기에서 조회할 수 있게 합니다.${phones[0] ? `\n그 기기의 사용자 앱이 ${phones[0]} 번호로 로그인되어 있어야 주문이 보입니다.` : ''}\n주문·입금 기록 자체는 변경되지 않으며, 변경 사유가 상태 이력에 남습니다.`)) return;
       pending.current = { contract, fields: { ...fields, clientMutationId: createMutationId('admin_recovery') } };
     }
     const result = await requestAdminOperation(pin, pending.current.fields);
     pending.current = null;
     setRecoveryCode(''); setRecoverySelection({});
-    setMessage(`주문 ${Number(result.recovery?.orders || orderIds.length)}건을 해당 기기로 재연결했습니다. 사용자가 같은 전화번호로 주문 내역을 다시 불러오면 확인할 수 있습니다.`);
+    setMessage(`주문 ${Number(result.recovery?.orders || orderIds.length)}건을 복구 코드 …${capabilityHash.slice(-8)} 기기에 연결했습니다. 그 기기의 사용자 앱을 ${phones[0] || '주문할 때 쓴 번호'}로 로그인한 상태에서 내 주문 → “주문 이력 다시 불러오기”를 눌러야 보입니다. 다른 번호로 로그인되어 있거나 기기의 복구 코드가 바뀌었으면 보이지 않습니다.`);
   });
   const changePin = () => run(async () => {
     if (!currentPin) { setError('현재 PIN을 입력해 주세요.'); return; }
@@ -243,7 +252,7 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
         {ordersStatus === 'error' && <p>주문 내역을 확인하지 못했습니다.{orders.length ? ' 마지막으로 확인한 내역을 유지합니다.' : ''} 새로고침해 주세요.</p>}
         {ordersStatus === 'ready' && !orders.length && <p>저장된 주문이 없습니다.</p>}
         {orders.map((order) => <article className="admin-order" key={order.id}>
-          <strong>{order.customerName || order.nickname || order.visitorId}</strong><small>{order.id}</small>
+          <strong>{order.customerName || order.nickname || order.visitorId}</strong>{maskedOrderPhone(order) && <small> · {maskedOrderPhone(order)}</small>}<small>{order.id}</small>
           <p>수량 {order.selectedCount || order.quantity || 1} · {order.status === 'cancelled' ? '참여 취소' : { pending: '입금대기', requested: '입금확인 요청', confirmed: '입금완료' }[order.paymentStatus] || order.status}</p>
           {order.refundReviewRequired && <p className="form-error">입금완료 후 취소 · 실제 환불 확인 필요</p>}
           <label className="admin-order-select"><input type="checkbox" aria-label={`${order.id} 재연결 대상 선택`} checked={Boolean(recoverySelection[order.id])} disabled={busy || ordersStatus !== 'ready'}
@@ -253,8 +262,9 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
         <details className="admin-recovery">
           <summary>기기 재연결 (주문 조회 권한 복구)</summary>
           <p className="form-error">반드시 대면 또는 유선으로 본인 확인을 마친 뒤에만 사용하세요. 복구 코드는 비밀이 아니라 공개 식별자이므로, 코드를 알고 있다는 사실만으로는 본인 확인이 되지 않습니다.</p>
-          <p>사용자가 자기 기기의 <strong>내 주문 → 이전 주문이 보이지 않나요? → 복구 코드 보기</strong>에서 64자리 코드를 읽어 주면, 위에서 선택한 주문만 그 기기에서 조회할 수 있게 연결합니다. 주문·입금 기록과 원래 소유 기록은 그대로 두고 연결 기록만 추가하며, 변경 사유는 상태 이력에 남습니다.</p>
-          <p>한 기기에는 재연결을 한 번만 기록할 수 있고, 같은 기기에서 넣은 주문끼리만 함께 선택할 수 있습니다. 사용자는 재연결 뒤 같은 전화번호로 주문 내역을 다시 불러와야 합니다.</p>
+          <p>사용자가 자기 기기의 <strong>내 주문</strong> 화면(목록이 비어 있으면 안내 상자에 자동 표시, 아니면 “이전 주문이 보이지 않나요?”를 펼침)에 나오는 64자리 복구 코드를 읽어 주면, 위에서 선택한 주문만 그 기기에서 조회할 수 있게 연결합니다. 주문·입금 기록과 원래 소유 기록은 그대로 두고 연결 기록만 추가하며, 변경 사유는 상태 이력에 남습니다.</p>
+          <p>한 기기에는 재연결을 한 번만 기록할 수 있고, 같은 기기에서 넣은 주문끼리만 함께 선택할 수 있습니다.</p>
+          <p><strong>사용자 앱은 로그인한 전화번호의 주문만 보여 줍니다.</strong> 재연결 뒤 그 기기의 사용자 앱이 주문 옆에 표시된 번호로 로그인되어 있어야 합니다. 복구 코드는 기기 저장 공간이 비워지면 바뀌므로, 재연결 직전에 그 기기에서 다시 확인한 값을 넣어 주세요.</p>
           <label>사용자 복구 코드 (64자리)<input aria-label="사용자 복구 코드" autoComplete="off" spellCheck={false} maxLength={64} value={recoveryCode} disabled={busy}
             onChange={(event) => setRecoveryCode(event.target.value)} placeholder="예: 3f9a…(64자리)" /></label>
           <p>선택한 주문 {orders.filter((order) => recoverySelection[order.id]).length}건</p>

@@ -842,6 +842,12 @@ button:disabled {
   grid-column: 1 / -1;
 }
 
+.customer-payment-state.sample {
+  border-color: #dfe3e8;
+  background: #f5f7f9;
+  color: #536170;
+}
+
 .customer-payment-state.cancelled {
   border-color: #dfe4e9;
   background: #eef1f4;
@@ -3980,6 +3986,8 @@ code {
 .customer-history-notice p { margin: 0; font-size: inherit; line-height: inherit; }
 .customer-history-notice > button { margin: 7px 0; font-size: 12px; }
 .customer-history-notice summary { cursor: pointer; }
+.customer-history-notice .customer-history-phone { margin: 4px 0 0; color: #2b3542; }
+.customer-history-notice.has-error .customer-history-phone { color: inherit; }
 .customer-history-notice .customer-recovery { margin: 8px 0; padding: 8px 10px; border: 1px solid #e0e5e9; border-radius: 8px; background: #fff; color: #536170; }
 .customer-history-notice .customer-recovery summary { font-weight: 800; color: #2b3542; }
 .customer-history-notice .customer-recovery .form-stack { padding: 8px 0 0; gap: 8px; }

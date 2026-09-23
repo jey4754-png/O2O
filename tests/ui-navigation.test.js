@@ -47,7 +47,7 @@ test('scope-aligned UI hides destructive entry points but keeps payment and host
   assert.match(groupRoomSource, /o2o-customer-orders-updated/);
   assert.match(groupRoomSource, /viewerPaymentStatus !== observedPaymentStatusRef\.current/);
   assert.match(groupRoomSource, /입금확인 요청 상태가 채팅과 내 주문에 반영되었습니다/);
-  assert.match(appSource, /const tracksPayment = order\.type === 'purchase' \|\| Boolean\(order\.groupId\)/);
+  assert.match(appSource, /const tracksPayment = !sampleOrder && \(order\.type === 'purchase' \|\| Boolean\(order\.groupId\)\)/);
 });
 
 test('group polling applies its central snapshot locally without republishing or leaking a rejection', () => {
