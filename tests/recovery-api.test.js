@@ -195,3 +195,32 @@ test('입력 검증에 걸리면 수집기에 아무 요청도 가지 않는다'
     assert.equal(store.calls.length, 0);
   }
 });
+
+test('입력 제한에 걸리면 풀리는 시각을 알 수 있게 대기 시간을 돌려준다', async (t) => {
+  const store = fixture(t);
+  assert.equal((await invoke(enrollBody())).statusCode, 200);
+  let last;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    last = await invoke(redeemBody({ pin: '000000', clientMutationId: `recovery-redeem-10${attempt}0` }));
+  }
+  assert.equal(last.statusCode, 429);
+  assert.equal(last.body.error, 'recovery_rate_limited');
+  assert.ok(last.body.retryAfter > 0 && last.body.retryAfter <= 900, String(last.body.retryAfter));
+  assert.equal(last.headers['Retry-After'], String(last.body.retryAfter));
+  assert.equal(store.recovery.rows.length, 2);
+});
+
+test('같은 기기에서 확인번호를 다시 등록하면 새 숫자로만 되살아난다', async (t) => {
+  const store = fixture(t);
+  assert.equal((await invoke(enrollBody())).statusCode, 200);
+  const again = await invoke(enrollBody({ pin: '731946', clientMutationId: 'recovery-enroll-0002' }));
+  assert.equal(again.statusCode, 200, JSON.stringify(again.body));
+  assert.equal(store.recovery.rows.length, 2, '같은 키의 재등록은 행을 늘리지 않고 확인번호만 바꾼다');
+
+  const old = await invoke(redeemBody({ pin: PIN }));
+  assert.equal(old.statusCode, 403);
+  assert.equal(old.body.error, 'invalid_recovery_pin');
+  const fresh = await invoke(redeemBody({ pin: '731946', clientMutationId: 'recovery-redeem-0002' }));
+  assert.equal(fresh.statusCode, 200, JSON.stringify(fresh.body));
+  assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)), [ORDER]);
+});

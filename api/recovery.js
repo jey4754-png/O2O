@@ -289,7 +289,11 @@ export default async function handler(request, response) {
     return response.status(200).json(result);
   } catch (error) {
     if (error?.status === 429) response.setHeader('Retry-After', String(error.retryAfter || 1));
-    // Never echo the collector body, the phone number, or exception text.
-    return response.status(error?.status || 503).json({ ok: false, error: error?.code || 'recovery_failed' });
+    // Never echo the collector body, the phone number, or exception text. The
+    // wait is safe to tell: it is the caller's own lock, not anyone's record.
+    return response.status(error?.status || 503).json({
+      ok: false, error: error?.code || 'recovery_failed',
+      ...(error?.status === 429 ? { retryAfter: Number(error.retryAfter) || 1 } : {}),
+    });
   }
 }

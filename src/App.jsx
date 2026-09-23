@@ -624,6 +624,7 @@ async function requestRecovery(action, fields) {
     const error = new Error(result.error || `recovery_${response.status}`);
     error.code = result.error || 'recovery_failed';
     error.status = response.status;
+    error.retryAfter = Number(result.retryAfter || response.headers.get('Retry-After')) || 0;
     throw error;
   }
   return result;
@@ -5580,7 +5581,9 @@ function CustomerRecoveryRedeem({ onRecovered }) {
       setPin('');
       onRecovered?.(response);
     } catch (requestError) {
-      const message = recoveryMessage(requestError?.code, '되살리지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.');
+      const message = requestError?.code === 'recovery_rate_limited' && requestError.retryAfter
+        ? `틀린 입력이 여러 번 쌓여 잠시 막혔습니다. ${new Date(Date.now() + requestError.retryAfter * 1000).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' })} 이후에 다시 시도해 주세요. 그 전에 누르면 막힌 시간이 늘지는 않지만 확인되지 않습니다.`
+        : recoveryMessage(requestError?.code, '되살리지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.');
       setError(requestError?.code === 'invalid_recovery_pin'
         ? `${message} 방금 넣은 숫자는 ${pin.length}자리입니다. 등록한 기기의 내 주문 화면에 등록한 자리 수가 표시됩니다. 여러 번 틀리면 잠시 입력이 막힙니다.`
         : message);
