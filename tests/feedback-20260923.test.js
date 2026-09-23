@@ -70,3 +70,9 @@ test('확인번호는 자리 수만 남기고 숫자 보기로 오타를 가려�
   assert.match(appSource, /방금 넣은 숫자는 \$\{pin\.length\}자리입니다/);
   assert.match(appSource, /function RecoveryPinVisibility/);
 });
+
+test('확인번호 칸은 비밀번호 칸이 아니어서 브라우저가 저장된 관리자 PIN을 채우지 못한다', () => {
+  const helper = appSource.slice(appSource.indexOf('function recoveryPinInput'), appSource.indexOf('function RecoveryPinVisibility'));
+  assert.match(helper, /type: 'text'/);
+  assert.equal(/'password'/.test(helper), false);
+});

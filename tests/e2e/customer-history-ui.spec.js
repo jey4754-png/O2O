@@ -162,9 +162,12 @@ test('빈 목록에서 확인번호로 되살리면 그룹·상품 권한을 이
     await expect(page.getByRole('heading', { name: '조회 가능한 참여 내역이 없습니다' })).toBeVisible();
     const readsBefore = f.state.reads.length;
     await page.getByLabel('복구 확인번호').fill('000000');
-    await expect(page.getByLabel('복구 확인번호')).toHaveAttribute('type', 'password');
-    await page.getByLabel('숫자 보기').check();
+    // Never a password field, so a browser cannot fill a saved credential in.
     await expect(page.getByLabel('복구 확인번호')).toHaveAttribute('type', 'text');
+    await expect(page.getByLabel('복구 확인번호')).toHaveClass(/masked/);
+    await page.getByLabel('숫자 보기').check();
+    await expect(page.getByLabel('복구 확인번호')).not.toHaveClass(/masked/);
+    expect(await page.locator('.customer-history-notice input[type="password"]').count()).toBe(0);
     await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
     await expect(page.getByText('확인번호가 맞지 않습니다', { exact: false })).toBeVisible();
     await expect(page.getByText('방금 넣은 숫자는 6자리입니다', { exact: false })).toBeVisible();

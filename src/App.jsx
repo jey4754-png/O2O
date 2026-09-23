@@ -5487,8 +5487,18 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
   );
 }
 
+// Never a password field: Chrome ignores autocomplete="off" on those and
+// filled the admin PIN it had saved for this site into both confirmation
+// boxes, so the laptop registered the admin PIN while the customer typed a
+// number of their own on the phone (2026-09-23). A plain numeric text field
+// is not a credential target; masking, when wanted, is visual only.
 function recoveryPinInput(props, visible = false) {
-  return { type: visible ? 'text' : 'password', inputMode: 'numeric', autoComplete: 'off', maxLength: 12, ...props };
+  return {
+    type: 'text', inputMode: 'numeric', pattern: '[0-9]*', autoComplete: 'off',
+    autoCorrect: 'off', autoCapitalize: 'off', spellCheck: false, maxLength: 12,
+    'data-lpignore': 'true', 'data-1p-ignore': 'true', 'data-form-type': 'other',
+    className: visible ? 'recovery-pin' : 'recovery-pin masked', ...props,
+  };
 }
 
 // A masked 6~12 digit entry on a phone keyboard is easy to mistype, and a

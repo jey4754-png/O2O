@@ -3991,6 +3991,7 @@ code {
 .customer-history-notice .customer-history-inapp a { font-weight: 800; color: inherit; }
 .customer-history-notice .recovery-pin-toggle { flex-direction: row; align-items: center; gap: 6px; font-weight: 600; }
 .customer-history-notice .recovery-pin-toggle input { width: auto; min-height: 0; }
+.recovery-pin.masked { -webkit-text-security: disc; text-security: disc; }
 .customer-history-notice.has-error .customer-history-phone { color: inherit; }
 .customer-history-notice .customer-recovery { margin: 8px 0; padding: 8px 10px; border: 1px solid #e0e5e9; border-radius: 8px; background: #fff; color: #536170; }
 .customer-history-notice .customer-recovery summary { font-weight: 800; color: #2b3542; }
