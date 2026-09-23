@@ -4068,6 +4068,14 @@ function recoveryBoundSet_(sheets, capabilityHash, groupClaims, dealClaims) {
       if (orderIds.indexOf(String(order.id)) === -1) orderIds.push(String(order.id));
     });
   }
+  // Reads authorize from current rows and from the event-log snapshots, so the
+  // bound set must come from both. Binding only current rows left every
+  // snapshot-only order readable on the enrolling device and missing after a
+  // restore. The hash itself is the search key: the TextFinder touches only
+  // rows that contain it instead of the whole event sheet.
+  historicCustomerOrdersForHash_(sheets.events, capabilityHash).forEach(function(order) {
+    if (orderIds.indexOf(String(order.id)) === -1) orderIds.push(String(order.id));
+  });
   const groups = [];
   (groupClaims || []).forEach(function(claim) {
     if (!claim || typeof claim !== 'object') return;
@@ -4679,6 +4687,25 @@ function historicCustomerOrders_(events, phone, dealId) {
       const orderDealId = String(order.dealId || (order.deal && order.deal.id) || '');
       if (dealId && orderDealId !== dealId) return;
       if (order && order.id) results.push(order);
+    } catch (error) {}
+  });
+  return results;
+}
+
+function historicCustomerOrdersForHash_(events, capabilityHash) {
+  const hash = String(capabilityHash || '').toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(hash) || !events || events.getLastRow() < 2) return [];
+  const matches = events.getRange(2, 12, events.getLastRow() - 1, 1)
+    .createTextFinder(hash).matchCase(true).findAll();
+  if (!matches.length) return [];
+  const results = [];
+  matchedEventRows_(events, matches).forEach(function(row) {
+    if (String(row[6] || '') !== 'customer_order_snapshot') return;
+    try {
+      const order = JSON.parse(JSON.parse(row[11] || '{}').order_snapshot || '{}');
+      if (order && order.id && String(order._customerCapabilityHash || '').toLowerCase() === hash) {
+        results.push(order);
+      }
     } catch (error) {}
   });
   return results;

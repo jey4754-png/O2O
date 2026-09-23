@@ -675,6 +675,11 @@ export default async function handler(request, response) {
       throw requestError('invalid_group_id');
     }
     const orders = await listOrders(customerPhone, proof, !serviceRequest, groupId);
+    // A 200 with no orders and a 200 with a full history look identical in the
+    // request log; the count alone (no phone, key or content) separates them.
+    console.info('[customer-orders] list_result', JSON.stringify({
+      count: orders.length, groupScoped: Boolean(groupId),
+    }));
     return response.status(200).json({ ok: true, orders });
   } catch (error) {
     const code = error.code || error.message || 'order_sync_failed';
