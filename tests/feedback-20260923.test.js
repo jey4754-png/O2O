@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { maskedOrderPhone } from '../src/adminRecovery.js';
+import { isKakaoInAppBrowser } from '../src/inAppBrowser.js';
 
 const appSource = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
 const adminSource = readFileSync(new URL('../src/AdminConsole.jsx', import.meta.url), 'utf8');
@@ -55,4 +56,17 @@ test('배포 직후 시트 생성 경쟁에서 진 요청도 이미 만들어진
   assert.equal(inserts, 1);
   const broken = { getSheetByName: () => null, insertSheet() { throw new Error('quota'); } };
   assert.throws(() => context.sheetByNameOrInsert_(broken, '복구 등록'), /quota/);
+});
+
+test('카카오톡 인앱 브라우저를 알아보고 기본 브라우저로 여는 안내를 둔다', () => {
+  assert.equal(isKakaoInAppBrowser('Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 KAKAOTALK 11.4.0'), true);
+  assert.equal(isKakaoInAppBrowser('Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1'), false);
+  assert.match(appSource, /kakaotalk:\/\/web\/openExternal\?url=\$\{encodeURIComponent\(window\.location\.href\)\}/);
+});
+
+test('확인번호는 자리 수만 남기고 숫자 보기로 오타를 가려낼 수 있다', () => {
+  assert.match(appSource, /pinLength: pin\.length,/);
+  assert.equal(/saveJson\(RECOVERY_ENROLLMENT_KEY, \{[^}]*\bpin\b:/.test(appSource), false, '확인번호 원문을 저장하지 않는다');
+  assert.match(appSource, /방금 넣은 숫자는 \$\{pin\.length\}자리입니다/);
+  assert.match(appSource, /function RecoveryPinVisibility/);
 });

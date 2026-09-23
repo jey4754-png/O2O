@@ -39,6 +39,7 @@ import GroupRoom from './GroupRoom';
 import { RELEASE_FEATURES } from './releasePhase';
 import { SCOPED_UI_ACTIONS } from './scopeUi';
 import { createClientCapability } from './clientCapability';
+import { isKakaoInAppBrowser } from './inAppBrowser';
 import {
   customerOrderSyncFingerprint,
   customerOrderWriteContent,
@@ -651,8 +652,10 @@ async function enrollRecovery(pin, orderCount) {
     phone, pin, actorId: getVisitorId(), clientMutationId: createMutationId('recovery-enroll'),
     customerCapabilityToken: getCustomerOrderCapability(), ...recoveryClaims(),
   });
+  // Only the digit count is kept, so this device can say which number was
+  // registered without holding anything that would help guess it.
   saveJson(RECOVERY_ENROLLMENT_KEY, {
-    enrolledAt: new Date().toISOString(), orderCount, bound: result.bound || null,
+    enrolledAt: new Date().toISOString(), orderCount, bound: result.bound || null, pinLength: pin.length,
   });
   return result;
 }
@@ -5431,6 +5434,7 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
   // one, silently shows a different (often empty) history, so say which
   // number this list belongs to.
   const loginPhone = formatKoreanMobilePhoneInput(getProfile()?.phone);
+  const inAppBrowser = isKakaoInAppBrowser();
   // The redeem form unmounts while the list reloads, so its outcome lives here.
   const [recovered, setRecovered] = useState(null);
   return (
@@ -5438,6 +5442,12 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
       {status === 'loading' ? <p role="status">이전 주문·참여 이력을 확인하고 있습니다.</p>
         : status === 'error' ? <p role="alert">이전 이력을 불러오지 못했습니다. 현재 표시된 목록은 유지되며, 이전 주문이 없는 것으로 확정된 것은 아닙니다.</p>
           : <p>조회 가능한 주문 이력을 확인했습니다.</p>}
+      {inAppBrowser && (
+        <p className="customer-history-inapp" role="note">
+          카카오톡 안에서 열린 화면입니다. 이 화면은 사이트 저장 공간이 자주 비워져 주문 확인 키와 로그인이 사라질 수 있습니다. 오른쪽 아래 메뉴의 “다른 브라우저로 열기”로 Safari·Chrome에서 사용해 주세요.
+          {' '}<a href={`kakaotalk://web/openExternal?url=${encodeURIComponent(window.location.href)}`}>기본 브라우저로 열기</a>
+        </p>
+      )}
       {loginPhone && (
         <p className="customer-history-phone">로그인 번호 <strong>{loginPhone}</strong>로 넣은 주문만 표시합니다. 주문할 때 다른 번호를 썼다면 그 번호로 다시 로그인해야 보입니다.</p>
       )}
@@ -5467,8 +5477,20 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
   );
 }
 
-function recoveryPinInput(props) {
-  return { type: 'password', inputMode: 'numeric', autoComplete: 'off', maxLength: 12, ...props };
+function recoveryPinInput(props, visible = false) {
+  return { type: visible ? 'text' : 'password', inputMode: 'numeric', autoComplete: 'off', maxLength: 12, ...props };
+}
+
+// A masked 6~12 digit entry on a phone keyboard is easy to mistype, and a
+// mismatch reads the same as a wrong number. Letting the owner see the digits
+// on their own screen is the cheapest way to tell those apart.
+function RecoveryPinVisibility({ visible, onChange, disabled }) {
+  return (
+    <label className="recovery-pin-toggle">
+      <input type="checkbox" checked={visible} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+      숫자 보기
+    </label>
+  );
 }
 
 // Enrollment binds what this browser's live key owns right now, so a fresh
@@ -5481,6 +5503,7 @@ function CustomerRecoveryEnroll({ orderCount }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
+  const [visible, setVisible] = useState(false);
   const phone = normalizePhone(getProfile()?.phone);
   const newSinceEnrollment = enrollment ? Math.max(0, orderCount - Number(enrollment.orderCount || 0)) : 0;
   // Opens on its own only while there is something new to register; after a
@@ -5509,7 +5532,7 @@ function CustomerRecoveryEnroll({ orderCount }) {
     ? '확인번호 등록 — 기기가 바뀌거나 저장 공간이 비워져도 내 주문 유지'
     : newSinceEnrollment > 0
       ? `등록 이후 새 주문 ${newSinceEnrollment}건 — 확인번호를 다시 등록해 주세요`
-      : `확인번호 등록됨 · ${new Date(enrollment.enrolledAt).toLocaleDateString('ko-KR')}`;
+      : `확인번호${enrollment.pinLength ? `(${enrollment.pinLength}자리)` : ''} 등록됨 · ${new Date(enrollment.enrolledAt).toLocaleDateString('ko-KR')}`;
   return (
     <details className="customer-recovery" open={open} onToggle={(event) => setOpen(event.target.open)}>
       <summary>{summary}</summary>
@@ -5517,17 +5540,18 @@ function CustomerRecoveryEnroll({ orderCount }) {
       <form className="form-stack compact-form" onSubmit={submit}>
         <label>확인번호 (숫자 6~12자리)
           <input {...recoveryPinInput({ 'aria-label': '확인번호', value: pin, disabled: busy,
-            onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) })} />
+            onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) }, visible)} />
         </label>
         <label>확인번호 다시 입력
           <input {...recoveryPinInput({ 'aria-label': '확인번호 다시 입력', value: confirm, disabled: busy,
-            onChange: (event) => setConfirm(event.target.value.replace(/\D/g, '')) })} />
+            onChange: (event) => setConfirm(event.target.value.replace(/\D/g, '')) }, visible)} />
         </label>
+        <RecoveryPinVisibility visible={visible} onChange={setVisible} disabled={busy} />
         {error && <p className="form-error" role="alert">{error}</p>}
         {result && !error && (
           <p role="status">{result.duplicate
             ? '이미 같은 내용으로 등록되어 있습니다.'
-            : `등록했습니다. 주문 ${result.bound?.orders || 0}건·그룹 ${result.bound?.groups || 0}개·상품 ${result.bound?.deals || 0}개가 이 확인번호로 묶였습니다.`}</p>
+            : `${enrollment?.pinLength || ''}자리 확인번호로 등록했습니다. 주문 ${result.bound?.orders || 0}건·그룹 ${result.bound?.groups || 0}개·상품 ${result.bound?.deals || 0}개가 묶였습니다. 다른 기기에서는 이 숫자를 그대로 넣어야 합니다.`}</p>
         )}
         <button type="submit" className="secondary-button compact-button" disabled={busy}>
           {busy ? '등록 중…' : enrollment ? '확인번호 다시 등록' : '확인번호 등록'}
@@ -5541,6 +5565,7 @@ function CustomerRecoveryRedeem({ onRecovered }) {
   const [pin, setPin] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [visible, setVisible] = useState(false);
   const phone = normalizePhone(getProfile()?.phone);
   const submit = async (event) => {
     event.preventDefault();
@@ -5553,7 +5578,10 @@ function CustomerRecoveryRedeem({ onRecovered }) {
       setPin('');
       onRecovered?.(response);
     } catch (requestError) {
-      setError(recoveryMessage(requestError?.code, '되살리지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.'));
+      const message = recoveryMessage(requestError?.code, '되살리지 못했습니다. 연결을 확인한 뒤 다시 시도해 주세요.');
+      setError(requestError?.code === 'invalid_recovery_pin'
+        ? `${message} 방금 넣은 숫자는 ${pin.length}자리입니다. 등록한 기기의 내 주문 화면에 등록한 자리 수가 표시됩니다. 여러 번 틀리면 잠시 입력이 막힙니다.`
+        : message);
     } finally {
       setBusy(false);
     }
@@ -5563,8 +5591,9 @@ function CustomerRecoveryRedeem({ onRecovered }) {
       <p><strong>확인번호를 등록해 두셨나요?</strong> 전화번호 {phone}로 등록한 확인번호를 넣으면 그때 묶어 둔 주문·그룹·상품을 이 브라우저로 바로 되살립니다.</p>
       <label>확인번호
         <input {...recoveryPinInput({ 'aria-label': '복구 확인번호', value: pin, disabled: busy,
-          onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) })} />
+          onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) }, visible)} />
       </label>
+      <RecoveryPinVisibility visible={visible} onChange={setVisible} disabled={busy} />
       {error && <p className="form-error" role="alert">{error}</p>}
       <button type="submit" className="secondary-button compact-button" disabled={busy}>
         {busy ? '되살리는 중…' : '확인번호로 되살리기'}

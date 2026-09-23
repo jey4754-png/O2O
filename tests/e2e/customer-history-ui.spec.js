@@ -162,8 +162,12 @@ test('빈 목록에서 확인번호로 되살리면 그룹·상품 권한을 이
     await expect(page.getByRole('heading', { name: '조회 가능한 참여 내역이 없습니다' })).toBeVisible();
     const readsBefore = f.state.reads.length;
     await page.getByLabel('복구 확인번호').fill('000000');
+    await expect(page.getByLabel('복구 확인번호')).toHaveAttribute('type', 'password');
+    await page.getByLabel('숫자 보기').check();
+    await expect(page.getByLabel('복구 확인번호')).toHaveAttribute('type', 'text');
     await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
     await expect(page.getByText('확인번호가 맞지 않습니다', { exact: false })).toBeVisible();
+    await expect(page.getByText('방금 넣은 숫자는 6자리입니다', { exact: false })).toBeVisible();
     expect(f.state.reads.length).toBe(readsBefore);
 
     await page.getByLabel('복구 확인번호').fill('482913');
@@ -207,8 +211,9 @@ test('주문이 있으면 확인번호 등록을 권하고, 등록 뒤에는 새
 
     await page.getByLabel('확인번호 다시 입력').fill('482913');
     await page.getByRole('button', { name: '확인번호 등록', exact: true }).click();
-    await expect(page.getByRole('status').filter({ hasText: '등록했습니다. 주문 2건·그룹 0개·상품 0개' })).toBeVisible();
-    await expect(enroll.locator('summary')).toContainText('확인번호 등록됨');
+    await expect(page.getByRole('status').filter({ hasText: '6자리 확인번호로 등록했습니다. 주문 2건·그룹 0개·상품 0개' })).toBeVisible();
+    await expect(enroll.locator('summary')).toContainText('확인번호(6자리) 등록됨');
+    expect(await page.evaluate(() => localStorage.getItem('o2o_mvp_recovery_enrollment_v1'))).not.toContain('482913');
     const sent = f.state.recovery.at(-1);
     expect(sent.action).toBe('enroll');
     expect(sent.phone).toBe('01011112222');
@@ -222,7 +227,7 @@ test('주문이 있으면 확인번호 등록을 권하고, 등록 뒤에는 새
     await openOrders(page);
     await expect(page.locator('.order-card')).toHaveCount(2);
     await expect(page.locator('details.customer-recovery')).not.toHaveAttribute('open', '');
-    await expect(page.locator('details.customer-recovery summary')).toContainText('확인번호 등록됨');
+    await expect(page.locator('details.customer-recovery summary')).toContainText('확인번호(6자리) 등록됨');
   } finally { await f.close(); }
 });
 
