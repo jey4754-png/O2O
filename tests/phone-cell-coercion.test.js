@@ -45,14 +45,14 @@ test('되살린 키도 숫자로 바뀐 전화번호 칸의 결박 주문을 읽
   built.context.ensureSheets_ = () => ({ ...ensure(), recovery });
   const OLD = 'd'.repeat(64);
   const NEW = 'e'.repeat(64);
-  const order = { id: 'order-1700000014001', dealId: built.dealId, customerPhone: '01037474754', type: 'purchase',
+  const order = { id: 'order-1700000014001', dealId: built.dealId, customerPhone: '01012345678', type: 'purchase',
     status: 'new', paymentStatus: 'requested', quantity: 1, selectedCount: 1, version: 1, paymentVersion: 1,
     visitorId: 'member-test', _customerCapabilityHash: OLD };
   built.data.customerOrders.rows.push(['', order.id, asSheetsNumber(order.customerPhone), JSON.stringify(order)]);
   recovery.rows.push(['2026-09-23', '2026-09-23', 'admin:x', '', OLD, NEW, JSON.stringify([order.id]),
     '[]', '[]', 'member-test', 1, 'admin-recovery-0001']);
 
-  const result = built.context.getCustomerOrdersResponse_('01037474754', 'fresh-visitor', NEW);
+  const result = built.context.getCustomerOrdersResponse_('01012345678', 'fresh-visitor', NEW);
   assert.equal(result.ok, true, result.error);
   assert.deepEqual(ids(result), [order.id]);
 });
@@ -64,11 +64,11 @@ test('새로 쓰는 주문 행과 스냅샷의 전화번호는 텍스트로 저�
     setValues: (values) => writes.push(values[0]),
     getValues: () => [], getValue: () => '',
   });
-  built.context.updateCustomerOrderRecord_(built.data, { rowNumber: 5, order: { id: 'order-1700000014002', customerPhone: '010-3747-4754' } });
-  assert.equal(writes[0][2], "'01037474754");
+  built.context.updateCustomerOrderRecord_(built.data, { rowNumber: 5, order: { id: 'order-1700000014002', customerPhone: '010-1234-5678' } });
+  assert.equal(writes[0][2], "'01012345678");
   assert.equal(built.context.textCell_('UP-ABC'), 'UP-ABC');
   assert.equal(built.context.textCell_(''), '');
-  assert.equal(built.context.samePhone_(1037474754, '010-3747-4754'), true);
+  assert.equal(built.context.samePhone_(1012345678, '010-1234-5678'), true);
   assert.equal(built.context.samePhone_('', ''), false);
 });
 

@@ -10,7 +10,7 @@ const adminSource = readFileSync(new URL('../src/AdminConsole.jsx', import.meta.
 const collectorSource = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
 
 test('관리자 화면은 주문 번호 뒤 4자리만 보여 주고 전체 번호는 숨긴다', () => {
-  assert.equal(maskedOrderPhone({ customerPhone: '010-3747-4754' }), '010-****-4754');
+  assert.equal(maskedOrderPhone({ customerPhone: '010-1234-5678' }), '010-****-5678');
   assert.equal(maskedOrderPhone({ customerPhone: '01012345678' }), '010-****-5678');
   assert.equal(maskedOrderPhone({ customerPhone: '' }), '');
   assert.equal(maskedOrderPhone({}), '');
