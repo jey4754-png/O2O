@@ -9,3 +9,6 @@ playwright-report/
 test-results/
 docs/kakaotalk-*.txt
 .claude/
+
+# Local-only operator prompts (the repository is public)
+docs/*.local.md
