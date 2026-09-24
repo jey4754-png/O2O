@@ -16,6 +16,8 @@ function fixture() {
   let locked = false;
   const properties = {
     getProperty(name) {
+      // The collector also looks up its own deploy config; that is not credential state.
+      if (['O2O_SPREADSHEET_ID', 'O2O_INGEST_TOKEN'].includes(name)) return null;
       assert.ok([key, rateKey].includes(name));
       counters.propertyReads += 1;
       return values.has(name) ? values.get(name) : null;
@@ -144,7 +146,7 @@ test('GAS serializes concurrent rotations and rejects stale compare-and-swap ver
   let concurrentResult;
   const concurrent = { ...initialWrite, clientMutationId: 'concurrent-change-0002' };
   store.properties.getProperty = (name) => {
-    if (!attempted) { attempted = true; concurrentResult = store.request(concurrent); }
+    if (!attempted && name === key) { attempted = true; concurrentResult = store.request(concurrent); }
     return getProperty(name);
   };
   assert.equal(store.request(initialWrite).ok, true);

@@ -103,6 +103,7 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
   const [checkPhone, setCheckPhone] = useState('');
   const [checkCode, setCheckCode] = useState('');
   const [checkResult, setCheckResult] = useState(null);
+  const [checkError, setCheckError] = useState('');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -181,7 +182,7 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
   // is a public identifier and proves nothing on its own.
   const reassign = () => run(async () => {
     if (!reason.trim()) { setError('변경 사유를 입력해 주세요.'); return; }
-    const capabilityHash = recoveryCode.trim().toLowerCase();
+    const capabilityHash = recoveryCode.replace(/[^0-9a-fA-F]/g, '').toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(capabilityHash)) { setError(MESSAGES.invalid_recovery_capability); return; }
     const orderIds = orders.filter((order) => recoverySelection[order.id]).map((order) => order.id);
     if (!orderIds.length) { setError('재연결할 주문을 한 건 이상 선택해 주세요.'); return; }
@@ -203,15 +204,23 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
   });
   // Read-only: asks the server what it returns to the device behind a
   // recovery code. Nothing is written, so no reason or confirmation is needed.
-  const checkRecovery = () => run(async () => {
-    setCheckResult(null);
+  // Copied codes arrive with spaces, line breaks or invisible characters; only
+  // the hex digits matter. Errors stay next to this panel, not at the page top.
+  const checkRecovery = async () => {
+    if (inFlight.current) return;
+    setCheckResult(null); setCheckError('');
     const phone = checkPhone.replace(/\D/g, '');
-    if (!/^010\d{8}$/.test(phone)) { setError('010으로 시작하는 휴대폰 번호 11자리를 입력해 주세요.'); return; }
-    const capabilityHash = checkCode.trim().toLowerCase();
-    if (!/^[a-f0-9]{64}$/.test(capabilityHash)) { setError(MESSAGES.invalid_recovery_capability); return; }
-    const result = await requestAdminOperation(pin, { action: 'recovery_check', phone, capabilityHash });
-    setCheckResult({ code: capabilityHash, count: Number(result.count || 0), orders: result.orders || [] });
-  });
+    if (!/^010\d{8}$/.test(phone)) { setCheckError('010으로 시작하는 휴대폰 번호 11자리를 입력해 주세요.'); return; }
+    const capabilityHash = checkCode.replace(/[^0-9a-fA-F]/g, '').toLowerCase();
+    if (!/^[a-f0-9]{64}$/.test(capabilityHash)) { setCheckError(MESSAGES.invalid_recovery_capability); return; }
+    inFlight.current = true; setBusy(true);
+    try {
+      const result = await requestAdminOperation(pin, { action: 'recovery_check', phone, capabilityHash });
+      setCheckResult({ code: capabilityHash, count: Number(result.count || 0), orders: result.orders || [] });
+    } catch (failure) {
+      setCheckError(MESSAGES[failure.message] || '서버 응답을 확인하지 못했습니다. 잠시 후 다시 눌러 주세요.');
+    } finally { inFlight.current = false; setBusy(false); }
+  };
   const changePin = () => run(async () => {
     if (!currentPin) { setError('현재 PIN을 입력해 주세요.'); return; }
     if (!/^\d{8,12}$/.test(newPin)) { setError(MESSAGES.invalid_new_pin); return; }
@@ -300,8 +309,9 @@ export default function AdminConsole({ pin, onPinChange, onOpenRoom, onBack, Ima
             onChange={(event) => setCheckPhone(event.target.value)} placeholder="010-0000-0000" /></label>
           <label>복구 코드 (64자리)<input aria-label="점검 복구 코드" autoComplete="off" spellCheck={false} maxLength={64} value={checkCode} disabled={busy}
             onChange={(event) => setCheckCode(event.target.value)} /></label>
-          <button className="secondary-button" disabled={busy}>서버 응답 확인</button>
+          <button className="secondary-button" disabled={busy}>{busy ? '확인 중…' : '서버 응답 확인'}</button>
         </form>
+        {checkError && <p role="alert" className="form-error">{checkError}</p>}
         {checkResult && <div role="status">
           <p><strong>복구 코드 …{checkResult.code.slice(-8)} 기기에 서버가 돌려주는 주문: {checkResult.count}건</strong></p>
           {checkResult.orders.slice(0, 50).map((order) => <p key={order.id}><small>{order.id}</small> {order.title} · {{ pending: '입금대기', requested: '입금확인 요청', confirmed: '입금완료' }[order.paymentStatus] || order.status}</p>)}

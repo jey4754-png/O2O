@@ -1,6 +1,52 @@
 // Production values are configured in the deployed Apps Script project.
 const SPREADSHEET_ID = 'REPLACE_WITH_SPREADSHEET_ID';
 const INGEST_TOKEN = 'REPLACE_WITH_RANDOM_TOKEN';
+// Every redeploy used to paste this file over the editor and then retype the two
+// values above; forgetting it stopped all central storage. A run with real values
+// now keeps them in Script Properties, and a later paste that still carries the
+// placeholders reads them back from there. Real values in the file always win.
+const COLLECTOR_CONFIG_PROPERTY_KEYS = { SPREADSHEET_ID: 'O2O_SPREADSHEET_ID', INGEST_TOKEN: 'O2O_INGEST_TOKEN' };
+
+// Script Properties are capped per day and this runs on every request, so it is
+// consulted at most once per cache period; within one run the answer is memoised.
+const COLLECTOR_CONFIG_CACHE_SECONDS = 21600;
+const COLLECTOR_CONFIG_MEMO_ = {};
+
+function collectorConfig_(name, inFile) {
+  if (Object.prototype.hasOwnProperty.call(COLLECTOR_CONFIG_MEMO_, name)) return COLLECTOR_CONFIG_MEMO_[name];
+  const key = COLLECTOR_CONFIG_PROPERTY_KEYS[name];
+  const placeholder = /^REPLACE_WITH_/.test(String(inFile || ''));
+  let cache = null;
+  let properties = null;
+  try { cache = CacheService.getScriptCache(); } catch (error) {}
+  try { properties = PropertiesService.getScriptProperties(); } catch (error) {}
+  let value = inFile;
+  if (!placeholder) {
+    // Record the real value once per cache period so a later placeholder paste
+    // can recover it.
+    let persisted = null;
+    try { persisted = cache && cache.get(key + '_persisted'); } catch (error) {}
+    if (persisted !== inFile && properties) {
+      try {
+        if (properties.getProperty(key) !== inFile) properties.setProperty(key, inFile);
+        if (cache) cache.put(key + '_persisted', inFile, COLLECTOR_CONFIG_CACHE_SECONDS);
+      } catch (error) {}
+    }
+  } else {
+    let stored = null;
+    try { stored = cache && cache.get(key); } catch (error) {}
+    if (!stored && properties) {
+      try { stored = properties.getProperty(key); } catch (error) {}
+      if (stored && cache) { try { cache.put(key, stored, COLLECTOR_CONFIG_CACHE_SECONDS); } catch (error) {} }
+    }
+    value = stored || inFile;
+  }
+  COLLECTOR_CONFIG_MEMO_[name] = value;
+  return value;
+}
+
+function collectorSpreadsheetId_() { return collectorConfig_('SPREADSHEET_ID', SPREADSHEET_ID); }
+function collectorIngestToken_() { return collectorConfig_('INGEST_TOKEN', INGEST_TOKEN); }
 const EVENT_HEADERS = [
   '수집시각', '발생시각', '사용자명', '사용자유형', '익명ID', '세션ID',
   '이벤트', '시도', '시군구', '읍면동', '화면', '상세데이터', '고객번호', '연락처', '이벤트ID'
@@ -205,7 +251,7 @@ function doGet() {
 function doPost(e) {
   try {
     const body = JSON.parse((e.postData && e.postData.contents) || '{}');
-    if (body.token !== INGEST_TOKEN) return json_({ ok: false, error: 'unauthorized' });
+    if (body.token !== collectorIngestToken_()) return json_({ ok: false, error: 'unauthorized' });
     if (body.action !== 'admin_credentials' && body.payload && body.payload.adminAssertion === true) {
       requireCurrentAdminCredential_(body.payload);
     }
@@ -282,7 +328,7 @@ function doPost(e) {
         safeCell_(event.visitorId || ''), safeCell_(event.sessionId || ''), safeCell_(event.name || ''),
         safeCell_(properties.region || '미설정'), safeCell_(properties.district || '미설정'),
         safeCell_(properties.neighborhood || '미설정'), safeCell_(properties.screen || ''), JSON.stringify(storedProperties),
-        safeCell_(properties.customer_number || ''), safeCell_(properties.customer_phone || ''), safeCell_(event.id || '')
+        safeCell_(properties.customer_number || ''), textCell_(properties.customer_phone || ''), safeCell_(event.id || '')
       ]);
       if (event.name === 'profile_submitted') {
         backfillVisitorProfile_(events, event.visitorId, properties);
@@ -653,7 +699,7 @@ function appendCustomerOrderSnapshotEvent_(events, order, customerCapabilityHash
     'customer_order_snapshot',
     safeCell_(properties.region || '미설정'), safeCell_(properties.district || '미설정'),
     safeCell_(properties.neighborhood || '미설정'), 'customer_orders', JSON.stringify(properties),
-    safeCell_(properties.customer_number), safeCell_(properties.customer_phone), safeCell_(eventId)
+    safeCell_(properties.customer_number), textCell_(properties.customer_phone), safeCell_(eventId)
   ]);
   try { CacheService.getScriptCache().remove('central_stats_v2'); } catch (error) {}
   return true;
@@ -2055,7 +2101,7 @@ const PRODUCT_IMAGE_CHUNKS_ = Math.ceil(PRODUCT_IMAGE_LIMIT_ / PRODUCT_IMAGE_CHU
 const PRODUCT_IMAGE_SHEET_ = '상품 이미지';
 
 function productImageSheet_(create) {
-  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const spreadsheet = SpreadsheetApp.openById(collectorSpreadsheetId_());
   let sheet = spreadsheet.getSheetByName(PRODUCT_IMAGE_SHEET_);
   if (!sheet && create) sheet = spreadsheet.insertSheet(PRODUCT_IMAGE_SHEET_);
   if (sheet && create) {
@@ -2898,6 +2944,28 @@ function normalizePhone_(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
+// Sheets stores an all-digit string written by setValues/appendRow as a number
+// unless the cell is text-formatted, so 01037474754 comes back as 1037474754.
+// The 주문 내역 phone column was never text-formatted and the event sheet's
+// format covered only the rows that existed when it was applied, so every
+// phone-scoped history read silently dropped those rows (found 2026-09-24:
+// a restored phone read 0 orders). Compare without leading zeros.
+function canonicalPhone_(value) {
+  return normalizePhone_(value).replace(/^0+/, '');
+}
+
+function samePhone_(left, right) {
+  const canonical = canonicalPhone_(left);
+  return Boolean(canonical) && canonical === canonicalPhone_(right);
+}
+
+// Forces Sheets to keep an all-digit value as text; the apostrophe is not part
+// of the stored value and getValues() returns the digits with the zero intact.
+function textCell_(value) {
+  const text = safeCell_(value);
+  return /^\d+$/.test(text) ? "'" + text : text;
+}
+
 function validVisitorId_(value) {
   return /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(String(value || ''));
 }
@@ -3254,7 +3322,7 @@ function requireSameCustomerOrderIdentity_(existingOrder, incomingOrder) {
   if (customerOrderDealId_(existingOrder) !== customerOrderDealId_(incomingOrder)
     || String(existingOrder.participantActorId || existingOrder.visitorId || '')
       !== String(incomingOrder.participantActorId || incomingOrder.visitorId || '')
-    || normalizePhone_(existingOrder.customerPhone) !== normalizePhone_(incomingOrder.customerPhone)
+    || !samePhone_(existingOrder.customerPhone, incomingOrder.customerPhone)
     || requireSecureOrderQuantity_(existingOrder) !== requireSecureOrderQuantity_(incomingOrder)
     || Number(existingOrder.unitPrice || 0) !== Number(incomingOrder.unitPrice || 0)
     || Number(existingOrder.total || 0) !== Number(incomingOrder.total || 0)
@@ -4260,7 +4328,7 @@ function handleRecoveryCredentials_(payload) {
         // 각 항목을 따로 파생한다. 같은 씨앗을 재사용하면 salt 가 ref 의 앞부분과
         // 같고 hash 가 같은 값의 반복이 되어, 호출자가 미끼를 알아보고 이 번호의
         // 등록 수를 그대로 읽어낸다.
-        const base = 'recovery-decoy:' + identityKey + ':' + candidates.length + ':' + INGEST_TOKEN;
+        const base = 'recovery-decoy:' + identityKey + ':' + candidates.length + ':' + collectorIngestToken_();
         candidates.push({
           ref: sha256Hex_(base + ':ref'),
           verifier: {
@@ -4529,7 +4597,7 @@ function getCustomerOrders_(phoneValue, visitorIdValue, customerCapabilityHashVa
   if (sheet.getLastRow() >= 2) {
     sheet.getRange(2, 3, sheet.getLastRow() - 1, 2)
       .getValues()
-      .filter(function(row) { return normalizePhone_(row[0]) === phone; })
+      .filter(function(row) { return samePhone_(row[0], phone); })
       .forEach(function(row) {
         try {
           const order = JSON.parse(row[1] || '{}');
@@ -4680,7 +4748,7 @@ function historicCustomerOrders_(events, phone, dealId) {
   const results = [];
   rows.forEach(function(row) {
     if (String(row[6] || '') !== 'customer_order_snapshot') return;
-    if (phone && normalizePhone_(row[13]) !== normalizePhone_(phone)) return;
+    if (phone && !samePhone_(row[13], phone)) return;
     try {
       const details = JSON.parse(row[11] || '{}');
       const order = JSON.parse(details.order_snapshot || '{}');
@@ -5383,7 +5451,7 @@ function updateCustomerOrderRecord_(sheets, record) {
   const serialized = JSON.stringify(order);
   if (serialized.length > 30000) throw groupOperationError_('order_too_large');
   sheets.customerOrders.getRange(record.rowNumber, 1, 1, CUSTOMER_ORDER_HEADERS.length).setValues([[
-    new Date(), safeCell_(order.id), safeCell_(normalizePhone_(order.customerPhone)), serialized
+    new Date(), safeCell_(order.id), textCell_(normalizePhone_(order.customerPhone)), serialized
   ]]);
 }
 
@@ -6865,7 +6933,7 @@ function repairExistingUnsetRows() {
 
 function ensureSheets_() {
   if (RUNTIME_SHEETS_CACHE_) return RUNTIME_SHEETS_CACHE_;
-  const spreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+  const spreadsheet = SpreadsheetApp.openById(collectorSpreadsheetId_());
   let events = spreadsheet.getSheetByName('전체 이벤트');
   if (!events) events = spreadsheet.insertSheet('전체 이벤트');
   if (events.getLastRow() === 0) {
