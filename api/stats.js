@@ -1,6 +1,9 @@
 import { callDataApiJson, fetchUpstreamJson } from './_data-upstream.js';
 
 export const config = { maxDuration: 60 };
+// Aggregate reads can outlast the shared request deadline on a cold collector.
+// Leave time for a structured error before the function's 60-second limit.
+const STATS_READ_TIMEOUT_MS = 50000;
 
 function statusForStatsError(code, upstreamStatus = 0) {
   if (upstreamStatus >= 400 && upstreamStatus < 600) return upstreamStatus;
@@ -18,7 +21,7 @@ export default async function handler(request, response) {
   }
 
   try {
-    const proxied = await callDataApiJson('/api/stats');
+    const proxied = await callDataApiJson('/api/stats', { timeoutMs: STATS_READ_TIMEOUT_MS });
     if (proxied) {
       const { upstream, result } = proxied;
       if (!upstream.ok || result.ok !== true || !result.stats) {
@@ -40,6 +43,7 @@ export default async function handler(request, response) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ token: collectorToken, action: 'stats' }),
       redirect: 'follow',
+      timeoutMs: STATS_READ_TIMEOUT_MS,
     });
     if (!upstream.ok || !result.ok || !result.stats) {
       const code = result.error || 'collector_failed';
