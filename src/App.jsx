@@ -1696,6 +1696,11 @@ function App() {
     setPaymentNotices((current) => { const next = { ...current }; delete next[groupId]; return next; });
   };
 
+  const unreadCountsRef = useRef(unreadCounts);
+  unreadCountsRef.current = unreadCounts;
+  const openUnreadRoomId = ['/customer', '/admin'].includes(route) && customerScreen === 'room'
+    ? selectedDeal?.id : undefined;
+
   useEffect(() => {
     if (!profile || !RELEASE_FEATURES.unreadBadges) {
       setUnreadCounts({});
@@ -1703,11 +1708,19 @@ function App() {
     }
     let cancelled = false;
     let refreshingUnread = false;
+    let nextRefreshAt = 0;
+    let retryDelay = 5000;
     const refreshUnread = async () => {
-      if (refreshingUnread || document.visibilityState === 'hidden') return;
+      if (refreshingUnread || document.visibilityState === 'hidden' || Date.now() < nextRefreshAt) return;
       refreshingUnread = true;
+      nextRefreshAt = Date.now() + 2000;
+      let transientFailure = false;
       try {
-        const next = await fetchUnreadCounts({ adminMode: customerAdminMode, onSnapshot: (groupId, snapshot, actorId) => {
+        const next = await fetchUnreadCounts({ adminMode: customerAdminMode, skipGroupId: openUnreadRoomId,
+          previousCounts: unreadCountsRef.current,
+          onError: (error) => {
+            if ([429, 500, 502, 503, 504].includes(error.status) || error.name === 'TypeError') transientFailure = true;
+          }, onSnapshot: (groupId, snapshot, actorId) => {
           if (cancelled) return;
           const key = `${groupId}::${actorId}`;
           const seen = loadJson(PAYMENT_NOTICE_SEEN_KEY, {});
@@ -1719,6 +1732,12 @@ function App() {
         } });
         if (!cancelled) setUnreadCounts(next);
       } finally {
+        if (transientFailure) {
+          retryDelay = Math.min(60000, retryDelay * 2);
+          nextRefreshAt = Date.now() + retryDelay;
+        } else {
+          retryDelay = 5000;
+        }
         refreshingUnread = false;
       }
     };
@@ -1739,7 +1758,7 @@ function App() {
       document.removeEventListener('visibilitychange', handleFocus);
       window.removeEventListener('o2o-group-fallback-updated', handleFocus);
     };
-  }, [customerAdminMode, profile, route]);
+  }, [customerAdminMode, profile, route, openUnreadRoomId]);
 
   useEffect(() => {
     if (!RELEASE_FEATURES.unreadBadges || !profile || !['/customer', '/admin'].includes(route)) {

@@ -777,7 +777,7 @@ test('transient unread polling failures never disable a saved group', async () =
   try {
     assert.deepEqual(await fetchUnreadCounts(), { [groupId]: 0 });
     assert.deepEqual(await fetchUnreadCounts(), { [groupId]: 0 });
-    assert.equal(fetchCalls, 8);
+    assert.equal(fetchCalls, 2);
     assert.equal(getGroupCredential(groupId, actorId).active, true);
   } finally {
     globalThis.fetch = previousFetch;
@@ -2044,5 +2044,41 @@ test('participation cancellation fails closed offline and leaves browser state u
     else globalThis.CustomEvent = previousCustomEvent;
     if (previousFallback === undefined) delete process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK;
     else process.env.VITE_ENABLE_GROUP_LOCAL_FALLBACK = previousFallback;
+  }
+});
+
+test('unread polling skips the visible room, retains badges on failure and resumes after recovery', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  const storage = memoryStorage();
+  const actorId = 'visitor-poll-load';
+  const credentials = Object.fromEntries(['open-room', 'other-room'].map((groupId) => [`${groupId}::${actorId}`, {
+    groupId, actorId, role: 'member', active: true, capabilityToken: `group-${'u'.repeat(64)}`,
+  }]));
+  storage.setItem('o2o_mvp_group_credentials_v1', JSON.stringify(credentials));
+  globalThis.localStorage = storage;
+  const calls = [];
+  let unavailable = true;
+  globalThis.fetch = async (_url, options) => {
+    const body = JSON.parse(options.body);
+    calls.push(body.groupId);
+    return { ok: !unavailable, status: unavailable ? 503 : 200,
+      json: async () => unavailable ? { ok: false, error: 'collector_busy' } : {
+        ok: true, snapshot: { group: { groupId: body.groupId }, lastSeq: 4, messages: [], participants: [], history: [] },
+      },
+    };
+  };
+  try {
+    let errors = 0;
+    const counts = await fetchUnreadCounts({ skipGroupId: 'open-room', previousCounts: { 'other-room': 3 }, onError: () => errors++ });
+    assert.deepEqual(counts, { 'open-room': 0, 'other-room': 3 });
+    assert.deepEqual(calls, ['other-room']);
+    assert.equal(errors, 1);
+    unavailable = false;
+    await fetchUnreadCounts();
+    assert.deepEqual(calls, ['other-room', 'open-room', 'other-room']);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = previousStorage;
   }
 });

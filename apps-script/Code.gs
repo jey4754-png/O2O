@@ -317,7 +317,6 @@ function doPost(e) {
         if (event.name === 'survey_submitted' && !surveyExists_(sheets.surveys, event.id)) {
           appendSurveyRow_(sheets.surveys, event, properties);
         }
-        CacheService.getScriptCache().remove('central_stats_v2');
         return json_({ ok: true, duplicate: true });
       }
       const storedProperties = JSON.parse(JSON.stringify(properties));
@@ -337,7 +336,6 @@ function doPost(e) {
         appendSurveyRow_(sheets.surveys, event, properties);
       }
       if (centralDashboardEvent) rememberCentralAnalyticsEvent_(event.id);
-      CacheService.getScriptCache().remove('central_stats_v2');
     } finally {
       lock.releaseLock();
     }
@@ -6530,15 +6528,7 @@ function executeGroupMutation_(action, payload, sheets) {
   } else if (action === 'send_message') {
     const body = groupText_(payload.body, 500);
     if (!body) throw groupOperationError_('invalid_message_body');
-    if (group.chatLocked) {
-      if (actor.role === 'admin') {
-        // Administrators remain canonical without a participant-host binding.
-      } else if (actor.role === 'host') {
-        requireManager_(actor, group);
-      } else {
-        throw groupOperationError_('chat_locked');
-      }
-    }
+    if (group.chatLocked && actor.role !== 'admin') throw groupOperationError_('chat_locked');
     const nextSeq = group.lastMessageSeq + 1;
     const messageId = Utilities.getUuid();
     const participant = actor.participant || ensureAdminParticipant_(sheets, groupId, actor, nextSeq, now);
@@ -6757,7 +6747,7 @@ function executeGroupMutation_(action, payload, sheets) {
       version: group.version, createdAt: now
     }, mutationContract, mutationResult(), targetOperations);
   } else if (action === 'toggle_lock') {
-    requireManager_(actor, group);
+    if (actor.role !== 'admin') throw groupOperationError_('forbidden');
     const expectedVersion = requireInteger_(payload.expectedVersion, 'expected_version', 1, Number.MAX_SAFE_INTEGER);
     if (expectedVersion !== group.version) throw groupOperationError_('state_conflict');
     if (typeof payload.locked !== 'boolean') throw groupOperationError_('invalid_locked');
@@ -6878,24 +6868,27 @@ function preferValue_(preferred, fallback) {
 
 function backfillVisitorProfile_(events, visitorId, properties) {
   if (!visitorId || events.getLastRow() < 2) return;
-  const rowCount = events.getLastRow() - 1;
-  const range = events.getRange(2, 1, rowCount, EVENT_HEADERS.length);
-  const values = range.getValues();
-  let changed = false;
-
-  values.forEach(function(row) {
-    if (String(row[4]) !== String(visitorId)) return;
-    if (!row[2] || row[2] === '미설정') row[2] = properties.tester_name || '미설정';
-    if (!row[3] || row[3] === '미설정') row[3] = properties.tester_type || '미설정';
-    if (!row[7] || row[7] === '미설정') row[7] = properties.region || '미설정';
-    if (!row[8] || row[8] === '미설정') row[8] = properties.district || '미설정';
-    if (!row[9] || row[9] === '미설정') row[9] = properties.neighborhood || '미설정';
-    if (!row[12]) row[12] = properties.customer_number || '';
-    if (!row[13]) row[13] = properties.customer_phone || '';
-    changed = true;
+  // Search the visitor column only. Never rewrite unrelated visitors or existing
+  // cells: a full-sheet setValues also coerces old text phone numbers to numbers.
+  const matches = events.getRange(2, 5, events.getLastRow() - 1, 1)
+    .createTextFinder(String(visitorId)).matchEntireCell(true).matchCase(true).findAll();
+  const fields = [
+    [3, properties.tester_name], [4, properties.tester_type],
+    [8, properties.region], [9, properties.district], [10, properties.neighborhood],
+    [13, properties.customer_number], [14, properties.customer_phone],
+  ];
+  matches.forEach(function(cell) {
+    const rowNumber = cell.getRow();
+    const row = events.getRange(rowNumber, 1, 1, EVENT_HEADERS.length).getValues()[0];
+    fields.forEach(function(field) {
+      const column = field[0];
+      const value = field[1];
+      const current = row[column - 1];
+      if (!value || value === '미설정' || (current && current !== '미설정')) return;
+      events.getRange(rowNumber, column, 1, 1)
+        .setValues([[column === 14 ? textCell_(value) : safeCell_(value)]]);
+    });
   });
-
-  if (changed) range.setValues(values);
 }
 
 function repairExistingUnsetRows() {
@@ -6934,49 +6927,40 @@ function repairExistingUnsetRows() {
 function ensureSheets_() {
   if (RUNTIME_SHEETS_CACHE_) return RUNTIME_SHEETS_CACHE_;
   const spreadsheet = SpreadsheetApp.openById(collectorSpreadsheetId_());
-  let events = spreadsheet.getSheetByName('전체 이벤트');
-  if (!events) events = spreadsheet.insertSheet('전체 이벤트');
+  const events = sheetByNameOrInsert_(spreadsheet, '전체 이벤트');
   if (events.getLastRow() === 0) {
     events.getRange(1, 1, 1, EVENT_HEADERS.length).setValues([EVENT_HEADERS]);
     events.setFrozenRows(1);
   } else if (events.getLastColumn() < EVENT_HEADERS.length) {
     events.getRange(1, 1, 1, EVENT_HEADERS.length).setValues([EVENT_HEADERS]);
   }
-  let summary = spreadsheet.getSheetByName('통합 현황');
-  if (!summary) summary = spreadsheet.insertSheet('통합 현황');
-  let surveys = spreadsheet.getSheetByName('설문 응답');
-  if (!surveys) surveys = spreadsheet.insertSheet('설문 응답');
+  const summary = sheetByNameOrInsert_(spreadsheet, '통합 현황');
+  const surveys = sheetByNameOrInsert_(spreadsheet, '설문 응답');
   if (surveys.getLastRow() === 0) {
     surveys.getRange(1, 1, 1, SURVEY_HEADERS.length).setValues([SURVEY_HEADERS]);
     surveys.setFrozenRows(1);
   } else if (surveys.getLastColumn() < SURVEY_HEADERS.length) {
     surveys.getRange(1, 1, 1, SURVEY_HEADERS.length).setValues([SURVEY_HEADERS]);
   }
-  let publicDeals = spreadsheet.getSheetByName('공개 상품');
-  if (!publicDeals) publicDeals = spreadsheet.insertSheet('공개 상품');
+  const publicDeals = sheetByNameOrInsert_(spreadsheet, '공개 상품');
   if (publicDeals.getLastRow() === 0) {
     publicDeals.getRange(1, 1, 1, PUBLIC_DEAL_HEADERS.length).setValues([PUBLIC_DEAL_HEADERS]);
     publicDeals.setFrozenRows(1);
   }
   const recovery = sheetByNameOrInsert_(spreadsheet, '복구 등록');
   ensureHeader_(recovery, RECOVERY_HEADERS);
-  let customerOrders = spreadsheet.getSheetByName('주문 내역');
-  if (!customerOrders) customerOrders = spreadsheet.insertSheet('주문 내역');
+  const customerOrders = sheetByNameOrInsert_(spreadsheet, '주문 내역');
   if (customerOrders.getLastRow() === 0) {
     customerOrders.getRange(1, 1, 1, CUSTOMER_ORDER_HEADERS.length).setValues([CUSTOMER_ORDER_HEADERS]);
     customerOrders.setFrozenRows(1);
   }
-  let groups = spreadsheet.getSheetByName('그룹');
-  if (!groups) groups = spreadsheet.insertSheet('그룹');
+  const groups = sheetByNameOrInsert_(spreadsheet, '그룹');
   ensureHeader_(groups, GROUP_HEADERS);
-  let groupParticipants = spreadsheet.getSheetByName('그룹 참여자');
-  if (!groupParticipants) groupParticipants = spreadsheet.insertSheet('그룹 참여자');
+  const groupParticipants = sheetByNameOrInsert_(spreadsheet, '그룹 참여자');
   ensureHeader_(groupParticipants, GROUP_PARTICIPANT_HEADERS);
-  let groupChat = spreadsheet.getSheetByName('그룹 채팅');
-  if (!groupChat) groupChat = spreadsheet.insertSheet('그룹 채팅');
+  const groupChat = sheetByNameOrInsert_(spreadsheet, '그룹 채팅');
   ensureHeader_(groupChat, GROUP_CHAT_HEADERS);
-  let groupHistory = spreadsheet.getSheetByName('상태 이력');
-  if (!groupHistory) groupHistory = spreadsheet.insertSheet('상태 이력');
+  const groupHistory = sheetByNameOrInsert_(spreadsheet, '상태 이력');
   ensureHeader_(groupHistory, GROUP_HISTORY_HEADERS);
   RUNTIME_SHEETS_CACHE_ = {
     events, summary, surveys, publicDeals, customerOrders,
@@ -7111,7 +7095,7 @@ function getCentralStats_() {
     try { return JSON.parse(cached); } catch (error) {}
   }
   const stats = buildCentralStats_();
-  try { cache.put('central_stats_v2', JSON.stringify(stats), 4); } catch (error) {}
+  try { cache.put('central_stats_v2', JSON.stringify(stats), 30); } catch (error) {}
   return stats;
 }
 

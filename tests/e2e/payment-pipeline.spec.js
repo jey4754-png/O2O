@@ -604,3 +604,77 @@ test('실제 API·GAS: 다른 화면에서 입금완료된 오래된 로컬 주�
     expect(pipeline.failures).toEqual([]);
   } finally { await pipeline.close(); }
 });
+
+test('실제 API·GAS: 독립 브라우저 간 채팅은 다음 갱신에 표시되고 열린 방의 조회는 중복되지 않는다', async ({ page, browser }, testInfo) => {
+  const pipeline = await installPaymentPipeline(page);
+  const memberContext = await browser.newContext({ ...testInfo.project.use });
+  const member = await memberContext.newPage();
+  await pipeline.attach(member);
+  try {
+    await createSelfHostedGroup(page);
+    await waitForOrderAcknowledgement(page, pipeline);
+    const groupId = pipeline.orders()[0].groupId;
+    // A clean second context has neither host credentials nor a copied profile.
+    await member.goto(`/customer?group=${encodeURIComponent(groupId)}&view=detail`);
+    await member.getByLabel('이름', { exact: true }).fill('다른 브라우저 참여자');
+    await member.getByLabel('연락처').fill('010-0000-1002');
+    await member.getByLabel('개인정보 수집 및 테스트 행동 데이터 수집 동의').check();
+    await member.getByRole('button', { name: '테스트 시작' }).click();
+    await member.getByRole('button', { name: '참여하기', exact: true }).click();
+    await member.getByRole('button', { name: '참여 완료하기' }).click();
+    await member.getByRole('button', { name: '그룹 채팅 바로가기' }).click();
+    await expect(member.locator('.group-room-screen')).toBeVisible();
+    const timings = [];
+    for (const [sender, receiver, message] of [
+      [page, member, '호스트에서 다른 브라우저로'],
+      [member, page, '참여자에서 호스트로'],
+    ]) {
+      const started = Date.now();
+      await sender.getByLabel('메시지 입력').fill(message);
+      await sender.getByRole('button', { name: '메시지 전송' }).click();
+      await expect(receiver.locator('.chat-message').filter({ hasText: message })).toBeVisible({ timeout: 6500 });
+      timings.push(Date.now() - started);
+      await expect(receiver.locator('.chat-message').filter({ hasText: message }).locator('time')).not.toBeEmpty();
+      await expect(receiver.locator('.chat-message').filter({ hasText: message }).locator('.chat-sender')).not.toBeEmpty();
+    }
+    await testInfo.attach('two-context-timings', { body: JSON.stringify({ timingsMs: timings }), contentType: 'application/json' });
+    const start = pipeline.apiRequests.length;
+    await page.waitForTimeout(10500);
+    const reads = pipeline.apiRequests.slice(start).filter(({ body }) => body.action === 'snapshot');
+    // Two room pollers should make at most six reads in this window, not four pollers.
+    expect(reads.length).toBeLessThanOrEqual(6);
+    await member.goto(`/customer?group=${encodeURIComponent(groupId)}&view=room`);
+    await expect(member.locator('.chat-message').filter({ hasText: '호스트에서 다른 브라우저로' })).toBeVisible();
+    expect(pipeline.failures).toEqual([]);
+  } finally {
+    await pipeline.close();
+    await memberContext.close();
+  }
+});
+
+test('계약 A-03: 관리자 잠금은 호스트 입력도 막고 기존 대화와 관리자 안내를 유지한다', async ({ page }) => {
+  const pipeline = await installPaymentPipeline(page);
+  try {
+    await createSelfHostedGroup(page);
+    await waitForOrderAcknowledgement(page, pipeline);
+    const groupId = pipeline.orders()[0].groupId;
+    await page.getByLabel('메시지 입력').fill('잠금 전 기록');
+    await page.getByRole('button', { name: '메시지 전송' }).click();
+    await expect(page.locator('.chat-message')).toContainText('잠금 전 기록');
+    const admin = (action, extra) => JSON.parse(pipeline.context.doPost({ postData: { contents: JSON.stringify({
+      token: 'REPLACE_WITH_RANDOM_TOKEN', action: `group_${action}`,
+      payload: { groupId, actorId: 'operator_admin', adminAssertion: true,
+        clientMutationId: `admin-lock-${action}-${extra.locked ?? 'message'}`, ...extra },
+    }) } }).contents);
+    const version = () => pipeline.context.getGroupRecord_(pipeline.data, groupId).version;
+    expect(admin('toggle_lock', { locked: true, expectedVersion: version() }).ok).toBe(true);
+    await expect(page.getByLabel('메시지 입력')).toBeDisabled({ timeout: 6500 });
+    await expect(page.getByRole('button', { name: '채팅 잠금 해제', exact: true })).toHaveCount(0);
+    expect(admin('send_message', { body: '관리자 운영 안내' }).ok).toBe(true);
+    await expect(page.locator('.chat-message').filter({ hasText: '관리자 운영 안내' })).toBeVisible({ timeout: 6500 });
+    await expect(page.locator('.chat-message').filter({ hasText: '잠금 전 기록' })).toBeVisible();
+    expect(admin('toggle_lock', { locked: false, expectedVersion: version() }).ok).toBe(true);
+    await expect(page.getByLabel('메시지 입력')).toBeEnabled({ timeout: 6500 });
+    expect(pipeline.failures).toEqual([]);
+  } finally { await pipeline.close(); }
+});

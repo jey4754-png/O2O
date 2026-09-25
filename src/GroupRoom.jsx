@@ -352,6 +352,7 @@ export default function GroupRoom({
     let inFlight = false;
     let retryDelay = 5000;
     let terminalMissing = false;
+    let lastStartedAt = 0;
 
     const schedule = (delay = 5000) => {
       window.clearTimeout(timer);
@@ -367,6 +368,7 @@ export default function GroupRoom({
       if (inFlight) return;
       inFlight = true;
       const startedAt = Date.now();
+      lastStartedAt = startedAt;
       controller?.abort();
       controller = new AbortController();
       const revision = mutationRevisionRef.current;
@@ -407,9 +409,8 @@ export default function GroupRoom({
 
     poll();
     const refresh = () => {
-      if (terminalMissing) return;
-      controller?.abort();
-      inFlight = false;
+      // Focus/pageshow bursts must not cancel a useful read and start duplicates.
+      if (terminalMissing || inFlight || Date.now() - lastStartedAt < 2000) return;
       schedule(0);
     };
     window.addEventListener('online', refresh);
@@ -1019,7 +1020,7 @@ export default function GroupRoom({
                   )}
                 >저장</button>
               </div>
-              {RELEASE_FEATURES.chat && canManageTrade && (
+              {RELEASE_FEATURES.chat && role === 'admin' && (
                 <button
                   className="secondary-button lock-toggle"
                   disabled={busy}
@@ -1157,11 +1158,11 @@ export default function GroupRoom({
               maxLength={500}
               value={message}
               onChange={(event) => setMessage(event.target.value)}
-              placeholder={group?.chatLocked && !canManageTrade ? '관리자가 대화를 잠갔습니다' : '메시지 입력'}
-              disabled={busy || (group?.chatLocked && !canManageTrade)}
+              placeholder={group?.chatLocked && role !== 'admin' ? '관리자가 대화를 잠갔습니다' : '메시지 입력'}
+              disabled={busy || (group?.chatLocked && role !== 'admin')}
               aria-label="메시지 입력"
             />
-            <button type="submit" disabled={busy || !message.trim() || (group?.chatLocked && !canManageTrade)} aria-label="메시지 전송"><Send size={18} /></button>
+            <button type="submit" disabled={busy || !message.trim() || (group?.chatLocked && role !== 'admin')} aria-label="메시지 전송"><Send size={18} /></button>
           </form>}
 
           {snapshot.history.length > 0 && (

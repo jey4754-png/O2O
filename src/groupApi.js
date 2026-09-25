@@ -396,7 +396,9 @@ async function performGroupOperationRequest(payload, signal, assertCurrentContex
       }
       return result;
     } catch (error) {
-      const retryCount = groupOperationRetryCount(error);
+      // The scheduled poll already retries reads. Immediate retries multiply load
+      // while the collector is busy; mutation retries retain their frozen identity.
+      const retryCount = payload.action === 'snapshot' ? 0 : groupOperationRetryCount(error);
       if (signal?.aborted || attempt >= retryCount) throw error;
       const delay = Math.min(2400, 350 * (2 ** attempt)) + Math.floor(Math.random() * 180);
       attempt += 1;
@@ -1927,7 +1929,7 @@ export function updateGroupTarget(groupId, targetCount, actorId, expectedVersion
 
 export function setGroupChatLocked(groupId, locked, actorId) {
   return mutateGroup(groupId, actorId, 'toggle_lock', { locked: Boolean(locked) }, (snapshot, actor) => {
-    if (!actor || !['host', 'admin'].includes(actor.role)) throw new Error('forbidden');
+    if (!actor || actor.role !== 'admin') throw new Error('forbidden');
     const previous = Boolean(snapshot.group.chatLocked);
     snapshot.group.chatLocked = Boolean(locked);
     snapshot.history.push({
@@ -1938,7 +1940,7 @@ export function setGroupChatLocked(groupId, locked, actorId) {
   }, { allowLocalFallback: false });
 }
 
-export async function fetchUnreadCounts({ adminMode = false, onSnapshot } = {}) {
+export async function fetchUnreadCounts({ adminMode = false, onSnapshot, onError, skipGroupId, previousCounts = {} } = {}) {
   const entries = Object.entries(getGroupCredentials())
     .map(([storageKey, credential]) => ({
       groupId: credential?.groupId || storageKey.split('::')[0],
@@ -1948,16 +1950,18 @@ export async function fetchUnreadCounts({ adminMode = false, onSnapshot } = {}) 
     .filter(({ credential }) => credential.active !== false)
     .filter(({ credential }) => (adminMode ? credential.role === 'admin' : credential.role !== 'admin'));
   const snapshots = await Promise.all(entries.map(async ({ groupId, credential }) => {
+    if (groupId === skipGroupId) return [groupId, null, 0];
     try {
       const snapshot = await fetchGroupSnapshot(groupId, { actorId: credential.actorId });
       onSnapshot?.(groupId, snapshot, credential.actorId);
       return [groupId, snapshot];
-    } catch {
-      return [groupId, null];
+    } catch (error) {
+      onError?.(error);
+      return [groupId, null, error.code === 'group_not_found' ? 0 : (previousCounts[groupId] || 0)];
     }
   }));
-  return Object.fromEntries(snapshots.map(([groupId, snapshot]) => [
+  return Object.fromEntries(snapshots.map(([groupId, snapshot, retainedCount = 0]) => [
     groupId,
-    snapshot ? resolveUnreadCount(snapshot, getLastReadSeq(groupId)) : 0,
+    snapshot ? resolveUnreadCount(snapshot, getLastReadSeq(groupId)) : retainedCount,
   ]));
 }

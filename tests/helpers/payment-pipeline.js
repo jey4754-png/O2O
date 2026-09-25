@@ -115,7 +115,10 @@ export async function installPaymentPipeline(page, hooks = {}) {
     '/api/customer-orders': customerOrderHandler,
     '/api/collect': collectHandler,
   };
-  await page.route('**/api/**', async (route) => {
+  const attachedPages = new Set();
+  const attach = async (page) => {
+    attachedPages.add(page);
+    await page.route('**/api/**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const path = url.pathname;
@@ -153,10 +156,12 @@ export async function installPaymentPipeline(page, hooks = {}) {
       await route.fulfill({ status: 500, json: { ok: false, error: 'test_handler_exception' } });
     }
   });
+  };
+  await attach(page);
   return {
-    ...store, apiRequests, collectorRequests, failures,
+    ...store, apiRequests, collectorRequests, failures, attach,
     async close() {
-      await page.close();
+      await Promise.all([...attachedPages].map((attached) => attached.close()));
       await new Promise((resolve) => server.close(resolve));
       for (const key of Object.keys(env)) {
         if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key];

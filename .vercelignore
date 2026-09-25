@@ -16,3 +16,6 @@ apps-script/
 .github/
 AGENTS.md
 README.md
+
+.claude/
+scripts/

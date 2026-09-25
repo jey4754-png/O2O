@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
-  ACCEPT_RUN_AS_FLAG, assertMayUpdateDeployment, bodyDigest, deploymentVersion, DEPLOYMENT_ID, mergeRealConfig,
+  ACCEPT_RUN_AS_FLAG, assertPublishedSource, assertMayUpdateDeployment, bodyDigest, deploymentVersion, DEPLOYMENT_ID, mergeRealConfig,
   ownerSteps, parseArgs, webAppSettings,
 } from '../scripts/deploy-collector.mjs';
 
@@ -76,4 +76,16 @@ test('배포를 바꾸는 명령은 모두 복제한 프로젝트 폴더 안에�
   const calls = source.match(/clasp\(\['update-deployment'[^\n]*/g) || [];
   assert.ok(calls.length >= 2);
   for (const call of calls) assert.match(call, /, dir\);$/, `update-deployment 는 .clasp.json 이 있는 폴더에서만 동작한다: ${call}`);
+});
+
+
+test('staging rejects uncommitted source before reaching a remote and refuses unpublished commits', () => {
+  const calls = [];
+  assert.throws(() => assertPublishedSource((args) => { calls.push(args); return ' M apps-script/Code.gs'; }), /not_committed/);
+  assert.equal(calls.length, 1);
+  assert.throws(() => assertPublishedSource((args) => {
+    if (args[0] === 'merge-base') throw new Error('not ancestor');
+    return '';
+  }), /not_published/);
+  assert.doesNotThrow(() => assertPublishedSource(() => ''));
 });

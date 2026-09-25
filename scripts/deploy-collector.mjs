@@ -108,6 +108,18 @@ export function deploymentVersion(listing, deploymentId = DEPLOYMENT_ID) {
   return match ? match[1] : null;
 }
 
+// Refuse unreleased collector code before making any remote API calls.
+export function assertPublishedSource(runGit = (args) => execFileSync('git', args, {
+  cwd: fileURLToPath(new URL('..', import.meta.url)), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+})) {
+  if (String(runGit(['status', '--porcelain', '--', 'apps-script/Code.gs'])).trim()) {
+    throw new Error('collector_source_not_committed');
+  }
+  runGit(['fetch', 'origin', 'main']);
+  try { runGit(['merge-base', '--is-ancestor', 'HEAD', 'origin/main']); }
+  catch { throw new Error('collector_commit_not_published_on_main'); }
+}
+
 function clasp(args, cwd) {
   return execFileSync('npx', [...CLASP, ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 }
@@ -204,6 +216,7 @@ async function probe({ acceptRunAsThisAccount }) {
 // Pushes the repository code with the remote's real configuration lines and
 // creates a version. With promote=false the live deployment is not touched.
 async function deploy(description, { promote, acceptRunAsThisAccount }) {
+  assertPublishedSource();
   const before = currentVersion();
   const { dir, file, source, settings } = cloneRemote();
   let version = null;
