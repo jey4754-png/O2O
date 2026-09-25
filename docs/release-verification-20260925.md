@@ -55,3 +55,22 @@ Chromium·WebKit E2E 200/200 통과(실패·재시도 합격·건너뜀 0). 두 
 배포 전 읽기 점검: 주요 화면 HTTP200, 공개상품 목록 POST HTTP200/46건(7,154ms), 집계 HTTP200(10,076ms), 기존 collector health HTTP200/정상(18,853ms). 중앙 응답 지연은 남은 관찰 항목이며 health 성공만으로 주문·채팅·인수 완료를 판정하지 않는다.
 
 비공개 상세 로그: 로컬 .vercel/closeout-20260925/. 실제 고객 데이터와 비밀값을 공개 문서에 복사하지 않는다.
+
+## 웹 운영 배포 후 확인
+
+기능 소스 `412798d`를 GitHub main에 반영한 후 Vercel 운영으로 배포했다. 생성 시각은 2026-09-25 13:17:48 KST이며 배포 상태는 Ready이다.
+
+- 배포: `dpl_8pcMwjqBgQoYQnGs9aHZHHpnKpMy`
+- 원본 URL: `https://o2o-3wy4ty6dq-malshues-projects.vercel.app`
+- 기존 운영 URL 유지: `https://o2o-ten.vercel.app`
+- 운영 JS: `index-DKk5Qqpv.js`, 916,698 bytes
+- 운영 JS SHA-256: `aeb3c38dab03aa552c0c8decdfabeefa441187f4922119ed369985dfeb828b0b`
+- 웹 되돌리기 참조: `dpl_GQWfE9YskF6qnTKJyomoQSTiJ3Tk` / `https://o2o-lth1sq4xr-malshues-projects.vercel.app`
+
+배포 뒤 `/`, `/customer`, `/owner`, `/admin` 모두 HTTP200 및 새 JS 참조를 확인했다. 공개상품 목록은 필수 Origin 헤더를 포함한 요청에서 HTTP200, ok=true, 46건(6,296ms), 집계는 HTTP200, ok=true(10,304ms)였다. 최초 점검 요청은 Origin 헤더가 없어 의도된 origin_not_allowed/403으로 거부되었고, 헤더를 바로잡아 재검증했다.
+
+실제 운영 브라우저에서 첫 진입에 빈 화면이 한 번 관찰됐다. 새로고침 뒤 정상 표시됐으며 별도 새 탭의 재진입에서도 정상 표시됐다. 사용자·사장님·관리자 프로필 진입 화면을 확인했고 브라우저 수집 콘솔 오류·경고는 0건이었다. 빈 화면의 최초 원인은 확인하지 못했으므로 이를 해결 완료한 결함으로 기록하지 않는다. 고객 연락처 입력이나 고객 주문 상태 변경은 하지 않았다.
+
+배포 후 첫 운영 로그 13건은 HTTP200 2건, 수집 요청 HTTP202 10건, 위 점검 요청 HTTP403 1건이었다. 이 짧은 관찰 구간의 결과를 장기 무오류 또는 고객 주문·입금 검수 통과로 확대하지 않는다.
+
+Apps Script 편집기는 여전히 지정 dev 계정의 `본인 인증`과 `계정 보안을 유지하기 위해 Google에서 본인 인증을 해야 합니다. 계속하려면 다시 로그인하세요.`를 표시한다. 이번 중앙 코드의 새 버전 번호·실행 계정·접근 설정은 아직 확인하거나 변경하지 못했다. 인증 완료 후 기존 배포 번호와 설정을 기록하고, 백업·비밀값 보존·동일 배포 갱신·health 및 운영 흐름 재검증을 이어가야 한다. 웹 배포 성공은 이 중앙 배포를 대신하지 않는다.
