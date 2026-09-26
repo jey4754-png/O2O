@@ -1,14 +1,19 @@
 # 운영·인수 확인 안내
 
-## 운영 정보
+## 현재 상태 — 2026-09-26
 
-- 서비스: https://o2o-ten.vercel.app
+최신 검증·미완료 항목은 `closeout-verification-20260926.md`를 기준으로 한다. 이 문서의 파일명은 최초 작성일이며 과거 배포를 현재 배포로 해석하지 않는다.
+
+- 운영 서비스: https://o2o-ten.vercel.app
 - 사용자 `/customer`, 사장님 `/owner`, 관리자 `/admin`, 대시보드 `/dashboard`.
-- 현재 중앙 저장소는 Google Sheets와 Apps Script **v25**다(2026-09-17 10:22 KST 고객 배포). 운영 웹은 2026-09-19 11:57:53 KST에 생성된 Vercel 배포 `dpl_3FxjPMyAzjHb8SRi2FYjw5VEqsF3`, 배포 원본 URL `https://o2o-op2gnunnz-malshues-projects.vercel.app`, 운영 별칭 `https://o2o-ten.vercel.app`, 자산 `index-DGcBlIRZ.js`를 사용한다. 자산 SHA-256은 `f235478c474ade281cc83f754ccefb1cb9feebf2e07af6f7e5ae782cbecb6fcd`이다. 웹 소스 기준 커밋은 `83e250c`이며, 중앙 처리 소스는 `apps-script/Code.gs`, 필요한 설정 이름은 `.env.example`과 README에 있다. 비밀값은 공개 자료에 포함하지 않는다.
-- 되돌리기 참조로 이전 운영 배포 `dpl_6UjADmvcXXBiFRkdcsn41yUNqEFP`(자산 `index-CNfjkvMS.js`)를 보존한다. 2026-09-16~09-19 수정 범위와 검수 결과는 `feedback-20260915-payment-sync-qa.md`와 `final-inspection-20260920.md`에 있다.
-- Apps Script 프로젝트 소유자는 `Joo Joo`이며 `dev@bottlecorp.kr`은 편집기다. Git 원격은 `jey4754-png/O2O`, 기본 브랜치는 `main`이다. 인수자는 각 서비스에서 자신의 실제 소유·관리 권한을 직접 확인한다.
-- 2026-09-11 20:34 KST 중앙 시점 백업을 `/Users/seungsoohan/Documents/O2O-Handover/uptwoyou-data-20260911-2034.xlsx`에 생성했다. 2026-09-14 재검사 기준 파일은 3,272,479바이트, 권한 600, SHA-256 `12cbab012034d324682dc0d2957f7f676c8ae00b302a8f41c483fe851a43c58f`이며 ZIP 무결성과 11개 시트의 XLSX 구조 검사를 통과했다. 고객 정보가 포함될 수 있으므로 공개 저장소·일반 채팅에 첨부하지 않는다.
-- 관리자 PIN 변경은 관리자 로그인 후 PIN 변경 화면에서 한다. 중앙 PIN 해시 속성이나 권한 비밀을 삭제·초기화하는 것을 장애 복구로 사용하지 않는다.
+- 마지막 확인 웹 배포: `dpl_3ZBwQodoBMXmmhcWfwJ6C9a8CU11`, 2026-09-25 15:51:13 KST, 원본 `https://o2o-dhb1z4nmp-malshues-projects.vercel.app`. API 수정 소스 `decec3a`, 주요 기능 수정 `412798d`. 배포·검증 상세는 `release-verification-20260925.md`.
+- 운영 웹 자산: `index-DKk5Qqpv.js`, SHA-256 `aeb3c38dab03aa552c0c8decdfabeefa441187f4922119ed369985dfeb828b0b`. 이번 문서 작업은 운영 자산을 바꾸지 않는다.
+- 중앙 저장소: Google Sheets + Apps Script. 소유자 측은 9월25일15:38 KST 기존 웹 앱을 버전30으로 배포했다고 회신했다. dev 계정의 권한 제한 때문에 배포 설정·버전 소스를 독립 검증한 것은 아니다. 웹 되돌리기 참조는 `dpl_8pcMwjqBgQoYQnGs9aHZHHpnKpMy`이다.
+- GitHub: `jey4754-png/O2O`, 기본 브랜치 `main`. 중앙 처리 소스는 `apps-script/Code.gs`; 설정 이름은 `.env.example`, README, `contract-closeout-20260914.md`에 있다. 실제 비밀값은 소스·문서에 넣지 않는다.
+- 최신 데이터 백업: `/Users/seungsoohan/Documents/O2O-Handover/uptwoyou-data-20260926.xlsx`, 3,451,025 bytes, mode600, 워크시트12개, SHA-256 `3937b9712b79063bb8b3fed80b64e875fc5334cfd9e064e07bfb2127b9029747`. ZIP 무결성·읽기 전용 재열기를 확인했다. 9월11일 백업은 별도로 보존한다.
+- 활성 주문45건과 참여자 입금 저장 상태가45/45 일치했다. 데이터 시점 대조이며 실제 기기 UI·권한·동기화 속도 검수를 대신하지 않는다.
+- 앱 관리자 인증, 실제 두 기기·모바일 공유 검수, 최종 계정·비밀값 수령 및 고객 인수 승인은 남아 있다. 백업 확보와 인수자 수령을 구분한다.
+- 관리자 PIN 변경은 관리자 로그인 후 PIN 변경 화면에서 한다. 중앙 PIN 해시·권한 비밀 삭제나 초기화를 장애 복구에 사용하지 않는다.
 
 ## 역할별 확인
 
@@ -33,8 +38,10 @@
 
 ## 인수 상태
 
-이 문서는 운영 배포, 읽기 검증, GitHub 전달용 비밀값 제거, 중앙 데이터 시점 백업까지 반영한 인수 안내다. 2026-09-15 `pnpm verify:release` 재검사에서 단위·API·Apps Script 연계 검사 535개, 프로덕션 빌드, 모바일 Chromium·WebKit 회귀 188개가 모두 통과했다. 운영의 `/`, `/customer`, `/owner`, `/admin`, `/dashboard`는 모두 HTTP 200이었고 공개상품 중앙 읽기는 활성 45건을 반환했다. Chromium·WebKit으로 역할별 운영 화면을 열었을 때 페이지 오류는 없었다. 최종 배포 읽기 점검의 응답 완료 5건은 모두 HTTP 200이었고 4xx·5xx는 없었다.
+최신 코드·배포 검증 기록, 계약 기준 대조, 환경설정 이름과 최신 데이터 백업을 준비했다. 9월25일 기능 수정 당시 추적 대상636건·브라우저200건이 통과했으며 뒤이은 stats 한정 수정은 관련41건으로 검증했다. 이 숫자를 한정 수정 뒤 전체 재검사 또는 실운영 전 기능 합격으로 표현하지 않는다.
 
-2026-09-14 피드백의 입금 상태·내 주문 불일치는 중앙 주문 선조회, 오래된 로컬 주문 재게시 차단, 전화번호 형식 정규화, 늦은 실패 요청의 삭제·복구 차단으로 수정했다. 그룹 채팅은 요청 시작 간격을 약 5초로 맞췄고 새 메시지 배지는 5초 주기 병렬 조회로 변경했다. 사장님 상품·주문은 원래 등록한 브라우저의 관리키로 조회한다. 관리키가 없는 다른 브라우저·기기에 소유권을 자동 복구하는 화면은 신규 계정·권한 복구 기능이므로 현재 계약 범위에 포함하지 않았다.
+인수 폴더는 `/Users/seungsoohan/Documents/O2O-Handover/`이며 최신 파일과 해시는 `O2O-delivery-manifest-20260926.txt`에서 확인한다. 소스 ZIP은 저장소 추적 파일만 포함하고 운영 데이터·비밀값·임시 테스트를 제외한다. 데이터 백업과 코드 비밀값 백업은 비공개로 유지한다.
 
-자동검증은 고객의 실제 기기·브라우저·관리키로 수행한 운영 인수 승인을 대신하지 않는다. 최종 검수 현황과 남은 확인은 `contract-closeout-20260914.md`를 따른다. 중앙 원본이 없거나 주문·그룹 연결 근거가 불완전한 과거 맥주·아메리카노·양파 기록의 임의 재생성은 계약상 행동 데이터 연속성에 포함되지 않는 과거 데이터 백필이며 `feedback-20260911-csv-review.md`에서 별도 추적한다. 현재 계약 파일은 협의용 초안이므로 서명된 최종본이나 명시적으로 합의한 변경서가 제공되면 다시 대조한다.
+최종 확인 항목은 `closeout-verification-20260926.md`에 있다. 고객의 실제 기기·원래 브라우저 관리키로 수행하는 운영 검수, 관리자 인증, 실물 모바일 공유, 권한·비밀값 수령 확인은 자동검증과 별개이다. 고객의 수신 감사 회신만으로 최종 검수 승인을 판단하지 않는다.
+
+중앙 원본이나 주문·그룹 연결 근거가 불완전한 과거 기록을 임의 재생성하지 않는다. 계정 기반 권한 복구 등 신규 기능은 현 계약과 구분한다. 현재 계약 파일은 협의용 초안이므로 서명된 최종본 또는 명시적으로 합의한 변경서가 제공되면 우선한다.
