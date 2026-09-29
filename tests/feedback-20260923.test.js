@@ -32,7 +32,8 @@ test('내 주문은 목록이 어느 로그인 번호의 것인지 표시한다'
 
 test('서버가 없는 상품으로 거절한 예시 상품 주문만 체험용으로 안내한다', () => {
   assert.match(appSource, /const SAMPLE_DEAL_IDS = new Set\(\[\.\.\.sampleDeals, \.\.\.sampleCommunityGroups\]\.map\(\(deal\) => deal\.id\)\);/);
-  assert.match(appSource, /&& rawSyncIssue\?\.state === 'failed' && rawSyncIssue\?\.code === 'deal_not_found';/);
+  assert.match(appSource, /&& issue\?\.state === 'failed' && issue\?\.code === 'deal_not_found';/);
+  assert.match(appSource, /const sampleOrder = isLocalOnlySampleOrder\(order, orderSyncIssues\);/);
   assert.match(appSource, /const syncIssue = sampleOrder \? null : rawSyncIssue;/);
   assert.match(appSource, /체험용 예시 상품/);
 });

@@ -52,7 +52,7 @@ test('the admin credential round trip may outlast the shared upstream default wi
 test('a slow history read is awaited instead of being reported as unverified', () => {
   assert.equal(CUSTOMER_HISTORY_TIMEOUT_MS, 55000);
   assert.match(customerOrdersSource, /const HISTORY_READ_TIMEOUT_MS = 50000;/);
-  assert.match(customerOrdersSource, /\.\.\.\(body\.action === 'list' \? \{ timeoutMs: HISTORY_READ_TIMEOUT_MS \} : \{\}\)/);
+  assert.match(customerOrdersSource, /\.\.\.\(body\.action === 'customer_orders' \? \{ timeoutMs: HISTORY_READ_TIMEOUT_MS \} : \{\}\)/);
   assert.equal(CUSTOMER_HISTORY_TIMEOUT_MS > 50000, true,
     'the browser must outlast the central read it asked for');
 });
@@ -62,7 +62,7 @@ test('the history screen resolves on the read, not on the publish backlog', () =
   // screen still said “이력 확인 중”, even though the history was already known.
   assert.match(
     appSource,
-    /setCustomerHistoryState\(\{ scope: profilePhone, status: historyReadFailed \? 'error' : 'ready' \}\);\s*\n\s*const centralById = new Map/,
+    /setCustomerHistoryState\(\{\s*scope: profilePhone,\s*status: historyReadFailed \? 'error' : 'ready',\s*centralCount: historyReadFailed \? null : centralOrders\.length,\s*\}\);\s*\n\s*const centralById = new Map/,
   );
 });
 

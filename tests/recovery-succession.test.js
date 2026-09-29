@@ -413,6 +413,54 @@ test('승계로 인가된 쓰기는 저장된 소유 표시를 바꾸지 않는�
   assert.match(source, /시트 행을 절대 다시 쓰지 않는다|주문 행은 절대 다시 쓰지 않는다|다시 쓰지 않는다/);
 });
 
+test('승계로 인가된 쓰기 뒤에도 주문이 옛 키와 새 키 양쪽에서 계속 보인다', () => {
+  // 9/29 재현: 되살린 기기에서 옛 주문의 픽업 확인·취소·입금확인요청을 저장하면
+  // 스냅샷만 새 키 해시로 기록되어 같은 주문의 소유 해시가 둘이 되고, 조회가
+  // 충돌로 판정해 두 키 모두에서 그 주문을 숨겼다. 이벤트 로그는 추가 전용이다.
+  const OWNER = 'e'.repeat(64);
+  const SUCCESSOR = 'f'.repeat(64);
+  const built = storeWithRecovery();
+  const { context, data } = built;
+  const row = {
+    id: 'order-1700000000777', dealId: 'deal-succession', customerPhone: PHONE, type: 'purchase',
+    status: 'pickup_waiting', paymentStatus: 'confirmed', quantity: 1, selectedCount: 1,
+    version: 2, paymentVersion: 2, visitorId: 'member-test', total: 1000, _customerCapabilityHash: OWNER,
+  };
+  data.customerOrders.rows.push(['', row.id, PHONE, JSON.stringify(row)]);
+  data.recovery.rows.push(['2026-09-23T00:00:00Z', '2026-09-23T00:00:00Z', 'identity-key',
+    JSON.stringify({ algorithm: 'scrypt-v1' }), OWNER, SUCCESSOR, JSON.stringify([row.id]), '[]', '[]',
+    'member-test', 2, 'mutation-0000001']);
+  context.invalidateRecoveryRows_?.();
+  const visible = (hash) => {
+    const result = context.getCustomerOrdersResponse_(PHONE, 'member-test', hash);
+    assert.equal(result.ok, true, result.error);
+    return Array.from(result.orders || [], (order) => order.id);
+  };
+  assert.deepEqual(visible(SUCCESSOR), [row.id]);
+  assert.deepEqual(visible(OWNER), [row.id]);
+
+  const eventsBefore = data.events.rows.length;
+  const update = {
+    ...row,
+    customerPickupConfirmedAt: '2026-09-24T00:00:00Z',
+    version: 3,
+    paymentVersion: 3,
+    statusHistory: [{ status: 'new', actor: 'customer', timestamp: '2026-09-24T00:00:00Z', clientMutationId: 'pickup-000001' }],
+  };
+  delete update._customerCapabilityHash;
+  const response = context.publishCustomerOrder_(update, 'member-test', SUCCESSOR, '');
+  const published = JSON.parse(response.getContent ? response.getContent() : JSON.stringify(response));
+  assert.equal(published.ok, true, published.error);
+  assert.equal(published.snapshotCapabilityHash, OWNER, '웹의 보조 기록도 같은 소유 해시를 써야 한다');
+
+  const snapshots = data.events.rows.slice(eventsBefore).filter((event) => event[6] === 'customer_order_snapshot');
+  assert.equal(snapshots.length, 1);
+  assert.equal(JSON.parse(JSON.parse(snapshots[0][11]).order_snapshot)._customerCapabilityHash, OWNER);
+  context.invalidateRecoveryRows_?.();
+  assert.deepEqual(visible(SUCCESSOR), [row.id]);
+  assert.deepEqual(visible(OWNER), [row.id]);
+});
+
 test('미끼 검증자가 실제 등록과 구분되지 않는다', () => {
   const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
   // 같은 씨앗을 재사용하면 salt 가 ref 의 앞부분과 같고 hash 가 같은 값의

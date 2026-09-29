@@ -10,7 +10,7 @@ const HASH = createHash('sha256').update(TOKEN).digest('hex');
 const OLD_ID = 'order-1234567890701';
 const NEW_ID = 'order-1234567890702';
 
-async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked = false, repairRequired = false, recovery = null, localOrders = [] } = {}) {
+async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked = false, repairRequired = false, recovery = null, localOrders = [], token = TOKEN } = {}) {
   const fixture = customerHistoryStore({
     current: [historyOrder('1234567890702', { title: '새로 만든 합성 주문', _customerCapabilityHash: HASH }),
       historyOrder('1234567890703', { title: '다른 키의 주문', _customerCapabilityHash: 'b'.repeat(64) }),
@@ -51,7 +51,7 @@ async function setup(page, { failReads = false, holdFirst = false, onlyUnlinked 
     sessionStorage.setItem('o2o_mvp_active_app_session_v1', JSON.stringify({
       profileKey: '사용자:01011112222', startedAt: Date.now(),
     }));
-  }, { token: TOKEN, localOrders });
+  }, { token, localOrders });
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     const body = route.request().postDataJSON() || {};
@@ -264,6 +264,25 @@ test('내 주문은 로그인 번호를 밝히고, 서버가 거절한 예시 �
     await expect(page.getByText('조회 가능한 주문 이력을 확인했습니다.', { exact: true })).toBeVisible();
     // One rejected attempt, and the terminal rejection is not replayed.
     expect(f.state.writes.filter((body) => body.order?.id === sample.id)).toHaveLength(1);
+  } finally { await f.close(); }
+});
+
+test('다른 저장 공간의 키로 서버에서 0건이면 예시 주문이 있어도 이력을 확인했다고 말하지 않는다', async ({ page }) => {
+  // 9/28 노트북: 예전에 주문하던 창과 다른 Chrome 저장 공간이라 서버 결과가 0건이었는데,
+  // 체험용 예시 주문 때문에 목록이 비지 않아 "조회 가능한 주문 이력을 확인했습니다"가 떴다.
+  const sample = { ...historyOrder('1234567890798', { title: '아메리카노 10잔 번들' }),
+    dealId: 'deal-cafe', customerPhone: '01011112222', visitorId: 'customer-history-visitor', groupId: '' };
+  delete sample._customerCapabilityHash;
+  const f = await setup(page, { localOrders: [sample], token: 'synthetic-customer-history-other-browser-capability-9' });
+  try {
+    await page.goto('/customer');
+    await openOrders(page);
+    const card = page.locator('.order-card').filter({ hasText: '아메리카노 10잔 번들' });
+    await expect(card).toContainText('체험용 예시 상품');
+    await expect(page.locator('.customer-history-notice'))
+      .toContainText('서버에서 이 브라우저의 주문 확인 키와 로그인 번호로 찾은 주문이 없습니다.');
+    await expect(page.getByText('조회 가능한 주문 이력을 확인했습니다.', { exact: true })).toHaveCount(0);
+    await expect(page.locator('.order-card')).toHaveCount(1);
   } finally { await f.close(); }
 });
 

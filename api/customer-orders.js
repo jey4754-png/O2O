@@ -371,7 +371,9 @@ async function directCollector(body) {
     // first read then completes and fills the collector-side cache that keeps
     // later reads short. Mutations keep the shared default so an unknown write
     // outcome stays short.
-    ...(body.action === 'list' ? { timeoutMs: HISTORY_READ_TIMEOUT_MS } : {}),
+    // The history read reaches the collector as `customer_orders`; checking for
+    // 'list' never matched, so every read fell back to the short default.
+    ...(body.action === 'customer_orders' ? { timeoutMs: HISTORY_READ_TIMEOUT_MS } : {}),
   });
   if (!upstream.ok || !result.ok) throw new Error(result.error || 'collector_failed');
   return result;
@@ -386,6 +388,9 @@ async function dataApiRequest(body) {
       ...(token ? { 'x-o2o-service-token': token } : {}),
     },
     body: JSON.stringify(body),
+    // The proxied deployment waits up to HISTORY_READ_TIMEOUT_MS for a history
+    // read; giving up earlier here would bring back the upstream_timeout.
+    ...(body.action === 'list' ? { timeoutMs: HISTORY_READ_TIMEOUT_MS } : {}),
   });
   if (!proxied) return null;
   if (!proxied.upstream.ok || !proxied.result.ok) {
@@ -453,8 +458,14 @@ async function publishOrder(order, proof, participantCapabilityHash = '', allowP
   const published = sanitizeOrder(result.order || order);
   if (!published) throw new Error('invalid_published_order');
   if (result.legacyEventStored !== true) {
+    // Use the owner hash the collector kept on the order row. Under succession it
+    // differs from the caller's key, and a snapshot tagged with the caller's key
+    // would hide the order from both keys.
+    const snapshotHash = CAPABILITY_HASH_PATTERN.test(String(result.snapshotCapabilityHash || ''))
+      ? result.snapshotCapabilityHash
+      : proof.customerCapabilityHash;
     try {
-      await publishLegacyOrderEvent(published, proof.customerCapabilityHash);
+      await publishLegacyOrderEvent(published, snapshotHash);
     } catch {
       // The canonical order is already durable; legacy analytics must not turn it into a failed checkout.
     }

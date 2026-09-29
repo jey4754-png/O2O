@@ -389,6 +389,13 @@ let memoryCustomerOrderCapability = '';
 // that order can never be delivered and must not be reported as a failure the
 // customer should chase.
 const SAMPLE_DEAL_IDS = new Set([...sampleDeals, ...sampleCommunityGroups].map((deal) => deal.id));
+// Only the server's own answer marks an order as an example-listing order:
+// some example groups can exist centrally and sync normally.
+function isLocalOnlySampleOrder(order, orderSyncIssues = {}) {
+  const issue = orderSyncIssues[order.id];
+  return SAMPLE_DEAL_IDS.has(String(order.dealId || ''))
+    && issue?.state === 'failed' && issue?.code === 'deal_not_found';
+}
 let customerOrderCapabilityState = { created: false, persisted: true, lostKey: false };
 const visibleEventDefinitions = eventDefinitions.filter((event) => isEventVisibleInRelease(event.name));
 const DEFAULT_LOCATION = {
@@ -2599,7 +2606,11 @@ function App() {
         // queued rows happens afterwards and can take a while on a busy
         // collector, so resolving only at the end left “이력 확인 중” on screen
         // for minutes even though the history was already known.
-        setCustomerHistoryState({ scope: profilePhone, status: historyReadFailed ? 'error' : 'ready' });
+        setCustomerHistoryState({
+          scope: profilePhone,
+          status: historyReadFailed ? 'error' : 'ready',
+          centralCount: historyReadFailed ? null : centralOrders.length,
+        });
         const centralById = new Map(centralOrders.map((order) => [order.id, order]));
         const recoverableOrderIds = new Set(
           listRecoverableCheckoutAttempts().map((attempt) => attempt.orderId),
@@ -2853,7 +2864,14 @@ function App() {
           saveJson(CUSTOMER_ORDERS_KEY, merged);
           return JSON.stringify(merged) === JSON.stringify(current) ? current : merged;
         });
-        setCustomerHistoryState({ scope: profilePhone, status: historyReadFailed ? 'error' : 'ready' });
+        setCustomerHistoryState({
+          scope: profilePhone,
+          status: historyReadFailed ? 'error' : 'ready',
+          centralCount: historyReadFailed ? null : new Set([
+            ...acceptedCentralOrders,
+            ...published.filter(Boolean),
+          ].map((order) => order.id)).size,
+        });
       } catch {
         if (isCurrent()) setCustomerHistoryState({ scope: profilePhone, status: 'error' });
       } finally {
@@ -4290,6 +4308,7 @@ function App() {
                 orders={orders}
                 orderSyncIssues={orderSyncIssues}
                 historyStatus={customerHistoryState.scope === customerHistoryScope ? customerHistoryState.status : 'loading'}
+                historyCentralCount={customerHistoryState.scope === customerHistoryScope ? customerHistoryState.centralCount ?? null : null}
                 onRetryHistory={retryCustomerHistory}
                 favoriteIds={favoriteIds}
                 hostDealIds={hostDealIds}
@@ -4520,6 +4539,7 @@ function CustomerApp({
   orders,
   orderSyncIssues = {},
   historyStatus = 'ready',
+  historyCentralCount = null,
   onRetryHistory,
   favoriteIds,
   hostDealIds,
@@ -4800,6 +4820,7 @@ function CustomerApp({
         orders={customerOrders}
         orderSyncIssues={orderSyncIssues}
         historyStatus={historyStatus}
+        historyCentralCount={historyCentralCount}
         onRetryHistory={onRetryHistory}
         deals={deals}
         onSelectDeal={onSelectDeal}
@@ -5471,7 +5492,7 @@ function ExploreTab({ deals, hostDealIds, unreadCounts = {}, statusNotices = {},
   );
 }
 
-function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount = 0 }) {
+function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount = 0, noServerOrders = false }) {
   // A key minted in this browser cannot authorize anything ordered earlier, so
   // an empty list is not a confirmed history. Saying otherwise made a lost
   // ownership key look like deleted orders.
@@ -5494,7 +5515,12 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
     <div className={`customer-history-notice${status === 'error' || freshKey || !capability.persisted ? ' has-error' : ''}`} aria-live="polite">
       {status === 'loading' ? <p role="status">이전 주문·참여 이력을 확인하고 있습니다.</p>
         : status === 'error' ? <p role="alert">이전 이력을 불러오지 못했습니다. 현재 표시된 목록은 유지되며, 이전 주문이 없는 것으로 확정된 것은 아닙니다.</p>
-          : <p>조회 가능한 주문 이력을 확인했습니다.</p>}
+          // A read that found nothing is not a confirmed history: sample orders and
+          // copies kept only in this browser still fill the list, so saying the
+          // history was confirmed hid that the server had nothing for this key.
+          : noServerOrders
+            ? <p>서버에서 이 브라우저의 주문 확인 키와 로그인 번호로 찾은 주문이 없습니다. 체험용 예시 주문이나 이 기기에만 남은 기록은 다른 기기에서 보이지 않습니다. 다른 브라우저나 Chrome 프로필에서 주문했다면 그 창에서 확인해 주세요.</p>
+            : <p>조회 가능한 주문 이력을 확인했습니다.</p>}
       {inAppBrowser && (
         <p className="customer-history-inapp" role="note">
           카카오톡 안에서 열린 화면입니다. 이 화면은 사이트 저장 공간이 자주 비워져 주문 확인 키와 로그인이 사라질 수 있습니다. 오른쪽 아래 메뉴의 “다른 브라우저로 열기”로 Safari·Chrome에서 사용해 주세요.
@@ -5738,7 +5764,7 @@ function CustomerRecoveryCode({ autoReveal = false }) {
   );
 }
 
-function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRetryHistory, deals, onSelectDeal, onOpenOrderRoom, onConfirmPickup, onCancelParticipation, onScreen }) {
+function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', historyCentralCount = null, onRetryHistory, deals, onSelectDeal, onOpenOrderRoom, onConfirmPickup, onCancelParticipation, onScreen }) {
   useScreenAnalytics('customer_orders', { order_count: orders.length });
   const dealById = new Map(deals.map((deal) => [deal.id, deal]));
   const [cancellingId, setCancellingId] = useState('');
@@ -5799,7 +5825,16 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
         <ShoppingBag size={22} />
       </header>
 
-      <CustomerHistoryNotice status={historyStatus} onRetry={onRetryHistory} emptyList={orders.length === 0} orderCount={orders.length} />
+      <CustomerHistoryNotice
+        status={historyStatus}
+        onRetry={onRetryHistory}
+        emptyList={orders.length === 0}
+        orderCount={orders.length}
+        // The last read's count can predate an order placed since, so only claim
+        // the server found nothing when everything listed is an example order
+        // the server itself rejected.
+        noServerOrders={historyCentralCount === 0 && orders.every((order) => isLocalOnlySampleOrder(order, orderSyncIssues))}
+      />
       {orders.length === 0 && historyStatus === 'ready' && !getCustomerOrderCapabilityState().lostKey ? (
         <EmptyCustomerState
           icon={ShoppingBag}
@@ -5813,10 +5848,7 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
           {orders.map((order) => {
             const deal = resolveOrderLinkedDeal(order, dealById.get(order.dealId));
             const rawSyncIssue = orderSyncIssues[order.id] || null;
-            // Only the server's own answer marks an order as an example-listing
-            // order: some example groups can exist centrally and sync normally.
-            const sampleOrder = SAMPLE_DEAL_IDS.has(String(order.dealId || ''))
-              && rawSyncIssue?.state === 'failed' && rawSyncIssue?.code === 'deal_not_found';
+            const sampleOrder = isLocalOnlySampleOrder(order, orderSyncIssues);
             const syncIssue = sampleOrder ? null : rawSyncIssue;
             const cancelled = isCancelledOrder(order);
             const orderStage = getOrderStage(order);

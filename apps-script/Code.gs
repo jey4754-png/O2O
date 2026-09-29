@@ -2943,7 +2943,7 @@ function normalizePhone_(value) {
 }
 
 // Sheets stores an all-digit string written by setValues/appendRow as a number
-// unless the cell is text-formatted, so 01037474754 comes back as 1037474754.
+// unless the cell is text-formatted, so 01012345678 comes back as 1012345678.
 // The 주문 내역 phone column was never text-formatted and the event sheet's
 // format covered only the rows that existed when it was applied, so every
 // phone-scoped history read silently dropped those rows (found 2026-09-24:
@@ -3686,12 +3686,18 @@ function publishCustomerOrder_(
     sheet.getRange(targetRow, 1, 1, CUSTOMER_ORDER_HEADERS.length).setValues([[
       new Date(), safeCell_(storedOrder.id), safeCell_(phone), serialized
     ]]);
+    // The snapshot must carry the same owner hash as the order row. Under
+    // succession the row keeps the original owner's hash; tagging the snapshot
+    // with the successor's hash gave one order two owners, which the history
+    // read treats as a conflict and hides from both keys. The event log is
+    // append-only, so that loss could not be undone.
+    const snapshotCapabilityHash = String(storedOrder._customerCapabilityHash || incomingHash).toLowerCase();
     let legacyEventStored = false;
     try {
       legacyEventStored = appendCustomerOrderSnapshotEvent_(
         sheets.events,
         storedOrder,
-        incomingHash
+        snapshotCapabilityHash
       );
     } catch (error) {}
     invalidatePublicDealsCache_();
@@ -3701,7 +3707,8 @@ function publishCustomerOrder_(
     return json_({
       ok: true,
       order: publicOrderValue_(storedOrder),
-      legacyEventStored: legacyEventStored
+      legacyEventStored: legacyEventStored,
+      snapshotCapabilityHash: snapshotCapabilityHash
     });
   } catch (error) {
     return json_({ ok: false, error: error.code || 'customer_order_publish_failed' });
