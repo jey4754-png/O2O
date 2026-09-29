@@ -159,6 +159,7 @@ function historyValue(item, value) {
 export default function GroupRoom({
   deal,
   profile,
+  participantActorId = '',
   adminMode = false,
   initialAdminPin = '',
   isCreator = false,
@@ -176,7 +177,7 @@ export default function GroupRoom({
 }) {
   useScreenAnalytics('group_room', { group_id: deal.id, deal_id: deal.id, admin_mode: adminMode });
   const visitorId = getVisitorId();
-  const actorId = adminMode ? `${visitorId}_admin` : visitorId;
+  const actorId = adminMode ? `${visitorId}_admin` : (participantActorId || visitorId);
   const [credential, setCredential] = useState(() => getGroupCredential(deal.id, actorId));
   const [snapshot, setSnapshot] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -263,10 +264,10 @@ export default function GroupRoom({
   const activeOrder = useMemo(() => orders.find((order) => (
     order.type === 'purchase'
     && String(order.groupId || '') === String(deal.groupId || deal.id)
-    && String(order.visitorId || '') === String(visitorId)
+    && String(order.participantActorId || order.visitorId || '') === String(actorId)
     && order.status !== 'cancelled'
     && order.paymentStatus !== 'cancelled'
-  )) || null, [deal.groupId, deal.id, orders, visitorId]);
+  )) || null, [deal.groupId, deal.id, orders, actorId]);
   const canReleaseHost = !adminMode && groupStatus === 'recruiting'
     && role === 'host' && group?.hostMode === 'recruiting' && group?.hostActorId === actorId
     && (currentParticipant?.paymentStatus || 'pending') === 'pending';

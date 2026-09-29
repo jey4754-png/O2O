@@ -104,6 +104,7 @@ import {
   shouldKeepOwnerPreview,
   shouldNavigateAfterDealDelete,
 } from './customerUi';
+import { resolveOrderRoomAccess } from './orderRoomAccess';
 import {
   assertCustomerMutationAllowed,
   customerCanOpenGroupRoom,
@@ -4144,10 +4145,19 @@ function App() {
 
   const ensurePaymentOrderSaved = async (groupId, actorId) => {
     const profilePhone = normalizePhone(profile?.phone);
+    const requestVisitorId = getVisitorId();
     const assertSameCustomer = () => {
       assertCurrentCustomerMutationAllowed();
       if (!profilePhone || customerHistoryScopeRef.current !== profilePhone
-        || actorId !== getVisitorId()) throw new Error('forbidden');
+        || requestVisitorId !== getVisitorId()) throw new Error('forbidden');
+      // A restored order retains its original participant identity. Require
+      // that exact active order and saved room key before using the old seat;
+      // the server still validates the capability and the order binding.
+      if (actorId !== requestVisitorId && !loadOrders().some((order) => (
+        isOrderForProfile(order, profile, requestVisitorId)
+        && resolveOrderRoomAccess(order, null, getGroupCredential)?.groupId === groupId
+        && (order.participantActorId || order.visitorId) === actorId
+      ))) throw new Error('forbidden');
     };
     assertSameCustomer();
     await ensureGroupPaymentOrderSaved({
@@ -4290,10 +4300,10 @@ function App() {
                 unreadCounts={unreadCounts}
                 statusNotices={{ ...statusNotices, ...paymentNotices }}
                 onProfileSubmit={handleProfileSubmit}
-                onSelectDeal={(deal) => {
+                onSelectDeal={(deal, { screen = 'detail' } = {}) => {
                   acknowledgeGroupStatus(deal);
                   setSelectedDeal(deal);
-                  navigateCustomerScreen('detail');
+                  navigateCustomerScreen(screen);
                   track('open_listing', {
                     deal_id: deal.id,
                     category: deal.category,
@@ -4543,10 +4553,14 @@ function CustomerApp({
   const [completionMessage, setCompletionMessage] = useState('');
   const [adminConsolePin, setAdminConsolePin] = useState('');
   const [adminManagement, setAdminManagement] = useState(adminMode);
+  const [orderRoomAccess, setOrderRoomAccess] = useState(null);
   const accessOptions = { adminMode, readOnly };
   const visitorId = profile ? getVisitorId() : '';
+  const selectedRoomActorId = !adminMode && orderRoomAccess?.groupId === selectedDeal?.id
+    && orderRoomAccess.visitorId === visitorId && orderRoomAccess.phone === profile?.phone
+    ? orderRoomAccess.actorId : visitorId;
   const selectedGroupCredential = visitorId && selectedDeal?.id
-    ? getGroupCredential(selectedDeal.id, visitorId)
+    ? getGroupCredential(selectedDeal.id, selectedRoomActorId)
     : null;
   const selectedGroupOwnerCapability = selectedDeal?.source === 'customer'
     && editableDealIds.includes(selectedDeal.id)
@@ -4644,6 +4658,7 @@ function CustomerApp({
         onHostApply={onHostApply}
         editable={editableDealIds.includes(selectedDeal.id)}
         canRepairLegacyGroup={selectedGroupCanRestore}
+        roomCredential={selectedGroupCredential}
         onUpdateDeal={onUpdateDeal}
         onUpdateTarget={onUpdateTarget}
         onDeleteDeal={async (deal) => {
@@ -4666,6 +4681,7 @@ function CustomerApp({
         <GroupRoom
           deal={selectedDeal}
           profile={profile}
+          participantActorId={selectedRoomActorId}
           adminMode={adminMode}
           initialAdminPin={adminConsolePin}
           isCreator={selectedGroupIsLocalCreator}
@@ -4787,6 +4803,13 @@ function CustomerApp({
         onRetryHistory={onRetryHistory}
         deals={deals}
         onSelectDeal={onSelectDeal}
+        onOpenOrderRoom={(order, deal) => {
+          const access = resolveOrderRoomAccess(order, deal, getGroupCredential);
+          if (!access) return false;
+          setOrderRoomAccess({ ...access, visitorId, phone: profile?.phone });
+          onSelectDeal({ ...deal, id: access.groupId, groupId: access.groupId }, { screen: 'room' });
+          return true;
+        }}
         onConfirmPickup={onConfirmPickup}
         onCancelParticipation={onCancelParticipation}
         onScreen={navigateCustomer}
@@ -5715,13 +5738,14 @@ function CustomerRecoveryCode({ autoReveal = false }) {
   );
 }
 
-function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRetryHistory, deals, onSelectDeal, onConfirmPickup, onCancelParticipation, onScreen }) {
+function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRetryHistory, deals, onSelectDeal, onOpenOrderRoom, onConfirmPickup, onCancelParticipation, onScreen }) {
   useScreenAnalytics('customer_orders', { order_count: orders.length });
   const dealById = new Map(deals.map((deal) => [deal.id, deal]));
   const [cancellingId, setCancellingId] = useState('');
   const [cancelError, setCancelError] = useState(null);
   const [confirmingPickupId, setConfirmingPickupId] = useState('');
   const [pickupError, setPickupError] = useState(null);
+  const [roomErrorId, setRoomErrorId] = useState('');
 
   const handlePickupConfirmation = async (order) => {
     if (confirmingPickupId) return;
@@ -5914,13 +5938,17 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', onRe
                     <button
                       className="secondary-button compact-button room-entry-button"
                       onClick={() => {
-                        onSelectDeal(deal);
-                        onScreen('room');
+                        setRoomErrorId(onOpenOrderRoom(order, deal) ? '' : order.id);
                       }}
                     >
                       <MessageCircle size={15} />
                       그룹 채팅
                     </button>
+                  )}
+                  {roomErrorId === order.id && (
+                    <p className="form-error" role="alert">
+                      이 주문의 기존 채팅 권한을 확인하지 못했습니다. 다시 참여하지 마세요. 주문했던 브라우저에서 확인하거나 운영자에게 주문의 채팅 연결 점검을 요청해 주세요.
+                    </p>
                   )}
                   {canCancel && (
                     <button
@@ -6080,6 +6108,7 @@ function DealDetail({
   onHostApply,
   editable = false,
   canRepairLegacyGroup = false,
+  roomCredential = null,
   onUpdateDeal,
   onUpdateTarget,
   onDeleteDeal,
@@ -6145,7 +6174,7 @@ function DealDetail({
   const merchantPurchaseClosed = dealQuantity.remaining <= 0
     || (isMerchantGroup && !recruitmentOpen);
   const existingGroupCredential = isGroupDeal
-    ? getGroupCredential(deal.id, getVisitorId())
+    ? (roomCredential || getGroupCredential(deal.id, getVisitorId()))
     : null;
   const canOpenGroupRoom = customerCanOpenGroupRoom({
     adminMode,
