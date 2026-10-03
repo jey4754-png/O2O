@@ -5546,12 +5546,15 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
         <p role="status">{`주문 ${recovered.bound?.orders || 0}건·그룹 ${recovered.bound?.groups || 0}개·상품 ${recovered.bound?.deals || 0}개를 이 브라우저에 다시 연결했습니다. 목록을 새로 불러옵니다.`}</p>
       )}
       {showRecovery && <CustomerRecoveryRedeem onRecovered={(result) => { setRecovered(result); onRetry?.(); }} />}
-      {!emptyList && status === 'ready' && <CustomerRecoveryEnroll orderCount={orderCount} />}
       <details open={showRecovery}>
         <summary>이전 주문이 보이지 않나요?</summary>
         <p>이 브라우저와 현재 프로필에서 조회 권한이 확인된 이력만 표시합니다. 주문했던 같은 브라우저와 전화번호인지 확인해 주세요. 이전 주문의 권한키가 없거나 연결되지 않은 기록은 여기서 자동 복구할 수 없습니다. 브라우저 데이터를 지우지 말고 관리자에게 해당 주문 확인을 요청해 주세요.</p>
+        {/* A recent order does not prove this browser can read older orders.
+            Keep the existing restore path reachable without deleting that order. */}
+        {!showRecovery && status === 'ready' && <CustomerRecoveryRedeem onRecovered={(result) => { setRecovered(result); onRetry?.(); }} />}
         <CustomerRecoveryCode autoReveal={showRecovery} />
       </details>
+      {!emptyList && status === 'ready' && <CustomerRecoveryEnroll orderCount={orderCount} />}
     </div>
   );
 }
@@ -5627,6 +5630,7 @@ function CustomerRecoveryEnroll({ orderCount }) {
     <details className="customer-recovery" open={open} onToggle={(event) => setOpen(event.target.open)}>
       <summary>{summary}</summary>
       <p><strong>확인번호는 전화번호나 관리자 PIN이 아니라, 여기서 새로 정하는 숫자입니다.</strong> 전화번호 {phone}와 지금 정하는 확인번호로, 이 브라우저에서 확인된 주문·그룹·상품을 묶어 둡니다. 나중에 다른 기기나 비워진 브라우저에서 같은 전화번호로 로그인하고 확인번호를 넣으면 그대로 되살아납니다. 확인번호는 서버에 원문으로 저장되지 않으니 잊지 않게 적어 두세요.</p>
+      <p>등록은 현재 연결된 기록을 보관하는 절차입니다. 보이지 않는 이전 주문을 불러오려면 “이전 주문이 보이지 않나요?”에서 원래 주문이 있던 기기에 등록한 확인번호를 사용해 주세요.</p>
       <form className="form-stack compact-form" onSubmit={submit}>
         <label>확인번호 (숫자 6~12자리)
           <input {...recoveryPinInput({ 'aria-label': '확인번호', value: pin, disabled: busy,
@@ -5724,6 +5728,7 @@ function CustomerRecoveryRedeem({ onRecovered }) {
   return (
     <form className="form-stack compact-form customer-recovery" onSubmit={submit}>
       <p><strong>확인번호를 등록해 두셨나요?</strong> 전화번호 {phone}로 등록할 때 <strong>새로 정한 숫자</strong>(전화번호·관리자 PIN 아님)를 넣으면 그때 묶어 둔 주문·그룹·상품을 이 브라우저로 바로 되살립니다. 등록한 기기의 내 주문 화면에서 등록한 자리 수를 확인할 수 있습니다.</p>
+      <p>이 브라우저의 기존 주문은 유지됩니다. 같은 확인번호로 다른 기기에 되살린 적이 있다면, 그 기기에 연결했던 복구 권한은 이 브라우저로 옮겨집니다. 여러 기기에 동시에 복사하는 기능은 아닙니다.</p>
       <label>확인번호
         <input {...recoveryPinInput({ 'aria-label': '복구 확인번호', value: pin, disabled: busy,
           onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) }, visible)} />

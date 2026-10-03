@@ -53,8 +53,18 @@ async function viaHandler(handler, route, fixture) {
   }
 }
 
-test('확인번호로 되살리면 새 브라우저의 내 주문에 노트북 주문이 뜬다', async ({ page }) => {
+for (const partial of [false, true]) {
+test(partial ? '일부 주문이 있는 기기도 이전 주문을 복구하고 기존 주문과 키를 보존한다' : '확인번호로 되살리면 새 브라우저의 내 주문에 노트북 주문이 뜬다', async ({ page, browserName }, testInfo) => {
+  if (partial && browserName === 'chromium') await page.setViewportSize({ width: 1366, height: 900 });
   const fixture = store();
+  const destinationToken = 'destination-customer-capability-token-00000001';
+  const destinationHash = createHash('sha256').update(destinationToken).digest('hex');
+  if (partial) {
+    const current = historyOrder('1234567890810', { title: '현재 PC에서 넣은 주문', _customerCapabilityHash: destinationHash });
+    fixture.currentRows.push(['', current.id, PHONE, JSON.stringify(current)]);
+    const unrelated = historyOrder('1234567890811', { title: '같은 번호의 미승인 주문', _customerCapabilityHash: 'c'.repeat(64) });
+    fixture.currentRows.push(['', unrelated.id, PHONE, JSON.stringify(unrelated)]);
+  }
   const keys = ['O2O_DATA_API_ORIGIN', 'O2O_DATA_API_TOKEN', 'GOOGLE_SHEETS_COLLECTOR_URL', 'GOOGLE_SHEETS_COLLECTOR_TOKEN'];
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   Object.assign(process.env, { O2O_DATA_API_ORIGIN: '', O2O_DATA_API_TOKEN: '',
@@ -73,13 +83,14 @@ test('확인번호로 되살리면 새 브라우저의 내 주문에 노트북 �
     expect(enroll.statusCode, JSON.stringify(enroll.body)).toBe(200);
     expect(enroll.body.bound.orders).toBe(3);
 
-    await page.addInitScript(() => {
+    await page.addInitScript(({ partial, destinationToken }) => {
       if (localStorage.getItem('restore-test-seeded')) return;
       localStorage.setItem('restore-test-seeded', 'yes');
+      if (partial) localStorage.setItem('o2o_mvp_customer_order_capability_v1', destinationToken);
       localStorage.setItem('o2o_mvp_profile', JSON.stringify({ name: '새 브라우저', phone: '010-1111-2222',
         testerType: '사용자', consent: true, region: '경기도', district: '성남시 분당구', neighborhood: '판교동' }));
       sessionStorage.setItem('o2o_mvp_active_app_session_v1', JSON.stringify({ profileKey: '사용자:01011112222', startedAt: Date.now() }));
-    });
+    }, { partial, destinationToken });
     const reads = [];
     await page.route('**/api/**', async (route) => {
       const path = new URL(route.request().url()).pathname;
@@ -94,16 +105,36 @@ test('확인번호로 되살리면 새 브라우저의 내 주문에 노트북 �
     });
     await page.goto('/customer');
     await page.locator('.bottom-nav').getByRole('button', { name: '내 주문', exact: true }).click();
-    await expect(page.getByRole('heading', { name: '조회 가능한 참여 내역이 없습니다' })).toBeVisible();
+    if (partial) {
+      await expect(page.locator('.order-card')).toHaveCount(1);
+      await page.getByText('이전 주문이 보이지 않나요?', { exact: true }).click();
+      await page.getByLabel('복구 확인번호').fill('927361');
+      await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
+      await expect(page.getByRole('alert').filter({ hasText: '방금 넣은 숫자는' })).toBeVisible();
+      await expect(page.locator('.order-card')).toHaveCount(1);
+      expect(await page.evaluate(() => localStorage.getItem('o2o_mvp_customer_order_capability_v1'))).toBe(destinationToken);
+    } else {
+      await expect(page.getByRole('heading', { name: '조회 가능한 참여 내역이 없습니다' })).toBeVisible();
+    }
     await page.getByLabel('복구 확인번호').fill(PIN);
     await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
     await expect(page.getByRole('status').filter({ hasText: '주문 3건' })).toBeVisible();
-    await expect(page.locator('.order-card')).toHaveCount(3);
+    await expect(page.locator('.order-card')).toHaveCount(partial ? 4 : 3);
     await expect(page.locator('.order-card-list')).toContainText('노트북에서 넣은 경기미');
     await expect(page.locator('.order-card-list')).toContainText('과거 스냅샷 주문');
+    if (partial) {
+      await expect(page.locator('.order-card-list')).toContainText('현재 PC에서 넣은 주문');
+      await expect(page.locator('.order-card-list')).not.toContainText('같은 번호의 미승인 주문');
+      expect(await page.evaluate(() => localStorage.getItem('o2o_mvp_customer_order_capability_v1'))).toBe(destinationToken);
+      await page.reload();
+      await page.locator('.bottom-nav').getByRole('button', { name: '내 주문', exact: true }).click();
+      await expect(page.locator('.order-card')).toHaveCount(4);
+      await page.screenshot({ path: testInfo.outputPath('partial-history-restored.png'), fullPage: true });
+    }
   } finally {
     for (const key of keys) {
       if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key];
     }
   }
 });
+}
