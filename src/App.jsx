@@ -1697,10 +1697,12 @@ function App() {
 
   const acknowledgePayments = (groupId) => {
     const receipt = paymentNoticeReceipts.current[groupId];
-    if (!receipt) return;
-    const seen = loadJson(PAYMENT_NOTICE_SEEN_KEY, {});
-    seen[receipt.key] = receipt.id;
-    saveJson(PAYMENT_NOTICE_SEEN_KEY, seen);
+    if (receipt) {
+      const seen = loadJson(PAYMENT_NOTICE_SEEN_KEY, {});
+      seen[receipt.key] = receipt.id;
+      saveJson(PAYMENT_NOTICE_SEEN_KEY, seen);
+    }
+    delete paymentNoticeReceipts.current[groupId];
     setPaymentNotices((current) => { const next = { ...current }; delete next[groupId]; return next; });
   };
 
@@ -1736,9 +1738,24 @@ function App() {
           if (notice) {
             paymentNoticeReceipts.current[groupId] = { key, id: notice.id };
             setPaymentNotices((current) => current[groupId] === notice.text ? current : { ...current, [groupId]: notice.text });
+          } else {
+            delete paymentNoticeReceipts.current[groupId];
+            setPaymentNotices((current) => {
+              if (!(groupId in current)) return current;
+              const next = { ...current }; delete next[groupId]; return next;
+            });
           }
         } });
-        if (!cancelled) setUnreadCounts(next);
+        if (!cancelled) {
+          setUnreadCounts(next);
+          for (const groupId of Object.keys(paymentNoticeReceipts.current)) {
+            if (!(groupId in next)) delete paymentNoticeReceipts.current[groupId];
+          }
+          setPaymentNotices((current) => {
+            const entries = Object.entries(current).filter(([groupId]) => groupId in next);
+            return entries.length === Object.keys(current).length ? current : Object.fromEntries(entries);
+          });
+        }
       } finally {
         if (transientFailure) {
           retryDelay = Math.min(60000, retryDelay * 2);
@@ -6337,6 +6354,25 @@ function DealDetail({
       setDeleting(false);
     }
   };
+
+  // Authenticated historic orders contain a deliberately compact deal snapshot.
+  // Do not turn missing current product data into a crash or a zero-price order.
+  if (!Array.isArray(deal.menu) || !deal.menu.length || deal.menu.some((item) => !item || typeof item !== 'object')) {
+    return (
+      <section className="screen detail-screen">
+        <header className="top-nav compact">
+          <button className="icon-button" onClick={onBack} aria-label="뒤로"><ArrowLeft size={22} /></button>
+          <h1>공동구매 상세</h1>
+        </header>
+        <div className="content-block">
+          <h2>{deal.title || '이전 공동구매'}</h2>
+          {deal.store && <p>{deal.store}</p>}
+          <p role="status">상품 상세 정보를 현재 불러올 수 없습니다. 기존 주문은 내 주문에서 확인할 수 있습니다. 새로 참여하지 마세요.</p>
+          <button className="secondary-button" onClick={() => onScreen('orders')}>내 주문으로 돌아가기</button>
+        </div>
+      </section>
+    );
+  }
 
   return (
     <section className="screen detail-screen">
