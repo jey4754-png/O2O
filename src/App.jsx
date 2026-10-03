@@ -4157,7 +4157,7 @@ function App() {
   };
 
   const persistCustomerOrderSnapshot = (order) => {
-    if (!order?.id) return;
+    if (!order?.id || !isOrderForProfile(order, getProfile(), getVisitorId())) return;
     setOrders((current) => {
       const next = mergeCustomerOrderCollections(current, [order]);
       saveJson(CUSTOMER_ORDERS_KEY, next);

@@ -776,11 +776,14 @@ export default function GroupRoom({
             }
           } },
         );
-        if (requestRoomRevision !== roomRevisionRef.current || roomIdentityRef.current !== roomIdentity) return result;
         const updatedOrderActorId = String(
           result?.order?.participantActorId || result?.order?.visitorId || '',
         );
+        // The central write may finish after the user leaves the room. Preserve
+        // its authenticated order result in the app collection before checking
+        // the room lifecycle; the app rejects results for a changed profile.
         if (result?.order && updatedOrderActorId === actorId) onOrderUpdate?.(result.order);
+        if (requestRoomRevision !== roomRevisionRef.current || roomIdentityRef.current !== roomIdentity) return result;
         // A payment mutation may update more than one active order for the
         // participant. Refresh the customer collection immediately instead of
         // waiting for the 30-second background poll.
