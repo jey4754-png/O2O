@@ -107,6 +107,20 @@ test(partial ? '일부 주문이 있는 기기도 이전 주문을 복구하고 
     await page.locator('.bottom-nav').getByRole('button', { name: '내 주문', exact: true }).click();
     if (partial) {
       await expect(page.locator('.order-card')).toHaveCount(1);
+      // Simulate a locally visible record whose central ownership is no longer
+      // available. Enrollment must reject it without prompting a new order.
+      const removed = fixture.currentRows.splice(3, 1)[0];
+      const beforeRows = JSON.stringify(fixture.currentRows);
+      const beforeRegistrations = JSON.stringify(fixture.recovery.rows);
+      const browserKey = await page.evaluate(() => localStorage.getItem('o2o_mvp_customer_order_capability_v1'));
+      await page.getByLabel('확인번호', { exact: true }).fill('927361');
+      await page.getByLabel('확인번호 다시 입력', { exact: true }).fill('927361');
+      await page.getByRole('button', { name: '확인번호 등록', exact: true }).click();
+      await expect(page.getByRole('alert').filter({ hasText: '복구를 위해 새로 주문할 필요는 없습니다' })).toBeVisible();
+      expect(JSON.stringify(fixture.currentRows)).toBe(beforeRows);
+      expect(JSON.stringify(fixture.recovery.rows)).toBe(beforeRegistrations);
+      expect(await page.evaluate(() => localStorage.getItem('o2o_mvp_customer_order_capability_v1'))).toBe(browserKey);
+      fixture.currentRows.splice(3, 0, removed);
       await page.getByText('이전 주문이 보이지 않나요?', { exact: true }).click();
       await page.getByLabel('복구 확인번호').fill('927361');
       await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
@@ -115,6 +129,7 @@ test(partial ? '일부 주문이 있는 기기도 이전 주문을 복구하고 
       expect(await page.evaluate(() => localStorage.getItem('o2o_mvp_customer_order_capability_v1'))).toBe(destinationToken);
     } else {
       await expect(page.getByRole('heading', { name: '조회 가능한 참여 내역이 없습니다' })).toBeVisible();
+
     }
     await page.getByLabel('복구 확인번호').fill(PIN);
     await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();

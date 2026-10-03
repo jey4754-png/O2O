@@ -608,7 +608,7 @@ const RECOVERY_MESSAGES = {
   recovery_pin_matches_phone: '전화번호나 그 일부는 확인번호로 쓸 수 없습니다. 전화번호·관리자 PIN과 다른 숫자를 새로 정해 주세요.',
   invalid_recovery_phone: '010으로 시작하는 휴대폰 번호 11자리로 로그인되어 있어야 합니다.',
   recovery_rate_limited: '시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.',
-  recovery_nothing_to_bind: '이 브라우저에서 확인된 주문·그룹·상품이 없어 등록할 것이 없습니다. 주문한 뒤 다시 등록해 주세요.',
+  recovery_nothing_to_bind: '이 브라우저에는 확인번호로 보관할 기록이 없습니다. 이전 주문이 보이는 기기에서 확인번호를 등록한 뒤, 이 기기의 ‘확인번호로 되살리기’에 같은 번호를 입력해 주세요. 복구를 위해 새로 주문할 필요는 없습니다.',
   recovery_enrollment_limit: '이 전화번호로 등록할 수 있는 횟수를 넘었습니다. 관리자에게 문의해 주세요.',
   recovery_succession_exists: '이 브라우저는 이미 다른 등록을 되살린 상태라 한 번 더 되살릴 수 없습니다. 관리자에게 문의해 주세요.',
   recovery_not_enrolled: '이 전화번호로 등록된 확인번호가 없습니다.',
@@ -2407,6 +2407,8 @@ function App() {
                 nickname: attempt.nickname || profile.name || '테스트 호스트',
                 clientMutationId: attempt.reservationMutationId,
                 allowLocalFallback: false,
+                priority: 'background',
+                maxRetries: 0,
               });
               if (recoveredGroup?.localOnly) throw new Error('group_backend_required');
               updateCheckoutAttempt(attempt.orderId, { stage: 'publishing_deal' });
@@ -2460,6 +2462,8 @@ function App() {
                   attempt.reservationQuantity,
                   attempt.actorId,
                   attempt.reservationMutationId,
+                  undefined,
+                  { priority: 'background', maxRetries: 0 },
                 );
                 completeCheckoutAttempt(attempt.orderId);
                 track('checkout_interruption_recovered', {
@@ -2477,7 +2481,7 @@ function App() {
                 attempt.reservationQuantity,
                 attempt.actorId,
                 attempt.reservationMutationId,
-                { allowLocalFallback: false },
+                { allowLocalFallback: false, priority: 'background', maxRetries: 0 },
               );
             } else if (attempt.reservationAction === 'join') {
               await joinGroupRoom({
@@ -2488,6 +2492,8 @@ function App() {
                 selectedQuantity: attempt.reservationQuantity,
                 clientMutationId: attempt.reservationMutationId,
                 allowLocalFallback: false,
+                priority: 'background',
+                maxRetries: 0,
               });
             } else {
               completeCheckoutAttempt(attempt.orderId);
@@ -2498,6 +2504,8 @@ function App() {
               attempt.reservationQuantity,
               attempt.actorId,
               attempt.reservationMutationId,
+              undefined,
+              { priority: 'background', maxRetries: 0 },
             );
             completeCheckoutAttempt(attempt.orderId);
             track('checkout_interruption_recovered', {
@@ -5630,7 +5638,7 @@ function CustomerRecoveryEnroll({ orderCount }) {
     <details className="customer-recovery" open={open} onToggle={(event) => setOpen(event.target.open)}>
       <summary>{summary}</summary>
       <p><strong>확인번호는 전화번호나 관리자 PIN이 아니라, 여기서 새로 정하는 숫자입니다.</strong> 전화번호 {phone}와 지금 정하는 확인번호로, 이 브라우저에서 확인된 주문·그룹·상품을 묶어 둡니다. 나중에 다른 기기나 비워진 브라우저에서 같은 전화번호로 로그인하고 확인번호를 넣으면 그대로 되살아납니다. 확인번호는 서버에 원문으로 저장되지 않으니 잊지 않게 적어 두세요.</p>
-      <p>등록은 현재 연결된 기록을 보관하는 절차입니다. 보이지 않는 이전 주문을 불러오려면 “이전 주문이 보이지 않나요?”에서 원래 주문이 있던 기기에 등록한 확인번호를 사용해 주세요.</p>
+      <p>전화번호만 같거나 기기마다 다른 확인번호를 새로 등록하는 것으로는 이전 주문이 연결되지 않습니다. 먼저 주문이 보이는 기기에서 숫자를 정해 등록하고, 다른 기기에서는 같은 전화번호로 로그인한 뒤 그 숫자로 되살려 주세요. 보이지 않는 이전 주문을 불러오려면 “이전 주문이 보이지 않나요?”에서 원래 주문이 있던 기기에 등록한 확인번호를 사용해 주세요.</p>
       <form className="form-stack compact-form" onSubmit={submit}>
         <label>확인번호 (숫자 6~12자리)
           <input {...recoveryPinInput({ 'aria-label': '확인번호', value: pin, disabled: busy,

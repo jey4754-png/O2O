@@ -55,7 +55,7 @@ export function joinSubmitErrorMessage(error) {
     return '주문 저장 서버와 연결하지 못했습니다. 네트워크 연결을 확인한 뒤 다시 시도해 주세요.';
   }
   if (['collector_busy', 'upstream_timeout'].includes(code)) {
-    return '일시적으로 요청이 몰려 자동 재시도 중입니다. 잠시 후에도 계속되면 다시 눌러 주세요.';
+    return '자동 재시도 후에도 저장 서버에 연결하지 못했습니다. 중복 참여를 막기 위해 신청 정보를 유지했습니다. 잠시 후 이 화면에서 같은 수량으로 다시 눌러 주세요.';
   }
   return '참여 신청을 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.';
 }

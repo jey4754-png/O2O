@@ -38,6 +38,55 @@ test('only transient group API failures receive a bounded retry budget', () => {
   assert.equal(groupOperationRetryCount({ name: 'AbortError' }), 0);
 });
 
+test('busy background checkout recovery yields to foreground and retains the same join identity for retry', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  globalThis.localStorage = memoryStorage();
+  let unblock;
+  let started;
+  const gate = new Promise((resolve) => { unblock = resolve; });
+  const firstStarted = new Promise((resolve) => { started = resolve; });
+  const requests = [];
+  let busy = true;
+  globalThis.fetch = async (_url, options) => {
+    const input = JSON.parse(options.body);
+    requests.push(input);
+    if (input.clientMutationId === 'join-bg-first' && busy) {
+      started();
+      await gate;
+      return { ok: false, status: 503, json: async () => ({ ok: false, error: 'collector_busy' }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true,
+      capabilityToken: input.capabilityToken,
+      snapshot: { group: { groupId: input.groupId, status: 'recruiting' }, participants: [] },
+    }) };
+  };
+  const join = (id, background) => joinGroupRoom({ deal: { id: 'customer-contention-test' },
+    actorId: id, nickname: id, clientMutationId: id, allowLocalFallback: false,
+    ...(background ? { priority: 'background', maxRetries: 0 } : {}),
+  });
+  try {
+    const first = join('join-bg-first', true);
+    const rejected = assert.rejects(first, (error) => error.code === 'collector_busy');
+    await firstStarted;
+    const last = join('join-bg-last', true);
+    const foreground = join('join-fg-next', false);
+    unblock();
+    await Promise.all([rejected, last, foreground]);
+    assert.deepEqual(requests.map((input) => input.clientMutationId), ['join-bg-first', 'join-fg-next', 'join-bg-last']);
+    busy = false;
+    await join('join-bg-first', false);
+    assert.deepEqual(requests[3], requests[0], 'retry must keep the capability, quantity and mutation identity');
+    assert.equal(requests[0].priority, undefined, 'scheduling options are not collector payload fields');
+    assert.equal(requests[0].maxRetries, undefined);
+  } finally {
+    unblock();
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
 test('a response-loss retry replays the frozen group transition instead of advancing twice', async () => {
   const previousStorage = globalThis.localStorage;
   const previousFetch = globalThis.fetch;

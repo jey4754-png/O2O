@@ -365,7 +365,7 @@ function waitForRetry(delayMs, signal) {
   });
 }
 
-async function performGroupOperationRequest(payload, signal, assertCurrentContext) {
+async function performGroupOperationRequest(payload, signal, assertCurrentContext, { maxRetries = 3 } = {}) {
   // Freeze the request body once so retries cannot accidentally change the
   // mutation identity or reserved quantity across an async backoff boundary.
   const body = JSON.stringify(payload);
@@ -398,7 +398,7 @@ async function performGroupOperationRequest(payload, signal, assertCurrentContex
     } catch (error) {
       // The scheduled poll already retries reads. Immediate retries multiply load
       // while the collector is busy; mutation retries retain their frozen identity.
-      const retryCount = payload.action === 'snapshot' ? 0 : groupOperationRetryCount(error);
+      const retryCount = payload.action === 'snapshot' ? 0 : Math.min(maxRetries, groupOperationRetryCount(error));
       if (signal?.aborted || attempt >= retryCount) throw error;
       const delay = Math.min(2400, 350 * (2 ** attempt)) + Math.floor(Math.random() * 180);
       attempt += 1;
@@ -407,14 +407,14 @@ async function performGroupOperationRequest(payload, signal, assertCurrentContex
   }
 }
 
-function requestGroupOperation(payload, signal, assertCurrentContext) {
+function requestGroupOperation(payload, signal, assertCurrentContext, options = {}) {
   if (payload?.action === 'snapshot') {
     return performGroupOperationRequest(payload, signal, assertCurrentContext);
   }
 
   return runCentralMutation(
-    () => performGroupOperationRequest(payload, signal, assertCurrentContext),
-    { priority: payload?.action === 'mark_read' ? 'background' : 'foreground' },
+    () => performGroupOperationRequest(payload, signal, assertCurrentContext, options),
+    { priority: options.priority || (payload?.action === 'mark_read' ? 'background' : 'foreground') },
   );
 }
 
@@ -721,6 +721,8 @@ export async function createGroupRoom({
   selectedQuantity = deal.creatorQuantity ?? deal.selectedQuantity ?? 1,
   clientMutationId = '',
   allowLocalFallback = true,
+  priority = 'foreground',
+  maxRetries = 3,
 }) {
   const normalizedHostMode = hostMode === 'recruiting' ? 'recruiting' : 'self';
   const membershipAttempt = getMembershipAttempt(
@@ -755,10 +757,10 @@ export async function createGroupRoom({
   };
   const result = allowLocalFallback
     ? await withFallback(
-        () => requestGroupOperation(input),
+        () => requestGroupOperation(input, undefined, undefined, { priority, maxRetries }),
         () => localCreate(input),
       )
-    : await requestGroupOperation(input);
+    : await requestGroupOperation(input, undefined, undefined, { priority, maxRetries });
   const role = normalizedHostMode === 'recruiting' ? 'creator' : 'host';
   if (result.capabilityToken) {
     saveGroupCredential(deal.id, {
@@ -897,6 +899,8 @@ export async function joinGroupRoom({
   selectedQuantity = role === 'admin' ? 0 : 1,
   clientMutationId = '',
   allowLocalFallback = true,
+  priority = 'foreground',
+  maxRetries = 3,
 }) {
   const membershipAttempt = getMembershipAttempt(
     'join',
@@ -925,10 +929,10 @@ export async function joinGroupRoom({
   };
   const result = allowLocalFallback
     ? await withFallback(
-        () => requestGroupOperation(input),
+        () => requestGroupOperation(input, undefined, undefined, { priority, maxRetries }),
         () => localJoin(input, deal),
       )
-    : await requestGroupOperation(input);
+    : await requestGroupOperation(input, undefined, undefined, { priority, maxRetries });
   if (result.capabilityToken) {
     saveGroupCredential(deal.id, {
       actorId,
@@ -1571,7 +1575,7 @@ export async function reserveGroupQuantity(
   quantity,
   actorId,
   clientMutationId = createMutationId('reserve_quantity'),
-  { allowLocalFallback = true } = {},
+  { allowLocalFallback = true, priority = 'foreground', maxRetries = 3 } = {},
 ) {
   const delta = Number(quantity);
   if (!Number.isInteger(delta) || delta < 1 || delta > 999) throw new Error('invalid_quantity');
@@ -1586,7 +1590,7 @@ export async function reserveGroupQuantity(
     expectedVersion,
     clientMutationId,
   });
-  const remoteCall = () => requestGroupOperation(payload);
+  const remoteCall = () => requestGroupOperation(payload, undefined, undefined, { priority, maxRetries });
   const result = allowLocalFallback
     ? await withFallback(remoteCall, () => ({
         ok: true,
@@ -1608,7 +1612,7 @@ export async function rollbackGroupReservation(
   actorId,
   reservationMutationId,
   clientMutationId = createMutationId('rollback_reservation'),
-  { allowLocalFallback = false } = {},
+  { allowLocalFallback = false, priority = 'foreground', maxRetries = 3 } = {},
 ) {
   const rollbackQuantity = Number(quantity);
   if (!Number.isInteger(rollbackQuantity) || rollbackQuantity < 1 || rollbackQuantity > 999) {
@@ -1627,7 +1631,7 @@ export async function rollbackGroupReservation(
     reservationMutationId,
     clientMutationId,
   });
-  const remoteCall = () => requestGroupOperation(payload);
+  const remoteCall = () => requestGroupOperation(payload, undefined, undefined, { priority, maxRetries });
   const result = allowLocalFallback
     ? await withFallback(remoteCall, () => ({
         ok: true,

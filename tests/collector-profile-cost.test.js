@@ -71,3 +71,41 @@ test('concurrent first reads recover when another request creates each required 
   assert.equal(result.events.rows.length, 1);
   assert.equal(result.groupHistory.rows.length, 1);
 });
+
+test('repeat login with 1,000 historic visitor events uses bounded reads and batches only missing cells', () => {
+  const context = {};
+  runInNewContext(source, context);
+  const events = fakeSheet();
+  events.rows.push(Array(15).fill('header'));
+  for (let i = 0; i < 1000; i++) {
+    const row = Array(15).fill('');
+    row[4] = i === 500 ? 'unrelated-visitor' : 'returning-visitor';
+    row[2] = 'existing name';
+    row[13] = i % 10 === 0 ? '01000000000' : '';
+    events.rows.push(row);
+  }
+  const before = JSON.parse(JSON.stringify(events.rows));
+  let reads = 0;
+  let writes = 0;
+  const original = events.getRange.bind(events);
+  events.getRange = (...args) => {
+    const range = original(...args);
+    return { ...range,
+      getValues() { reads += 1; return range.getValues(); },
+      setValues(values) { writes += 1; return range.setValues(values); },
+    };
+  };
+  const profile = { tester_name: 'replacement', customer_phone: '01011112222', tester_type: '사용자' };
+  context.backfillVisitorProfile_(events, 'returning-visitor', profile);
+  assert.ok(reads <= 11, `historic login must not perform ${reads} individual row reads under the global lock`);
+  assert.ok(writes <= 120, `missing contiguous cells should be batched, got ${writes} writes`);
+  events.rows.forEach((row, i) => {
+    assert.equal(row[2], before[i][2]);
+    if (i === 0 || row[4] === 'unrelated-visitor') assert.deepEqual(row, before[i]);
+    else assert.equal(row[13], before[i][13] || "'01011112222");
+  });
+  reads = 0; writes = 0;
+  context.backfillVisitorProfile_(events, 'returning-visitor', profile);
+  assert.ok(reads <= 11);
+  assert.equal(writes, 0, 'repeat login never rewrites populated data');
+});

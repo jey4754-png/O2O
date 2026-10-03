@@ -6884,17 +6884,38 @@ function backfillVisitorProfile_(events, visitorId, properties) {
     [8, properties.region], [9, properties.district], [10, properties.neighborhood],
     [13, properties.customer_number], [14, properties.customer_phone],
   ];
-  matches.forEach(function(cell) {
-    const rowNumber = cell.getRow();
-    const row = events.getRange(rowNumber, 1, 1, EVENT_HEADERS.length).getValues()[0];
-    fields.forEach(function(field) {
-      const column = field[0];
-      const value = field[1];
-      const current = row[column - 1];
-      if (!value || value === '미설정' || (current && current !== '미설정')) return;
-      events.getRange(rowNumber, column, 1, 1)
-        .setValues([[column === 14 ? textCell_(value) : safeCell_(value)]]);
-    });
+  // A returning visitor may own thousands of events. One Spreadsheet RPC per
+  // event held the script-wide write lock long enough to reject group joins.
+  // Read bounded spans; write only contiguous missing cells for matched rows.
+  const rowNumbers = matches.map(function(cell) { return cell.getRow(); })
+    .sort(function(a, b) { return a - b; });
+  const pending = fields.map(function() { return []; });
+  for (let offset = 0; offset < rowNumbers.length;) {
+    const start = rowNumbers[offset];
+    let endOffset = offset + 1;
+    while (endOffset < rowNumbers.length && rowNumbers[endOffset] - start < 100) endOffset += 1;
+    const values = events.getRange(start, 1, rowNumbers[endOffset - 1] - start + 1, EVENT_HEADERS.length).getValues();
+    for (let index = offset; index < endOffset; index += 1) {
+      const rowNumber = rowNumbers[index];
+      const row = values[rowNumber - start];
+      fields.forEach(function(field, fieldIndex) {
+        const column = field[0];
+        const value = field[1];
+        const current = row[column - 1];
+        if (!value || value === '미설정' || (current && current !== '미설정')) return;
+        pending[fieldIndex].push({ row: rowNumber, value: column === 14 ? textCell_(value) : safeCell_(value) });
+      });
+    }
+    offset = endOffset;
+  }
+  pending.forEach(function(cells, fieldIndex) {
+    for (let offset = 0; offset < cells.length;) {
+      let end = offset + 1;
+      while (end < cells.length && end - offset < 100 && cells[end].row === cells[end - 1].row + 1) end += 1;
+      events.getRange(cells[offset].row, fields[fieldIndex][0], end - offset, 1)
+        .setValues(cells.slice(offset, end).map(function(cell) { return [cell.value]; }));
+      offset = end;
+    }
   });
 }
 
