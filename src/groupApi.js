@@ -365,7 +365,7 @@ function waitForRetry(delayMs, signal) {
   });
 }
 
-async function performGroupOperationRequest(payload, signal, assertCurrentContext, { maxRetries = 3 } = {}) {
+async function performGroupOperationRequest(payload, signal, assertCurrentContext, { maxRetries = 3, priority } = {}) {
   // Freeze the request body once so retries cannot accidentally change the
   // mutation identity or reserved quantity across an async backoff boundary.
   const body = JSON.stringify(payload);
@@ -373,12 +373,20 @@ async function performGroupOperationRequest(payload, signal, assertCurrentContex
   while (true) {
     try {
       assertCurrentContext?.();
-      const response = await fetch('/api/group-ops', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body,
-        signal,
-      });
+      const send = () => {
+        assertCurrentContext?.();
+        return fetch('/api/group-ops', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          signal,
+        });
+      };
+      // Read acknowledgements must retain their retry identity, but release the
+      // queue between attempts so automatic backoff never blocks a new join.
+      const response = priority === 'background'
+        ? await runCentralMutation(send, { priority })
+        : await send();
       let result = {};
       try {
         result = await response.json();
@@ -411,10 +419,13 @@ function requestGroupOperation(payload, signal, assertCurrentContext, options = 
   if (payload?.action === 'snapshot') {
     return performGroupOperationRequest(payload, signal, assertCurrentContext);
   }
-
+  const priority = options.priority || (payload?.action === 'mark_read' ? 'background' : 'foreground');
+  if (priority === 'background') {
+    return performGroupOperationRequest(payload, signal, assertCurrentContext, { ...options, priority });
+  }
   return runCentralMutation(
     () => performGroupOperationRequest(payload, signal, assertCurrentContext, options),
-    { priority: options.priority || (payload?.action === 'mark_read' ? 'background' : 'foreground') },
+    { priority },
   );
 }
 

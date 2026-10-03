@@ -14,6 +14,7 @@ import {
   hasLegacyCustomerGroupRecoveryState,
   isGroupBackedDeal,
   joinGroupRoom,
+  markGroupRead,
   normalizeSnapshot,
   recoverLegacyCustomerGroupRoom,
   reserveGroupQuantity,
@@ -81,6 +82,42 @@ test('busy background checkout recovery yields to foreground and retains the sam
     assert.equal(requests[0].maxRetries, undefined);
   } finally {
     unblock();
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = previousStorage;
+  }
+});
+
+test('automatic read acknowledgement releases the queue during retry backoff without losing its identity', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  globalThis.localStorage = memoryStorage();
+  const groupId = 'customer-read-backoff';
+  globalThis.localStorage.setItem('o2o_mvp_group_credentials_v1', JSON.stringify({
+    [`${groupId}::reader`]: { groupId, actorId: 'reader', role: 'member', active: true, capabilityToken: 'g'.repeat(64) },
+  }));
+  const inputs = [];
+  let started;
+  const firstStarted = new Promise((resolve) => { started = resolve; });
+  globalThis.fetch = async (_url, options) => {
+    const input = JSON.parse(options.body);
+    inputs.push(input);
+    if (inputs.length === 1) {
+      started();
+      return { ok: false, status: 503, json: async () => ({ ok: false, error: 'collector_busy' }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, capabilityToken: input.capabilityToken,
+      snapshot: { group: { groupId, status: 'recruiting' }, participants: [] },
+    }) };
+  };
+  try {
+    const read = markGroupRead(groupId, 7, 'reader');
+    await firstStarted;
+    const join = joinGroupRoom({ deal: { id: groupId }, actorId: 'new-member', nickname: 'new-member', allowLocalFallback: false });
+    await Promise.all([read, join]);
+    assert.deepEqual(inputs.map((input) => input.action), ['mark_read', 'join', 'mark_read']);
+    assert.deepEqual(inputs[0], inputs[2], 'read retry must acknowledge the same sequence with the same mutation ID');
+  } finally {
     globalThis.fetch = previousFetch;
     if (previousStorage === undefined) delete globalThis.localStorage;
     else globalThis.localStorage = previousStorage;
