@@ -27,7 +27,8 @@ test('재연결은 서로 다른 번호의 주문을 함께 묶지 않고, 성�
 
 test('내 주문은 목록이 어느 로그인 번호의 것인지 표시한다', () => {
   assert.match(appSource, /const loginPhone = formatKoreanMobilePhoneInput\(getProfile\(\)\?\.phone\);/);
-  assert.match(appSource, /로그인 번호 <strong>\{loginPhone\}<\/strong>로 넣은 주문만 표시합니다/);
+  assert.match(appSource, /로그인 번호 <strong>\{loginPhone\}<\/strong>의 주문 중 이 브라우저에서 주문했거나 확인번호로 복구한 기록을 표시합니다/);
+  assert.match(appSource, /같은 전화번호로 로그인해도 다른 기기의 주문은 자동으로 연결되지 않습니다/);
 });
 
 test('서버가 없는 상품으로 거절한 예시 상품 주문만 체험용으로 안내한다', () => {

@@ -67,9 +67,32 @@ test('concurrent first reads recover when another request creates each required 
   }) };
   const result = context.ensureSheets_();
   assert.equal(Object.keys(result).length, 10);
+  Object.values(result);
   assert.equal(sheets.size, 10);
   assert.equal(result.events.rows.length, 1);
   assert.equal(result.groupHistory.rows.length, 1);
+});
+
+test('a room request only initializes accessed tables and reuses their metadata checks', () => {
+  const context = {};
+  runInNewContext(source, context);
+  const touched = [];
+  const sheets = new Map();
+  context.SpreadsheetApp = { openById: () => ({
+    getSheetByName(name) { touched.push(name); return sheets.get(name) || null; },
+    insertSheet(name) {
+      const sheet = fakeSheet();
+      sheet.getLastColumn = () => sheet.rows[0]?.length || 0;
+      sheets.set(name, sheet);
+      return sheet;
+    },
+  }) };
+  const data = context.ensureSheets_();
+  assert.deepEqual(touched, []);
+  assert.equal(data.groupParticipants.rows.length, 1);
+  assert.equal(context.ensureSheets_().groupParticipants, data.groupParticipants);
+  assert.deepEqual(touched, ['그룹 참여자']);
+  assert.equal(sheets.size, 1, 'background room writes must not initialize analytics/survey/order tables');
 });
 
 test('repeat login with 1,000 historic visitor events uses bounded reads and batches only missing cells', () => {

@@ -613,6 +613,7 @@ function logOrderFailure(action, code, status, layer = 'handler') {
 }
 
 export default async function handler(request, response) {
+  const startedAt = Date.now();
   response.setHeader('Cache-Control', 'private, no-store');
   if (request.method !== 'POST') {
     response.setHeader('Allow', 'POST');
@@ -689,7 +690,7 @@ export default async function handler(request, response) {
     // A 200 with no orders and a 200 with a full history look identical in the
     // request log; the count alone (no phone, key or content) separates them.
     console.info('[customer-orders] list_result', JSON.stringify({
-      count: orders.length, groupScoped: Boolean(groupId),
+      count: orders.length, groupScoped: Boolean(groupId), durationMs: Date.now() - startedAt,
     }));
     return response.status(200).json({ ok: true, orders });
   } catch (error) {

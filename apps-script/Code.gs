@@ -112,7 +112,7 @@ const ADMIN_AUTH_RATE_BLOCK_MS = 15 * 60 * 1000;
 const ADMIN_AUTH_RATE_CLIENT_FAILURE_LIMIT = 5;
 const ADMIN_AUTH_RATE_GLOBAL_FAILURE_LIMIT = 40;
 const ADMIN_AUTH_RATE_MAX_CLIENTS = 48;
-const HISTORIC_CUSTOMER_ORDER_CACHE_PREFIX = 'historic_customer_orders_v1_';
+const HISTORIC_CUSTOMER_ORDER_CACHE_PREFIX = 'historic_customer_orders_v2_';
 const HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS = 21600;
 const HISTORIC_CUSTOMER_ORDER_CACHE_MAX_LENGTH = 90000;
 const PUBLIC_DEALS_CACHE_KEY = 'public_deals_v4';
@@ -884,36 +884,41 @@ function sha256Hex_(value) {
     .join('');
 }
 
-// Legacy order snapshots live in the analytics event log, and a phone read has
-// to scan that whole sheet to rebuild them. Publishing writes the canonical
-// 주문 내역 row instead, so this derived set only changes when the event sheet
-// itself gains a row — the row count is therefore a safe cache key. Current
-// orders and the participant payment projection are always read fresh, so a
-// cache hit can never freeze a live 입금 상태.
-function historicCustomerOrderCacheKey_(phone, eventRowCount) {
+// Events are append-only. Keep a watermark with the derived legacy set so a
+// screen_view or chat analytics append only scans the new suffix, rather than
+// invalidating and rebuilding every old order. Canonical rows and live payment
+// projections are still read fresh. A truncated sheet or evicted cache rebuilds.
+function historicCustomerOrderCacheKey_(phone, dealId) {
   return HISTORIC_CUSTOMER_ORDER_CACHE_PREFIX
-    + sha256Hex_('historic-orders:' + String(phone || '')).slice(0, 24)
-    + '_' + String(eventRowCount);
+    + sha256Hex_('historic-orders:' + (dealId ? 'deal:' + dealId : 'phone:' + String(phone || ''))).slice(0, 24);
 }
 
-function cachedHistoricCustomerOrders_(phone, eventRowCount) {
+function cachedHistoricCustomerOrders_(phone, eventRowCount, events, dealId) {
   try {
     const value = CacheService.getScriptCache()
-      .get(historicCustomerOrderCacheKey_(phone, eventRowCount));
+      .get(historicCustomerOrderCacheKey_(phone, dealId));
     if (typeof value !== 'string') return null;
     const parsed = JSON.parse(value);
-    return Array.isArray(parsed) ? parsed : null;
+    if (!parsed || !Array.isArray(parsed.orders)
+      || !Number.isInteger(parsed.throughRow) || parsed.throughRow < 1
+      || parsed.throughRow > eventRowCount) return null;
+    if (parsed.throughRow === eventRowCount) return parsed.orders;
+    if (!events) return null;
+    const appended = historicCustomerOrders_(events, phone, dealId || '', parsed.throughRow + 1, eventRowCount);
+    const orders = parsed.orders.concat(appended);
+    cacheHistoricCustomerOrders_(phone, eventRowCount, orders, dealId);
+    return orders;
   } catch (error) {
     return null;
   }
 }
 
-function cacheHistoricCustomerOrders_(phone, eventRowCount, orders) {
+function cacheHistoricCustomerOrders_(phone, eventRowCount, orders, dealId) {
   try {
-    const serialized = JSON.stringify(orders);
+    const serialized = JSON.stringify({ throughRow: eventRowCount, orders: orders });
     if (serialized.length > HISTORIC_CUSTOMER_ORDER_CACHE_MAX_LENGTH) return;
     CacheService.getScriptCache().put(
-      historicCustomerOrderCacheKey_(phone, eventRowCount),
+      historicCustomerOrderCacheKey_(phone, dealId),
       serialized,
       HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS
     );
@@ -4614,9 +4619,9 @@ function getCustomerOrders_(phoneValue, visitorIdValue, customerCapabilityHashVa
   // group. Keep every phone-matching snapshot in those checks so a scoped read
   // cannot revive an older order or hide a conflicting key in another group.
   const eventRowCount = sheets.events.getLastRow();
-  let historic = cachedHistoricCustomerOrders_(phone, eventRowCount);
+  let historic = cachedHistoricCustomerOrders_(phone, eventRowCount, sheets.events);
   if (!historic) {
-    historic = historicCustomerOrders_(sheets.events, phone, '');
+    historic = historicCustomerOrders_(sheets.events, phone, '', 2, eventRowCount);
     cacheHistoricCustomerOrders_(phone, eventRowCount, historic);
   }
   // 승계는 직접 소유가 없을 때만 의미가 있으므로 여기서 한 번만 읽는다.
@@ -4719,21 +4724,24 @@ function matchedEventColumnValues_(events, matches, column) {
 // event name exactly is what the authorized owner/admin read already does in
 // production. Select those rows first, then apply the existing phone check
 // below, so no snapshot is ever skipped.
-function historicCustomerOrders_(events, phone, dealId) {
-  if (events.getLastRow() < 2) return [];
+function historicCustomerOrders_(events, phone, dealId, startRowValue, endRowValue) {
+  const startRow = Math.max(2, Number(startRowValue || 2));
+  const endRow = endRowValue === undefined ? events.getLastRow() : Number(endRowValue);
+  if (endRow < startRow) return [];
+  const rowCount = endRow - startRow + 1;
   let rows;
   let matches;
   let snapshotMatched = false;
   if (dealId) {
-    matches = events.getRange(2, 12, events.getLastRow() - 1, 1)
+    matches = events.getRange(startRow, 12, rowCount, 1)
       .createTextFinder(String(dealId)).matchCase(true).findAll();
   } else if (phone) {
     snapshotMatched = true;
-    matches = events.getRange(2, 7, events.getLastRow() - 1, 1)
+    matches = events.getRange(startRow, 7, rowCount, 1)
       .createTextFinder('customer_order_snapshot').matchCase(true).matchEntireCell(true)
       .findAll();
   } else {
-    rows = events.getRange(2, 1, events.getLastRow() - 1, EVENT_HEADERS.length).getValues();
+    rows = events.getRange(startRow, 1, rowCount, EVENT_HEADERS.length).getValues();
   }
   if (matches && snapshotMatched) {
     if (!matches.length) return [];
@@ -5227,7 +5235,12 @@ function buildGroupSnapshot_(sheets, groupId, actor) {
     return participant.actorId === actor.actorId;
   });
   const viewer = publicViewer || actor.participant;
-  const lastReadSeq = viewer ? Number(viewer.lastReadSeq || 0) : 0;
+  // Read receipts do not invalidate the shared content cache. Authorization
+  // already reads the caller's participant fresh, so its receipt must take
+  // precedence over the cached public participant value.
+  const lastReadSeq = actor.participant
+    ? Number(actor.participant.lastReadSeq || 0)
+    : (viewer ? Number(viewer.lastReadSeq || 0) : 0);
   if (!isActiveGroupActor_(actor)) {
     return Object.assign({}, base, {
       participants: publicViewer ? [publicViewer] : [],
@@ -6805,6 +6818,15 @@ function handleGroupOperation_(action, payload) {
     if (action !== 'mark_read') invalidatePublicDealsCache_();
     lock.releaseLock();
     lock = null;
+    // The caller only needs an acknowledgement for a read receipt. Rebuilding
+    // the full room here adds order/payment/chat/history reads to a background
+    // write and holds the browser's mutation queue until they all complete.
+    if (action === 'mark_read') return json_({
+      ok: true,
+      duplicate: Boolean(result.duplicate),
+      unchanged: Boolean(result.unchanged),
+      lastReadSeq: Number(result.actor.participant && result.actor.participant.lastReadSeq || 0)
+    });
     const snapshot = buildGroupSnapshot_(sheets, groupId, result.actor);
     return json_({
       ok: true,
@@ -6857,7 +6879,13 @@ function getCustomerOrdersByGroup_(payload) {
           } catch (error) {}
         });
     }
-    const historic = historicCustomerOrders_(sheets.events, '', dealId)
+    const eventRowCount = sheets.events.getLastRow();
+    let legacy = cachedHistoricCustomerOrders_('', eventRowCount, sheets.events, dealId);
+    if (!legacy) {
+      legacy = historicCustomerOrders_(sheets.events, '', dealId, 2, eventRowCount);
+      cacheHistoricCustomerOrders_('', eventRowCount, legacy, dealId);
+    }
+    const historic = legacy
       .filter(function(order) { return String(order.groupId || '') === groupId; });
     const projectionContext = {};
     const orders = mergeCustomerOrderSnapshots_(current.concat(historic)).map(function(order) {
@@ -6955,45 +6983,30 @@ function repairExistingUnsetRows() {
 function ensureSheets_() {
   if (RUNTIME_SHEETS_CACHE_) return RUNTIME_SHEETS_CACHE_;
   const spreadsheet = SpreadsheetApp.openById(collectorSpreadsheetId_());
-  const events = sheetByNameOrInsert_(spreadsheet, '전체 이벤트');
-  if (events.getLastRow() === 0) {
-    events.getRange(1, 1, 1, EVENT_HEADERS.length).setValues([EVENT_HEADERS]);
-    events.setFrozenRows(1);
-  } else if (events.getLastColumn() < EVENT_HEADERS.length) {
-    events.getRange(1, 1, 1, EVENT_HEADERS.length).setValues([EVENT_HEADERS]);
-  }
-  const summary = sheetByNameOrInsert_(spreadsheet, '통합 현황');
-  const surveys = sheetByNameOrInsert_(spreadsheet, '설문 응답');
-  if (surveys.getLastRow() === 0) {
-    surveys.getRange(1, 1, 1, SURVEY_HEADERS.length).setValues([SURVEY_HEADERS]);
-    surveys.setFrozenRows(1);
-  } else if (surveys.getLastColumn() < SURVEY_HEADERS.length) {
-    surveys.getRange(1, 1, 1, SURVEY_HEADERS.length).setValues([SURVEY_HEADERS]);
-  }
-  const publicDeals = sheetByNameOrInsert_(spreadsheet, '공개 상품');
-  if (publicDeals.getLastRow() === 0) {
-    publicDeals.getRange(1, 1, 1, PUBLIC_DEAL_HEADERS.length).setValues([PUBLIC_DEAL_HEADERS]);
-    publicDeals.setFrozenRows(1);
-  }
-  const recovery = sheetByNameOrInsert_(spreadsheet, '복구 등록');
-  ensureHeader_(recovery, RECOVERY_HEADERS);
-  const customerOrders = sheetByNameOrInsert_(spreadsheet, '주문 내역');
-  if (customerOrders.getLastRow() === 0) {
-    customerOrders.getRange(1, 1, 1, CUSTOMER_ORDER_HEADERS.length).setValues([CUSTOMER_ORDER_HEADERS]);
-    customerOrders.setFrozenRows(1);
-  }
-  const groups = sheetByNameOrInsert_(spreadsheet, '그룹');
-  ensureHeader_(groups, GROUP_HEADERS);
-  const groupParticipants = sheetByNameOrInsert_(spreadsheet, '그룹 참여자');
-  ensureHeader_(groupParticipants, GROUP_PARTICIPANT_HEADERS);
-  const groupChat = sheetByNameOrInsert_(spreadsheet, '그룹 채팅');
-  ensureHeader_(groupChat, GROUP_CHAT_HEADERS);
-  const groupHistory = sheetByNameOrInsert_(spreadsheet, '상태 이력');
-  ensureHeader_(groupHistory, GROUP_HISTORY_HEADERS);
-  RUNTIME_SHEETS_CACHE_ = {
-    events, summary, surveys, publicDeals, customerOrders,
-    groups, groupParticipants, groupChat, groupHistory, recovery,
+  const definitions = {
+    events: ['전체 이벤트', EVENT_HEADERS], summary: ['통합 현황'],
+    surveys: ['설문 응답', SURVEY_HEADERS], publicDeals: ['공개 상품', PUBLIC_DEAL_HEADERS],
+    customerOrders: ['주문 내역', CUSTOMER_ORDER_HEADERS], recovery: ['복구 등록', RECOVERY_HEADERS],
+    groups: ['그룹', GROUP_HEADERS], groupParticipants: ['그룹 참여자', GROUP_PARTICIPANT_HEADERS],
+    groupChat: ['그룹 채팅', GROUP_CHAT_HEADERS], groupHistory: ['상태 이력', GROUP_HISTORY_HEADERS]
   };
+  const sheets = {};
+  Object.keys(definitions).forEach(function(key) {
+    let initialized = null;
+    Object.defineProperty(sheets, key, { enumerable: true, get: function() {
+      if (initialized) return initialized;
+      const definition = definitions[key];
+      const sheet = sheetByNameOrInsert_(spreadsheet, definition[0]);
+      if (definition[1]) ensureHeader_(sheet, definition[1]);
+      initialized = sheet;
+      return initialized;
+    } });
+  });
+  // Metadata checks for ten unrelated sheets used to run for every request,
+  // including room polls and background read receipts. Initialize only the
+  // tables that this invocation actually accesses; first-use race handling and
+  // schema upgrades remain identical.
+  RUNTIME_SHEETS_CACHE_ = sheets;
   return RUNTIME_SHEETS_CACHE_;
 }
 
@@ -7024,6 +7037,7 @@ function ensureHeader_(sheet, headers) {
 
 function setup() {
   const sheets = ensureSheets_();
+  Object.keys(sheets).forEach(function(key) { return sheets[key]; });
   clearLegacyValidations_(sheets.events);
   backfillEventIds_(sheets.events);
   repairExistingUnsetRows();

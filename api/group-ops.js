@@ -529,13 +529,15 @@ function logGroupFailure(action, code, status, layer = 'handler') {
   }));
 }
 
-function logGroupSuccess(action, result) {
-  if (action !== 'transition_payment') return;
+function logGroupSuccess(action, result, durationMs) {
   console.info('[group-ops] request_success', JSON.stringify({
     action,
+    durationMs,
     duplicate: Boolean(result?.duplicate),
-    orderUpdated: Boolean(result?.order),
-    paymentStatus: String(result?.order?.paymentStatus || 'unknown'),
+    ...(action === 'transition_payment' ? {
+      orderUpdated: Boolean(result?.order),
+      paymentStatus: String(result?.order?.paymentStatus || 'unknown'),
+    } : {}),
   }));
 }
 
@@ -614,6 +616,7 @@ async function callUpstream(payload, allowProxy = true) {
 }
 
 export default async function handler(request, response) {
+  const startedAt = Date.now();
   response.setHeader('Cache-Control', 'private, no-store, max-age=0');
   response.setHeader('Vary', 'Origin');
   if (request.method !== 'POST') {
@@ -658,7 +661,7 @@ export default async function handler(request, response) {
         ...(result?.order ? { order: publicOrder(result.order) } : {}),
       });
     }
-    logGroupSuccess(action, result);
+    logGroupSuccess(action, result, Date.now() - startedAt);
     if (action === 'recover_legacy_customer_group') {
       return response.status(status >= 400 ? status : 200).json({
         ok: true,

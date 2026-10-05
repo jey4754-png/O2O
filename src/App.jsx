@@ -5553,7 +5553,7 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
         </p>
       )}
       {loginPhone && (
-        <p className="customer-history-phone">로그인 번호 <strong>{loginPhone}</strong>로 넣은 주문만 표시합니다. 주문할 때 다른 번호를 썼다면 그 번호로 다시 로그인해야 보입니다.</p>
+        <p className="customer-history-phone">로그인 번호 <strong>{loginPhone}</strong>의 주문 중 이 브라우저에서 주문했거나 확인번호로 복구한 기록을 표시합니다. 같은 전화번호로 로그인해도 다른 기기의 주문은 자동으로 연결되지 않습니다. 다른 번호로 주문했다면 그 번호로 로그인해 주세요.</p>
       )}
       {freshKey && (
         <p role="alert">이 브라우저의 주문 확인 키가 사라져 새로 만들었습니다. 브라우저가 저장소를 비웠을 때 생기며, 이전 주문은 이 키로는 조회되지 않습니다. 없어진 것이 아니라 이 브라우저에서 확인할 수 없는 상태이니 원래 사용하던 브라우저에서 확인하거나 관리자 앱으로 조회해 주세요.</p>

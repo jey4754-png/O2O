@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { adminStore } from './helpers/admin-store.js';
 import { customerHistoryStore, historyOrder } from './helpers/customer-history-store.js';
 
@@ -232,11 +233,47 @@ test('a repeated phone history read reuses the legacy event scan but never a sta
   assert.ok(orderSheetReads > ordersBefore, '주문 내역 is re-read on every request');
   assert.ok(participantReads > participantsBefore, 'the payment projection is re-read on every request');
 
-  // A new event row changes the key, so genuinely new legacy evidence is read.
+  // New rows still need inspection so newly appended order evidence is included.
   data.events.rows.push(['2026-09-02T00:00:00Z', '', '', '', '', '', 'screen_view',
     '', '', '', '', '{}', '', '01011112222']);
   read();
-  assert.ok(eventScans > scansAfterFirst, 'a changed event sheet must invalidate the cached legacy set');
+  assert.ok(eventScans > scansAfterFirst, 'new event rows must be inspected');
+});
+
+test('analytics appends scan only the suffix and new legacy conflicts still revoke ownership', () => {
+  const phone = '01011112222';
+  const first = historyOrder('1700000009301', { _customerCapabilityHash: 'b'.repeat(64) });
+  const { context, data, eventRows } = customerHistoryStore({ historic: [first] });
+  context.Utilities = { DigestAlgorithm: { SHA_256: 'SHA_256' }, Charset: { UTF_8: 'UTF_8' },
+    computeDigest: (_algorithm, value) => [...createHash('sha256').update(String(value)).digest()] };
+  const cache = new Map();
+  context.CacheService = { getScriptCache: () => ({ get: (key) => cache.get(key) ?? null,
+    put: (key, value) => cache.set(key, value) }) };
+  for (let i = 0; i < 20000; i++) {
+    const row = Array(16).fill(''); row[6] = 'screen_view'; eventRows.push(row);
+  }
+  const getRange = data.events.getRange.bind(data.events);
+  const scans = [];
+  data.events.getRange = (...args) => { scans.push(args); return getRange(...args); };
+  const read = () => context.getCustomerOrdersResponse_(phone, 'customer-history-visitor', 'b'.repeat(64));
+  assert.deepEqual(read().orders.map((item) => item.id), [first.id]);
+  const throughRow = eventRows.length;
+  const analytics = Array(16).fill(''); analytics[6] = 'screen_view'; eventRows.push(analytics);
+  scans.length = 0;
+  assert.deepEqual(read().orders.map((item) => item.id), [first.id]);
+  assert.deepEqual(scans, [[throughRow + 1, 7, 1, 1]], 'analytics must not rescan 20,000 older events');
+  const second = historyOrder('1700000009302', { _customerCapabilityHash: 'b'.repeat(64) });
+  const append = (order) => {
+    const row = Array(16).fill(''); row[6] = 'customer_order_snapshot'; row[13] = phone;
+    row[11] = JSON.stringify({ order_snapshot: JSON.stringify(order) }); eventRows.push(row);
+  };
+  append(second);
+  assert.deepEqual(read().orders.map((item) => item.id).sort(), [first.id, second.id].sort());
+  append({ ...first, version: 2, _customerCapabilityHash: 'd'.repeat(64) });
+  assert.deepEqual(read().orders.map((item) => item.id), [second.id],
+    'a new conflicting ownership snapshot must never be hidden by the cache');
+  eventRows.splice(2);
+  assert.deepEqual(read().orders.map((item) => item.id), [first.id], 'a truncated sheet requires a full rebuild');
 });
 
 test('a phone history read selects order snapshots by exact event name, not by a 4-digit phone match', () => {

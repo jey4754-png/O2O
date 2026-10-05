@@ -16,6 +16,7 @@ const MEMORY_MIRROR_KEYS = new Set([
   GROUP_TRANSITION_MUTATIONS_KEY,
 ]);
 const memoryJsonMirrors = new Map();
+const pendingReadReceipts = new Map();
 const GROUP_TRANSITION_STATES = ['recruiting', 'recruited', 'purchased', 'delivered'];
 const PAYMENT_TRANSITION_STATES = ['pending', 'requested', 'confirmed'];
 
@@ -1736,25 +1737,59 @@ export async function sendGroupMessage(groupId, body, actorId) {
 export async function markGroupRead(groupId, lastReadSeq, actorId) {
   const credential = getGroupCredential(groupId, actorId);
   if (credential?.role !== 'admin' && credential?.active === false) throw new Error('forbidden');
-  const payload = commonPayload(groupId, {
-    action: 'mark_read',
-    actorId,
-    lastReadSeq: Number(lastReadSeq || 0),
-    clientMutationId: createMutationId('read'),
-  });
-  try {
-    await requestGroupOperation(payload);
-    saveLastReadSeq(groupId, lastReadSeq);
-  } catch (error) {
-    if (!isFallbackEligible(error)) throw error;
-    saveLastReadSeq(groupId, lastReadSeq);
+  const sequence = Number(lastReadSeq || 0);
+  if (sequence <= getLastReadSeq(groupId)) return;
+  const key = `${groupId}::${actorId}`;
+  const existing = pendingReadReceipts.get(key);
+  if (existing?.storage === globalThis.localStorage) {
+    existing.sequence = Math.max(existing.sequence, sequence);
+    return existing.promise;
   }
+  const receipt = { sequence, storage: globalThis.localStorage };
+  pendingReadReceipts.set(key, receipt);
+  receipt.promise = (async () => {
+    let acknowledged = getLastReadSeq(groupId);
+    while (receipt.sequence > acknowledged) {
+      const requested = receipt.sequence;
+      const payload = commonPayload(groupId, {
+        action: 'mark_read', actorId, lastReadSeq: requested,
+        clientMutationId: createMutationId('read'),
+      });
+      try {
+        await requestGroupOperation(payload);
+      } catch (error) {
+        if (!isFallbackEligible(error)) throw error;
+      }
+      // Polls may observe the same unread sequence while its receipt is still
+      // being saved. One in-flight receipt covers them all; a newer sequence
+      // needs at most one follow-up, without losing its acknowledgement.
+      acknowledged = requested;
+      if (receipt.storage === globalThis.localStorage) saveLastReadSeq(groupId, requested);
+    }
+  })().finally(() => {
+    if (pendingReadReceipts.get(key) === receipt) pendingReadReceipts.delete(key);
+  });
+  return receipt.promise;
 }
 
 async function mutateGroup(groupId, actorId, action, extras, localMutation, options = {}) {
   const allowLocalFallback = options.allowLocalFallback === true;
   options.assertCurrentContext?.();
-  const snapshot = await fetchGroupSnapshot(groupId, { actorId, allowLocalFallback });
+  const displayed = options.snapshot;
+  const useDisplayedPayment = action === 'transition_payment'
+    && displayed?.centralGroupMissing !== true
+    && displayed?.localOnly !== true
+    && (displayed?.group?.groupId || displayed?.group?.id) === groupId
+    && displayed?.viewer?.actorId === actorId
+    && displayed?.viewer?.active === true
+    && Number(displayed?.participants?.find((item) => item.actorId === extras.participantActorId)?.version) > 0;
+  // The displayed payment state already has a participant CAS version. Send
+  // that exact confirmed intent; the server checks version, from/to state and
+  // permissions atomically. A conflict returns its current snapshot. Fetching
+  // the same room once more before every click added another slow round trip.
+  const snapshot = useDisplayedPayment
+    ? displayed
+    : await fetchGroupSnapshot(groupId, { actorId, allowLocalFallback });
   options.assertCurrentContext?.();
   const credential = getGroupCredential(groupId, actorId);
   const actingParticipant = snapshot.participants.find((item) => item.actorId === actorId);
@@ -1863,7 +1898,7 @@ export function transitionGroupStatus(groupId, direction, actorId, transitionInt
 
 export function transitionParticipantPayment(
   groupId, participantActorId, direction, actorId, transitionIntent = null,
-  { expectedFromStatus, assertCurrentContext } = {},
+  { expectedFromStatus, assertCurrentContext, snapshot } = {},
 ) {
   return mutateGroup(groupId, actorId, 'transition_payment', { participantActorId, direction }, (snapshot, actor) => {
     const participant = snapshot.participants.find((item) => item.actorId === participantActorId);
@@ -1890,6 +1925,7 @@ export function transitionParticipantPayment(
     allowLocalFallback: false,
     transitionIntent,
     assertCurrentContext,
+    snapshot,
     createTransitionIntent: (snapshot) => {
       const participant = snapshot.participants.find((item) => item.actorId === participantActorId);
       if (!participant) throw new Error('participant_not_found');

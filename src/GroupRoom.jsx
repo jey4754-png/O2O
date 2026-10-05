@@ -770,7 +770,7 @@ export default function GroupRoom({
           effectiveDirection,
           actorId,
           retryIntent,
-          { expectedFromStatus: fromStatus, assertCurrentContext: () => {
+          { snapshot, expectedFromStatus: fromStatus, assertCurrentContext: () => {
             if (requestRoomRevision !== roomRevisionRef.current || roomIdentityRef.current !== roomIdentity) {
               throw new Error('operation_context_changed');
             }

@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { transitionParticipantPayment } from '../src/groupApi.js';
 import { adminStore } from './helpers/admin-store.js';
 
 // Exercise the actual Apps Script create/publication/payment/read pipeline.
 // This uses only in-memory synthetic records, never the configured collector.
-function creatorStore() {
+function creatorStore(participantCapabilityHash = 'c'.repeat(64)) {
   const { context, data } = adminStore();
   for (const sheet of Object.values(data)) sheet.rows.splice(1);
   context.CacheService = {
@@ -12,7 +14,6 @@ function creatorStore() {
   };
   const groupId = 'customer-creator-payment-test';
   const actorId = 'visitor-creator-payment-test';
-  const participantCapabilityHash = 'c'.repeat(64);
   const customerCapabilityHash = 'b'.repeat(64);
   const reservationMutationId = 'create-creator-payment-test';
   const customerPhone = '01011112222';
@@ -54,6 +55,51 @@ function creatorStore() {
   const transition = (payload) => context.handleGroupOperation_('transition_payment', payload);
   return { context, data, groupId, actorId, order, publishOrder, readOrders, paymentPayload, transition };
 }
+
+test('the displayed payment CAS saves without a preflight read and still rejects a concurrent change', async () => {
+  const token = 'synthetic-payment-proof-'.repeat(4);
+  const hash = createHash('sha256').update(token).digest('hex');
+  const store = creatorStore(hash);
+  assert.equal(store.publishOrder().ok, true);
+  const oldFetch = globalThis.fetch;
+  const oldStorage = globalThis.localStorage;
+  const values = new Map();
+  globalThis.localStorage = { getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)) };
+  values.set('o2o_mvp_group_credentials_v1', JSON.stringify({ [`${store.groupId}::${store.actorId}`]: {
+    groupId: store.groupId, actorId: store.actorId, role: 'host', active: true, capabilityToken: token,
+  } }));
+  const requests = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    requests.push(payload.action);
+    const result = store.context.handleGroupOperation_(payload.action, { ...payload, capabilityHash: hash });
+    return { ok: result.ok, status: result.ok ? 200 : result.error === 'state_conflict' ? 409 : 400,
+      json: async () => result };
+  };
+  try {
+    const snapshot = store.context.handleGroupOperation_('snapshot', {
+      groupId: store.groupId, actorId: store.actorId, capabilityHash: hash,
+    }).snapshot;
+    const saved = await transitionParticipantPayment(store.groupId, store.actorId, 'next', store.actorId,
+      null, { snapshot, expectedFromStatus: 'pending' });
+    assert.deepEqual(requests, ['transition_payment'], 'the displayed intent needs one central request');
+    assert.equal(saved.order.paymentStatus, 'requested');
+    assert.equal(saved.snapshot.participants[0].version, 2);
+    const concurrent = store.transition(store.paymentPayload('requested', 'pending', 2, 'qa-concurrent-reversal'));
+    assert.equal(concurrent.ok, true, concurrent.error);
+    await assert.rejects(transitionParticipantPayment(store.groupId, store.actorId, 'next', store.actorId,
+      null, { snapshot: saved.snapshot, expectedFromStatus: 'requested' }),
+    (error) => error.code === 'state_conflict' && error.status === 409);
+    assert.deepEqual(requests, ['transition_payment', 'transition_payment']);
+    assert.equal(store.readOrders().orders[0].paymentStatus, 'pending');
+    assert.equal(store.readOrders().orders[0].version, 3, 'a stale click cannot apply a second payment transition');
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = oldStorage;
+  }
+});
 
 test('centrally saved customer creator order follows payment request and every reversal in My Orders', () => {
   const store = creatorStore();
