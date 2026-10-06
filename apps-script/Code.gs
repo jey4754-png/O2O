@@ -1388,8 +1388,7 @@ function groupPaymentOrderRecords_(sheets, groupIdValue, actorIdValue) {
   const sheet = sheets && sheets.customerOrders;
   if (!sheet || !groupId || !actorId || sheet.getLastRow() < 2) return [];
   const reservationHistory = customerOrderReservationHistory_(sheets, groupId, actorId);
-  return sheet.getRange(2, 1, sheet.getLastRow() - 1, CUSTOMER_ORDER_HEADERS.length)
-    .getValues()
+  return lockedCustomerOrderRows_(sheets)
     .map(function(row, index) {
       try {
         const order = JSON.parse(row[3] || '{}');
@@ -1505,8 +1504,7 @@ function plannedGroupPaymentOrderRecords_(sheets, groupId, actorId) {
   const claimed = Object.create(null);
   records.forEach(function(record) { claimed[record.order._reservationMutationId] = true; });
   const candidates = [];
-  sheet.getRange(2, 1, sheet.getLastRow() - 1, CUSTOMER_ORDER_HEADERS.length)
-    .getValues().forEach(function(row, index) {
+  lockedCustomerOrderRows_(sheets).forEach(function(row, index) {
       let order;
       try { order = JSON.parse(row[3] || '{}'); } catch (error) { return; }
       if (verifiedBoundGroupPurchaseOrder_(order, groupId, actorId, history)) return;
@@ -3053,9 +3051,11 @@ function requireSecureOrderQuantity_(order) {
 }
 
 function customerOrderReservationHistory_(sheets, groupId, actorId, projectionContext) {
-  // Only a single read response supplies this context. Mutations always read
-  // again under their script lock, and no snapshot survives between requests.
-  let records = projectionContext && projectionContext.reservationHistory;
+  // An unlocked read has its own projection context. A locked mutation can
+  // reuse the same verified history until a history write invalidates it;
+  // neither context survives that request or its lock.
+  const readContext = projectionContext || sheets._lockedGroupReadMemo;
+  let records = readContext && readContext.reservationHistory;
   if (!records) {
     const lastRow = sheets.groupHistory.getLastRow();
     const rows = lastRow < 2 ? [] : sheets.groupHistory
@@ -3076,13 +3076,14 @@ function customerOrderReservationHistory_(sheets, groupId, actorId, projectionCo
         result: result && typeof result === 'object' && !Array.isArray(result) ? result : {}
       };
     });
-    if (projectionContext) projectionContext.reservationHistory = records;
+    if (readContext) readContext.reservationHistory = records;
   }
-  return records.filter(function(item) {
+  const matching = records.filter(function(item) {
       return item.groupId === groupId
         && (item.actorId === actorId || (item.action === 'admin_cancel_order' && item.entityId === actorId))
         && ['create', 'join', 'reserve_quantity', 'rollback_reservation', 'cancel_participation', 'admin_cancel_order'].includes(item.action);
     });
+  return sheets._lockedGroupReadMemo ? JSON.parse(JSON.stringify(matching)) : matching;
 }
 
 function customerOrderReservationQuantity_(reservation, history, participantQuantity) {
@@ -4973,8 +4974,10 @@ function decodedSafeCell_(value) {
 }
 
 function findExactRow_(sheet, column, value) {
-  if (!value || sheet.getLastRow() < 2) return 0;
-  const match = sheet.getRange(2, column, sheet.getLastRow() - 1, 1)
+  if (!value) return 0;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  const match = sheet.getRange(2, column, lastRow - 1, 1)
     .createTextFinder(String(value)).matchEntireCell(true).findNext();
   return match ? match.getRow() : 0;
 }
@@ -5036,12 +5039,50 @@ function participantFromRow_(row, rowNumber, includeSecret) {
 }
 
 function getGroupRecord_(sheets, groupId) {
+  const memo = sheets._lockedGroupReadMemo;
+  if (memo && Object.prototype.hasOwnProperty.call(memo.groups, groupId)) {
+    // Callers edit their plan before it is persisted. Never expose the memo's
+    // own record to those edits, including an uncommitted version increment.
+    return Object.assign({}, memo.groups[groupId]);
+  }
   const rowNumber = findExactRow_(sheets.groups, 1, groupId);
   if (!rowNumber) throw groupOperationError_('group_not_found');
-  return groupFromRow_(sheets.groups.getRange(rowNumber, 1, 1, GROUP_HEADERS.length).getValues()[0], rowNumber);
+  const group = groupFromRow_(sheets.groups.getRange(rowNumber, 1, 1, GROUP_HEADERS.length).getValues()[0], rowNumber);
+  if (memo) memo.groups[groupId] = Object.assign({}, group);
+  return group;
+}
+
+function lockedParticipantRows_(sheets) {
+  const memo = sheets._lockedGroupReadMemo;
+  if (memo && memo.participantRows) return memo.participantRows;
+  const lastRow = sheets.groupParticipants.getLastRow();
+  const rows = lastRow < 2 ? [] : sheets.groupParticipants
+    .getRange(2, 1, lastRow - 1, GROUP_PARTICIPANT_HEADERS.length).getValues();
+  if (memo) memo.participantRows = rows;
+  return rows;
+}
+
+function lockedCustomerOrderRows_(sheets) {
+  const memo = sheets._lockedGroupReadMemo;
+  if (memo && memo.customerOrderRows) return memo.customerOrderRows;
+  const lastRow = sheets.customerOrders.getLastRow();
+  const rows = lastRow < 2 ? [] : sheets.customerOrders
+    .getRange(2, 1, lastRow - 1, CUSTOMER_ORDER_HEADERS.length).getValues();
+  if (memo) memo.customerOrderRows = rows;
+  return rows;
 }
 
 function getParticipantRecord_(sheets, groupId, actorId, required) {
+  if (sheets._lockedGroupReadMemo) {
+    const rows = lockedParticipantRows_(sheets);
+    for (let index = 0; index < rows.length; index += 1) {
+      if (String(rows[index][0]) === groupId && String(rows[index][1]) === actorId) {
+        return participantFromRow_(rows[index], index + 2, true);
+      }
+    }
+    if (required !== false) throw groupOperationError_('participant_not_found');
+    return null;
+  }
   const rowNumber = findGroupParticipantRow_(sheets.groupParticipants, groupId, actorId);
   if (!rowNumber) {
     if (required !== false) throw groupOperationError_('participant_not_found');
@@ -5107,6 +5148,11 @@ function requireTargetManager_(actor, group) {
 }
 
 function getParticipantsForGroup_(sheets, groupId, includeSecret) {
+  if (sheets._lockedGroupReadMemo) {
+    return lockedParticipantRows_(sheets)
+      .map(function(row, index) { return participantFromRow_(row, index + 2, includeSecret); })
+      .filter(function(participant) { return participant && participant.groupId === groupId; });
+  }
   const sheet = sheets.groupParticipants;
   if (sheet.getLastRow() < 2) return [];
   return sheet.getRange(2, 1, sheet.getLastRow() - 1, GROUP_PARTICIPANT_HEADERS.length)
@@ -5419,6 +5465,7 @@ function appendGroupHistory_(sheets, data) {
     safeCell_(data.reason || ''), safeCell_(data.clientMutationId || ''), Number(data.version || 0),
     data.createdAt || new Date().toISOString(), JSON.stringify(data.result || { ok: true })
   ]);
+  if (sheets._lockedGroupReadMemo) sheets._lockedGroupReadMemo.reservationHistory = null;
   return typeof sheets.groupHistory.getLastRow === 'function'
     ? sheets.groupHistory.getLastRow()
     : 0;
@@ -5431,6 +5478,7 @@ function appendParticipant_(sheets, data) {
     safeCell_(data.capabilityHash || ''), Number(data.version || 1), data.joinedAt, data.updatedAt,
     Number(data.selectedQuantity || 0)
   ]);
+  if (sheets._lockedGroupReadMemo) sheets._lockedGroupReadMemo.participantRows = null;
 }
 
 function updateParticipantRow_(sheets, participant) {
@@ -5440,6 +5488,7 @@ function updateParticipantRow_(sheets, participant) {
     safeCell_(participant.capabilityHash || ''), Number(participant.version || 1), participant.joinedAt, participant.updatedAt,
     Number(participant.selectedQuantity || 0)
   ]]);
+  if (sheets._lockedGroupReadMemo) sheets._lockedGroupReadMemo.participantRows = null;
 }
 
 function updateGroupRow_(sheets, group) {
@@ -5450,6 +5499,7 @@ function updateGroupRow_(sheets, group) {
     safeCell_(group.updatedBy || ''), safeCell_(group.creatorActorId || group.hostActorId || ''),
     safeCell_(group.hostMode === 'recruiting' ? 'recruiting' : 'self'), Number(group.totalQuantity || 1)
   ]]);
+  if (sheets._lockedGroupReadMemo) delete sheets._lockedGroupReadMemo.groups[group.groupId];
 }
 
 function getCustomerOrderRecord_(sheets, orderIdValue) {
@@ -5531,6 +5581,7 @@ function updateCustomerOrderRecord_(sheets, record) {
   sheets.customerOrders.getRange(record.rowNumber, 1, 1, CUSTOMER_ORDER_HEADERS.length).setValues([[
     new Date(), safeCell_(order.id), textCell_(normalizePhone_(order.customerPhone)), serialized
   ]]);
+  if (sheets._lockedGroupReadMemo) sheets._lockedGroupReadMemo.customerOrderRows = null;
 }
 
 function plainMutationRecord_(value) {
@@ -5737,6 +5788,7 @@ function updateGroupMutationResult_(sheets, rowNumber, result) {
   } else if (range && typeof range.setValues === 'function') {
     range.setValues([[JSON.stringify(result || {})]]);
   }
+  if (sheets._lockedGroupReadMemo) sheets._lockedGroupReadMemo.reservationHistory = null;
 }
 
 function beginGroupMutationIntent_(sheets, history, mutationContract, completionResult, operations) {
@@ -6874,7 +6926,20 @@ function handleGroupOperation_(action, payload) {
       return json_({ ok: true, snapshot: buildGroupSnapshot_(sheets, groupId, actor) });
     }
     lock = acquireScriptLock_();
-    const result = executeGroupMutation_(action, payload, sheets);
+    // Only reuse sheet reads while this request holds the global mutation
+    // lock. Writes invalidate their entries, and the memo is discarded before
+    // unlocking or constructing the response. No authority is cached between
+    // requests or reused by an unlocked read response.
+    sheets._lockedGroupReadMemo = {
+      groups: Object.create(null), participantRows: null,
+      customerOrderRows: null, reservationHistory: null
+    };
+    let result;
+    try {
+      result = executeGroupMutation_(action, payload, sheets);
+    } finally {
+      delete sheets._lockedGroupReadMemo;
+    }
     if (action !== 'mark_read') invalidatePublicDealsCache_();
     lock.releaseLock();
     lock = null;

@@ -96,3 +96,92 @@ test('an unreadable pending-intent batch stops payment before any participant or
   assert.equal(data.customerOrders.rows[1][3], beforeOrder);
   assert.deepEqual(data.groupParticipants.rows[1], beforeParticipant);
 });
+
+test('payment reads its participant table once inside the lock and discards the memo before unlocking', () => {
+  const { context, data, payload } = hostPaymentFixture();
+  let locked = false;
+  let participantReads = 0;
+  context.acquireScriptLock_ = () => {
+    locked = true;
+    return { releaseLock() {
+      assert.equal(data._lockedGroupReadMemo, undefined);
+      locked = false;
+    } };
+  };
+  const getRange = data.groupParticipants.getRange.bind(data.groupParticipants);
+  data.groupParticipants.getRange = (...args) => {
+    const range = getRange(...args);
+    const read = range.getValues.bind(range);
+    range.getValues = () => { if (locked) participantReads += 1; return read(); };
+    return range;
+  };
+  const result = context.handleGroupOperation_('transition_payment', payload);
+  assert.equal(result.ok, true, result.error);
+  assert.equal(participantReads, 1);
+  assert.equal(result.order.paymentStatus, 'requested');
+  assert.equal(data._lockedGroupReadMemo, undefined);
+});
+
+test('an uncommitted local plan cannot change the memoized group or participant authority', () => {
+  const { context, data, dealId, payload } = hostPaymentFixture();
+  const execute = context.executeGroupMutation_;
+  context.executeGroupMutation_ = (action, incoming, sheets) => {
+    const group = context.getGroupRecord_(sheets, dealId);
+    const version = group.version;
+    group.version += 100;
+    group.hostActorId = 'synthetic-uncommitted-host';
+    assert.equal(context.getGroupRecord_(sheets, dealId).version, version);
+    assert.equal(context.getGroupRecord_(sheets, dealId).hostActorId, 'member-test');
+    const participant = context.getParticipantRecord_(sheets, dealId, 'member-test', true);
+    participant.capabilityHash = 'd'.repeat(64);
+    participant.paymentStatus = 'confirmed';
+    const fresh = context.getParticipantRecord_(sheets, dealId, 'member-test', true);
+    assert.equal(fresh.capabilityHash, 'c'.repeat(64));
+    assert.equal(fresh.paymentStatus, 'pending');
+    return execute(action, incoming, sheets);
+  };
+  const result = context.handleGroupOperation_('transition_payment', payload);
+  assert.equal(result.ok, true, result.error);
+  assert.equal(JSON.parse(data.customerOrders.rows[1][3]).paymentStatus, 'requested');
+});
+
+test('a changed capability is rejected on the next invocation after a successful mutation', () => {
+  const { context, data, payload } = hostPaymentFixture();
+  assert.equal(context.handleGroupOperation_('transition_payment', payload).ok, true);
+  data.groupParticipants.rows[1][7] = 'd'.repeat(64);
+  const beforeChat = JSON.stringify(data.groupChat.rows);
+  const result = context.handleGroupOperation_('send_message', {
+    ...payload, body: 'must never be saved', clientMutationId: 'synthetic-revoked-message',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'invalid_capability');
+  assert.equal(JSON.stringify(data.groupChat.rows), beforeChat);
+  assert.equal(data._lockedGroupReadMemo, undefined);
+});
+
+test('a failed write clears memoized authority and retry repairs the durable intent once', () => {
+  const { context, data, payload } = hostPaymentFixture();
+  const getRange = data.groupParticipants.getRange.bind(data.groupParticipants);
+  let fail = true;
+  data.groupParticipants.getRange = (...args) => {
+    const range = getRange(...args);
+    const write = range.setValues.bind(range);
+    range.setValues = (values) => {
+      if (fail && args[0] === 2 && args[1] === 1) {
+        fail = false;
+        throw new Error('synthetic_participant_write_failed');
+      }
+      return write(values);
+    };
+    return range;
+  };
+  assert.equal(context.handleGroupOperation_('transition_payment', payload).ok, false);
+  assert.equal(data._lockedGroupReadMemo, undefined);
+  const result = context.handleGroupOperation_('transition_payment', payload);
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.duplicate, true);
+  assert.equal(result.order.paymentStatus, 'requested');
+  assert.equal(result.order.total, 3340);
+  assert.equal(data.groupParticipants.rows[1][5], 'requested');
+  assert.equal(data._lockedGroupReadMemo, undefined);
+});
