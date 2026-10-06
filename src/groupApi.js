@@ -1991,7 +1991,7 @@ export function setGroupChatLocked(groupId, locked, actorId) {
   }, { allowLocalFallback: false });
 }
 
-export async function fetchUnreadCounts({ adminMode = false, onSnapshot, onError, skipGroupId, previousCounts = {} } = {}) {
+export async function fetchUnreadCounts({ adminMode = false, onSnapshot, onUnreadCount, onError, skipGroupId, previousCounts = {} } = {}) {
   const entries = Object.entries(getGroupCredentials())
     .map(([storageKey, credential]) => ({
       groupId: credential?.groupId || storageKey.split('::')[0],
@@ -2001,14 +2001,20 @@ export async function fetchUnreadCounts({ adminMode = false, onSnapshot, onError
     .filter(({ credential }) => credential.active !== false)
     .filter(({ credential }) => (adminMode ? credential.role === 'admin' : credential.role !== 'admin'));
   const snapshots = await Promise.all(entries.map(async ({ groupId, credential }) => {
-    if (groupId === skipGroupId) return [groupId, null, 0];
+    if (groupId === skipGroupId) {
+      onUnreadCount?.(groupId, 0);
+      return [groupId, null, 0];
+    }
     try {
       const snapshot = await fetchGroupSnapshot(groupId, { actorId: credential.actorId });
       onSnapshot?.(groupId, snapshot, credential.actorId);
+      onUnreadCount?.(groupId, resolveUnreadCount(snapshot, getLastReadSeq(groupId)));
       return [groupId, snapshot];
     } catch (error) {
       onError?.(error);
-      return [groupId, null, error.code === 'group_not_found' ? 0 : (previousCounts[groupId] || 0)];
+      const retainedCount = error.code === 'group_not_found' ? 0 : (previousCounts[groupId] || 0);
+      onUnreadCount?.(groupId, retainedCount);
+      return [groupId, null, retainedCount];
     }
   }));
   return Object.fromEntries(snapshots.map(([groupId, snapshot, retainedCount = 0]) => [

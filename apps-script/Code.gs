@@ -112,9 +112,12 @@ const ADMIN_AUTH_RATE_BLOCK_MS = 15 * 60 * 1000;
 const ADMIN_AUTH_RATE_CLIENT_FAILURE_LIMIT = 5;
 const ADMIN_AUTH_RATE_GLOBAL_FAILURE_LIMIT = 40;
 const ADMIN_AUTH_RATE_MAX_CLIENTS = 48;
-const HISTORIC_CUSTOMER_ORDER_CACHE_PREFIX = 'historic_customer_orders_v2_';
+const HISTORIC_CUSTOMER_ORDER_CACHE_PREFIX = 'historic_customer_orders_v3_';
 const HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS = 21600;
-const HISTORIC_CUSTOMER_ORDER_CACHE_MAX_LENGTH = 90000;
+// A Korean character can use three UTF-8 bytes. Bound chunks by that worst
+// case rather than fitting 90,000 characters into CacheService's 100 KB item.
+const HISTORIC_CUSTOMER_ORDER_CACHE_CHUNK_SIZE = 30000;
+const HISTORIC_CUSTOMER_ORDER_CACHE_MAX_CHUNKS = 32;
 const PUBLIC_DEALS_CACHE_KEY = 'public_deals_v4';
 const PUBLIC_DEALS_CACHE_CHUNK_PREFIX = 'public_deals_v4_chunk_';
 const PUBLIC_DEALS_CACHE_CHUNK_SIZE = 60000;
@@ -895,17 +898,30 @@ function historicCustomerOrderCacheKey_(phone, dealId) {
 
 function cachedHistoricCustomerOrders_(phone, eventRowCount, events, dealId) {
   try {
-    const value = CacheService.getScriptCache()
-      .get(historicCustomerOrderCacheKey_(phone, dealId));
+    const cache = CacheService.getScriptCache();
+    const key = historicCustomerOrderCacheKey_(phone, dealId);
+    const value = cache.get(key);
     if (typeof value !== 'string') return null;
-    const parsed = JSON.parse(value);
+    const manifest = JSON.parse(value);
+    if (!manifest || !/^[a-f0-9]{64}$/.test(String(manifest.generation || ''))
+      || !Number.isInteger(manifest.chunks) || manifest.chunks < 1
+      || manifest.chunks > HISTORIC_CUSTOMER_ORDER_CACHE_MAX_CHUNKS) return null;
+    const keys = Array.from({ length: manifest.chunks }, function(_, index) {
+      return key + '_' + manifest.generation + '_' + index;
+    });
+    const chunks = typeof cache.getAll === 'function' ? cache.getAll(keys)
+      : keys.reduce(function(values, chunkKey) { values[chunkKey] = cache.get(chunkKey); return values; }, {});
+    if (keys.some(function(chunkKey) { return typeof chunks[chunkKey] !== 'string'; })) return null;
+    const serialized = keys.map(function(chunkKey) { return chunks[chunkKey]; }).join('');
+    if (sha256Hex_(serialized) !== manifest.generation) return null;
+    const parsed = JSON.parse(serialized);
     if (!parsed || !Array.isArray(parsed.orders)
       || !Number.isInteger(parsed.throughRow) || parsed.throughRow < 1
       || parsed.throughRow > eventRowCount) return null;
     if (parsed.throughRow === eventRowCount) return parsed.orders;
     if (!events) return null;
     const appended = historicCustomerOrders_(events, phone, dealId || '', parsed.throughRow + 1, eventRowCount);
-    const orders = parsed.orders.concat(appended);
+    const orders = compactHistoricCustomerOrders_(parsed.orders.concat(appended));
     cacheHistoricCustomerOrders_(phone, eventRowCount, orders, dealId);
     return orders;
   } catch (error) {
@@ -913,15 +929,59 @@ function cachedHistoricCustomerOrders_(phone, eventRowCount, events, dealId) {
   }
 }
 
+function compactHistoricCustomerOrders_(orders) {
+  const latest = Object.create(null);
+  (orders || []).forEach(function(order, index) {
+    if (!order || !order.id) return;
+    // Keep a winner for EVERY ownership proof, including missing/invalid
+    // proofs. Merging by id alone would hide conflicting owners and grant data.
+    const key = JSON.stringify([String(order.id), String(order._customerCapabilityHash || '').toLowerCase()]);
+    const previous = latest[key];
+    const version = secureOrderVersion_(order);
+    const time = new Date(order.statusUpdatedAt || order.syncedAt || order.createdAt || 0).getTime() || 0;
+    if (!previous || version > previous.version || (version === previous.version && time >= previous.time)) {
+      latest[key] = { order: order, version: version, time: time, index: index };
+    }
+  });
+  // Preserve the input tie order used by mergeCustomerOrderSnapshots_.
+  return Object.keys(latest).map(function(key) { return latest[key]; })
+    .sort(function(a, b) { return a.index - b.index; })
+    .map(function(entry) { return entry.order; });
+}
+
 function cacheHistoricCustomerOrders_(phone, eventRowCount, orders, dealId) {
   try {
-    const serialized = JSON.stringify({ throughRow: eventRowCount, orders: orders });
-    if (serialized.length > HISTORIC_CUSTOMER_ORDER_CACHE_MAX_LENGTH) return;
-    CacheService.getScriptCache().put(
-      historicCustomerOrderCacheKey_(phone, dealId),
-      serialized,
-      HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS
-    );
+    const serialized = JSON.stringify({ throughRow: eventRowCount, orders: compactHistoricCustomerOrders_(orders) });
+    const count = Math.ceil(serialized.length / HISTORIC_CUSTOMER_ORDER_CACHE_CHUNK_SIZE);
+    if (count < 1 || count > HISTORIC_CUSTOMER_ORDER_CACHE_MAX_CHUNKS) return;
+    const generation = sha256Hex_(serialized);
+    const key = historicCustomerOrderCacheKey_(phone, dealId);
+    const cache = CacheService.getScriptCache();
+    let previous = null;
+    try { previous = JSON.parse(cache.get(key) || 'null'); } catch (ignored) {}
+    const values = {};
+    for (let index = 0; index < count; index += 1) {
+      values[key + '_' + generation + '_' + index] = serialized.slice(
+        index * HISTORIC_CUSTOMER_ORDER_CACHE_CHUNK_SIZE,
+        (index + 1) * HISTORIC_CUSTOMER_ORDER_CACHE_CHUNK_SIZE
+      );
+    }
+    if (typeof cache.putAll === 'function') cache.putAll(values, HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS);
+    else Object.keys(values).forEach(function(chunkKey) { cache.put(chunkKey, values[chunkKey], HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS); });
+    // Publish the manifest last. Content-addressed chunks prevent overlapping
+    // refreshes from joining different watermarks; eviction forces a rebuild.
+    cache.put(key, JSON.stringify({ generation: generation, chunks: count }), HISTORIC_CUSTOMER_ORDER_CACHE_SECONDS);
+    // Every analytics append advances the watermark. Retire the previous
+    // namespace so one customer's refreshes do not consume the shared cache.
+    if (previous && previous.generation !== generation
+      && /^[a-f0-9]{64}$/.test(String(previous.generation || ''))
+      && Number.isInteger(previous.chunks) && previous.chunks > 0
+      && previous.chunks <= HISTORIC_CUSTOMER_ORDER_CACHE_MAX_CHUNKS
+      && typeof cache.removeAll === 'function') {
+      cache.removeAll(Array.from({ length: previous.chunks }, function(_, index) {
+        return key + '_' + previous.generation + '_' + index;
+      }));
+    }
   } catch (error) {}
 }
 

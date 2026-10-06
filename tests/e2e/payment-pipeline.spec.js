@@ -94,6 +94,40 @@ test('실제 API·GAS: 호스트 본인 입금 요청·취소·재요청·확인
   }
 });
 
+test('느린 행동 수집 응답이 있어도 그룹 생성·채팅·입금 요청을 기다리게 하지 않는다', async ({ page }, testInfo) => {
+  const delayed = deferred();
+  const release = deferred();
+  let heldEntry;
+  const pipeline = await installPaymentPipeline(page, {
+    async beforeApi(entry) {
+      if (entry.path !== '/api/collect' || heldEntry) return;
+      heldEntry = entry;
+      delayed.resolve();
+      await release.promise;
+    },
+  });
+  try {
+    await createSelfHostedGroup(page);
+    await delayed.promise;
+    await expect.poll(() => pipeline.orders().length).toBe(1);
+    await page.getByLabel('메시지 입력').fill('행동 수집 응답 대기 중 전송');
+    await page.getByRole('button', { name: '메시지 전송' }).click();
+    await expect(page.locator('.chat-message').filter({ hasText: '행동 수집 응답 대기 중 전송' })).toBeVisible();
+    await clickPayment(page, '입금했어요');
+    await expect(page.locator('.payment-chip.requested')).toBeVisible();
+    assertCentralPayment(pipeline, 'requested', 2);
+    expect(paymentRequests(pipeline)).toHaveLength(1);
+    expect(heldEntry.result).toBeUndefined();
+    await page.screenshot({ path: testInfo.outputPath('foreground-during-slow-analytics.png') });
+    release.resolve();
+    await expect.poll(() => heldEntry.status).toBe(202);
+    expect(pipeline.failures).toEqual([]);
+  } finally {
+    release.resolve();
+    await pipeline.close();
+  }
+});
+
 test('실제 API·GAS: 전체 이력 504·늦은 이전 상태·저장 응답 유실에도 확인된 호스트 주문은 한 번만 입금 요청된다', async ({ page }) => {
   const heldRead = deferred();
   const releaseRead = deferred();

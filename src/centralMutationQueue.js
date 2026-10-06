@@ -1,38 +1,39 @@
 const foregroundQueue = [];
 const backgroundQueue = [];
 
-let draining = false;
+let foregroundActive = false;
+let backgroundActive = false;
 let drainScheduled = false;
 
 function scheduleDrain() {
   if (
-    draining
-    || drainScheduled
+    drainScheduled
     || (foregroundQueue.length === 0 && backgroundQueue.length === 0)
   ) return;
 
   drainScheduled = true;
   queueMicrotask(() => {
     drainScheduled = false;
-    void drainQueue();
+    drainQueue();
   });
 }
-async function drainQueue() {
-  if (draining) return;
-  draining = true;
-  try {
-    while (foregroundQueue.length > 0 || backgroundQueue.length > 0) {
-      const entry = foregroundQueue.shift() || backgroundQueue.shift();
-      try {
-        entry.resolve(await entry.operation());
-      } catch (error) {
-        entry.reject(error);
-      }
-    }
-  } finally {
-    draining = false;
+function drainQueue() {
+  // A slow analytics/read-receipt response must not hold the user's next
+  // message or payment intent. User mutations remain serial, and at most one
+  // background request may overlap them. No further background work starts
+  // until both lanes and the waiting foreground queue are idle.
+  const priority = !foregroundActive && foregroundQueue.length > 0 ? 'foreground'
+    : !foregroundActive && !backgroundActive && foregroundQueue.length === 0
+      && backgroundQueue.length > 0 ? 'background' : null;
+  if (!priority) return;
+  const entry = (priority === 'foreground' ? foregroundQueue : backgroundQueue).shift();
+  if (priority === 'foreground') foregroundActive = true;
+  else backgroundActive = true;
+  void Promise.resolve().then(entry.operation).then(entry.resolve, entry.reject).finally(() => {
+    if (priority === 'foreground') foregroundActive = false;
+    else backgroundActive = false;
     scheduleDrain();
-  }
+  });
 }
 
 export function runCentralMutation(operation, { priority = 'foreground' } = {}) {

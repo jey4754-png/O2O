@@ -1728,6 +1728,10 @@ function App() {
       try {
         const next = await fetchUnreadCounts({ adminMode: customerAdminMode, skipGroupId: openUnreadRoomId,
           previousCounts: unreadCountsRef.current,
+          onUnreadCount: (groupId, count) => {
+            if (cancelled) return;
+            setUnreadCounts((current) => current[groupId] === count ? current : { ...current, [groupId]: count });
+          },
           onError: (error) => {
             if ([429, 500, 502, 503, 504].includes(error.status) || error.name === 'TypeError') transientFailure = true;
           }, onSnapshot: (groupId, snapshot, actorId) => {

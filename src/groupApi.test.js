@@ -2168,3 +2168,41 @@ test('unread polling skips the visible room, retains badges on failure and resum
     if (previousStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = previousStorage;
   }
 });
+
+test('one slow room does not delay unread counts from another room', async () => {
+  const previousStorage = globalThis.localStorage;
+  const previousFetch = globalThis.fetch;
+  const storage = memoryStorage();
+  const actorId = 'visitor-independent-unread';
+  storage.setItem('o2o_mvp_group_credentials_v1', JSON.stringify(Object.fromEntries(
+    ['slow-room', 'ready-room'].map(groupId => [`${groupId}::${actorId}`, {
+      groupId, actorId, role: 'member', capabilityToken: `group-${'q'.repeat(64)}`,
+    }]),
+  )));
+  globalThis.localStorage = storage;
+  let releaseSlow;
+  const slow = new Promise(resolve => { releaseSlow = resolve; });
+  globalThis.fetch = async (_url, options) => {
+    const { groupId } = JSON.parse(options.body);
+    if (groupId === 'slow-room') await slow;
+    return { ok: true, status: 200, json: async () => ({ ok: true,
+      snapshot: { group: { groupId }, lastSeq: 3, unreadCount: 3, messages: [], participants: [], history: [] },
+    }) };
+  };
+  const updates = [];
+  let completed = false;
+  const read = fetchUnreadCounts({ onUnreadCount: (groupId, count) => updates.push([groupId, count]) })
+    .then(result => { completed = true; return result; });
+  try {
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(updates, [['ready-room', 3]]);
+    assert.equal(completed, false);
+    releaseSlow();
+    assert.deepEqual(await read, { 'slow-room': 3, 'ready-room': 3 });
+  } finally {
+    releaseSlow();
+    await read;
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage; else globalThis.localStorage = previousStorage;
+  }
+});

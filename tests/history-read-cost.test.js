@@ -276,6 +276,69 @@ test('analytics appends scan only the suffix and new legacy conflicts still revo
   assert.deepEqual(read().orders.map((item) => item.id), [first.id], 'a truncated sheet requires a full rebuild');
 });
 
+test('large repeated history fits a chunked cache while preserving every ownership conflict', () => {
+  const phone = '01011112222';
+  const mine = 'b'.repeat(64);
+  const records = Array.from({ length: 4500 }, (_, index) => historyOrder(String(1700000400000 + index % 90), {
+    _customerCapabilityHash: mine, version: index + 1, description: '한글 주문 기록 '.repeat(70),
+  }));
+  const conflict = { ...records[0], version: 9999, _customerCapabilityHash: 'c'.repeat(64) };
+  const { context, data, eventRows } = customerHistoryStore({ historic: records.concat(conflict) });
+  context.Utilities = { DigestAlgorithm: { SHA_256: 'SHA_256' }, Charset: { UTF_8: 'UTF_8' },
+    computeDigest: (_algorithm, value) => [...createHash('sha256').update(String(value)).digest()] };
+  const cache = new Map();
+  context.CacheService = { getScriptCache: () => ({
+    get: key => cache.get(key) ?? null, getAll: keys => Object.fromEntries(keys.map(k => [k, cache.get(k)])),
+    removeAll(keys) { keys.forEach(key => cache.delete(key)); },
+    put(key, value) { assert.ok(Buffer.byteLength(value) < 100000); cache.set(key, value); },
+    putAll(values) { for (const [key, value] of Object.entries(values)) {
+      assert.ok(Buffer.byteLength(value) < 100000); cache.set(key, value);
+    } },
+  }) };
+  let payloadReads = 0;
+  const getRange = data.events.getRange.bind(data.events);
+  data.events.getRange = (...args) => { if (args[1] === 1) payloadReads++; return getRange(...args); };
+  const read = () => context.getCustomerOrdersResponse_(phone, 'customer-history-visitor', mine);
+  const first = read();
+  assert.equal(first.ok, true);
+  assert.equal(first.orders.length, 89);
+  const firstReads = payloadReads;
+  const key = context.historicCustomerOrderCacheKey_(phone);
+  const manifest = JSON.parse(cache.get(key));
+  assert.ok(manifest.chunks > 1, 'a cache larger than one item must still be retained');
+  assert.deepEqual(read(), first);
+  assert.equal(payloadReads, firstReads, 'repeat reads must reuse the large historic cache');
+  const compact = context.cachedHistoricCustomerOrders_(phone, eventRows.length, data.events);
+  assert.equal(compact.length, 91);
+  assert.deepEqual(Array.from(context.mergeCustomerOrderSnapshots_(records)),
+    Array.from(context.mergeCustomerOrderSnapshots_(context.compactHistoricCustomerOrders_(records))));
+  // A missing/corrupted generation cannot expose a partial authoritative set.
+  cache.delete(`${key}_${manifest.generation}_0`);
+  assert.equal(context.cachedHistoricCustomerOrders_(phone, eventRows.length, data.events), null);
+  assert.deepEqual(read(), first);
+  assert.ok(payloadReads > firstReads);
+  const oldChunks = cache.size;
+  const analytics = Array(16).fill(''); analytics[6] = 'screen_view'; eventRows.push(analytics);
+  assert.deepEqual(read(), first);
+  assert.equal(cache.size, oldChunks, 'a new watermark retires old content chunks');
+});
+
+test('historic compaction preserves unproved, invalid and conflicting hashes with canonical tie ordering', () => {
+  const { context } = customerHistoryStore();
+  const id = '1700000409999';
+  const records = [
+    historyOrder(id, { version: 1, _customerCapabilityHash: 'a'.repeat(64) }),
+    historyOrder(id, { version: 1, _customerCapabilityHash: 'b'.repeat(64) }),
+    historyOrder(id, { version: 1, title: '후순위 동일 버전', _customerCapabilityHash: 'a'.repeat(64) }),
+    historyOrder(id, { version: 1 }),
+    historyOrder(id, { version: 1, _customerCapabilityHash: 'invalid-hash' }),
+  ];
+  const compact = context.compactHistoricCustomerOrders_(records);
+  assert.equal(compact.length, 4);
+  assert.deepEqual(Array.from(context.mergeCustomerOrderSnapshots_(compact)), Array.from(context.mergeCustomerOrderSnapshots_(records)));
+  assert.equal(context.filterCustomerOrdersForProof_(compact, 'customer-history-visitor', 'a'.repeat(64), null).length, 0);
+});
+
 test('a phone history read selects order snapshots by exact event name, not by a 4-digit phone match', () => {
   const { context, data } = adminStore();
   // Analytics rows carrying the same last 4 phone digits must not drive the scan.
