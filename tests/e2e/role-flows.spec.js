@@ -52,6 +52,10 @@ async function mockCentralApis(page, {
   paymentTransitionError = '',
 } = {}) {
   let dealPublishFailureIndex = 0;
+  // Playwright gives the newest matching route priority. Keep the preceding
+  // handler installed until the replacement is registered: background recovery
+  // and polls can otherwise hit Vite's real 404 in the unroute/route gap and
+  // trigger a valid terminal rollback instead of the intended network fixture.
   await page.route('**/api/**', async (route) => {
     const path = new URL(route.request().url()).pathname;
     let request = {};
@@ -839,7 +843,6 @@ test('사장님 상품 관리의 홈 버튼은 사장님 등록 화면으로 돌
 
 test('사장님 상품 수량은 등록·재접속·관리 화면까지 동일하게 유지된다', async ({ page }) => {
   const requests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests });
   await page.goto('/owner');
   await completeOnboarding(page, { name: '상품 검수' });
@@ -877,7 +880,6 @@ test('사장님 상품 수량은 등록·재접속·관리 화면까지 동일�
 
 test('등록 완료 사진은 세로 원본 전체를 표시하고 상품 삭제 진입은 노출하지 않는다', async ({ page }) => {
   const requests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests });
   await page.route(FALLBACK_PRODUCT_IMAGE, (route) => route.fulfill({
     contentType: 'image/svg+xml',
@@ -912,7 +914,6 @@ test('등록 완료 사진은 세로 원본 전체를 표시하고 상품 삭제
 
 test('사장님 상품은 중앙 저장 성공 전에 완료 처리되지 않고 재시도 ID를 유지한다', async ({ page }) => {
   const publishAttempts = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { failDealPublish: true, publishAttempts });
   await page.goto('/owner');
   await completeOnboarding(page, { name: '등록 실패 검수' });
@@ -928,7 +929,6 @@ test('사장님 상품은 중앙 저장 성공 전에 완료 처리되지 않고
   await expect(page.getByRole('heading', { name: '메뉴 상세' })).toBeVisible();
   await expect(page.getByRole('heading', { name: '등록 완료' })).toHaveCount(0);
 
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { publishAttempts });
   await page.getByRole('button', { name: '상품 등록 완료' }).click();
 
@@ -940,7 +940,6 @@ test('사장님 상품은 중앙 저장 성공 전에 완료 처리되지 않고
 test('사장님 상품등록은 일시적인 502·503을 같은 상품으로 자동 복구한다', async ({ page }) => {
   const requests = [];
   const publishAttempts = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     dealPublishFailures: [
       { status: 502, error: 'upstream_invalid_response' },
@@ -974,7 +973,6 @@ test('사장님 상품등록은 일시적인 502·503을 같은 상품으로 자
 
 test('고객 그룹은 중앙 공개 실패를 완료로 처리하지 않고 재시도 ID를 유지한다', async ({ page }) => {
   const publishAttempts = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { failDealPublish: true, publishAttempts });
   await page.goto('/customer');
   await completeOnboarding(page, { name: '그룹 등록 검수' });
@@ -989,7 +987,6 @@ test('고객 그룹은 중앙 공개 실패를 완료로 처리하지 않고 재
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem('o2o_mvp_customer_groups') || '[]')))
     .toEqual([]);
 
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { publishAttempts });
   await page.getByRole('button', { name: '그룹방 생성' }).click();
 
@@ -1004,7 +1001,6 @@ test('기존 로컬 상품만 남은 사용자 그룹은 같은 ID로 중앙 그
   const requests = [];
   const groupState = new Map();
   const legacyEventId = '9b2c3d4e-5f60-4781-9abc-def012345678';
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     requests,
     groupState,
@@ -1146,7 +1142,6 @@ test('owner 복구가 소유권 미바인으로 거절된 레거시 그룹만 re
   const legacyEventId = '0f47c12a-30d7-4fb0-90e7-4c1f891b8d52';
   const groupCapabilityToken = `group-${'u'.repeat(64)}`;
   const ownerCapabilityToken = `deal-${'u'.repeat(64)}`;
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     requests,
     groupState,
@@ -1197,7 +1192,6 @@ test('owner 복구가 forbidden이면 receipt가 있어도 레거시 복구로 �
   const legacyEventId = 'f3375d45-5796-4c09-8112-50d44588007d';
   const groupCapabilityToken = `group-${'f'.repeat(64)}`;
   const ownerCapabilityToken = `deal-${'f'.repeat(64)}`;
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     requests,
     missingGroupIds: new Set([dealId]),
@@ -1238,7 +1232,6 @@ test('원 브라우저의 과거 생성 receipt는 편집 권한 없이 누락�
   const actorId = 'visitor-legacy-receipt-creator';
   const legacyEventId = 'f81d4fae-7dec-4a45-8a6f-67c6f0f5e123';
   const groupCapabilityToken = `group-${'r'.repeat(64)}`;
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     requests,
     groupState,
@@ -1382,7 +1375,6 @@ test('원 브라우저의 과거 생성 receipt는 편집 권한 없이 누락�
 
 test('로컬 상품 표시만 위조해도 기존 소유권 또는 그룹 권한 없이는 중앙 그룹을 만들 수 없다', async ({ page }) => {
   const requests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests });
   await page.addInitScript(() => {
     const actorId = 'visitor-forged-local-creator';
@@ -1432,7 +1424,6 @@ test('사용자가 등록한 그룹은 재로그인 후에도 같은 상품·참
   const requests = [];
   const groupState = new Map();
   const committedOrders = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests, groupState, committedOrders });
   await page.goto('/customer');
   await completeOnboarding(page, {
@@ -1500,7 +1491,6 @@ test('사용자 직접등록은 일시적인 502·503을 같은 그룹과 주문
   const requests = [];
   const groupState = new Map();
   const committedOrders = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     dealPublishFailures: [
       { status: 502, error: 'upstream_invalid_response' },
@@ -1552,7 +1542,6 @@ test('사용자 자동계산 등록은 금액·수량을 유지하며 일시 장
   const requests = [];
   const groupState = new Map();
   const committedOrders = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     dealPublishFailures: [
       { status: 502, error: 'upstream_invalid_response' },
@@ -1603,7 +1592,6 @@ test('사용자 자동계산 등록은 금액·수량을 유지하며 일시 장
 
 test('고객 그룹은 중앙 그룹방 생성 실패 시 공개 글과 로컬 완료 상태를 남기지 않는다', async ({ page }) => {
   const requests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { failGroupCreate: true, requests });
   await page.goto('/customer');
   await completeOnboarding(page, { name: '중앙 생성 실패 검수' });
@@ -1622,7 +1610,6 @@ test('고객 그룹은 중앙 그룹방 생성 실패 시 공개 글과 로컬 �
 
 test('고객 그룹은 공개 등록 전 영구 생성 거절도 삭제 요청 없이 정리한다', async ({ page }) => {
   const requests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { rejectGroupCreateTerminal: true, requests });
   await page.goto('/customer');
   await completeOnboarding(page, { name: '공개 전 보상 검수' });
@@ -1647,7 +1634,6 @@ test('고객 그룹 생성 주문은 확인 불가와 복구 실행 뒤에도 �
   const requests = [];
   const committedOrders = new Map();
   const groupState = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     abortCommittedOrderResponses: true,
     abortOrderReads: true,
@@ -1683,7 +1669,6 @@ test('고객 그룹 생성 주문은 확인 불가와 복구 실행 뒤에도 �
   )));
   expect(attemptsAfterRecovery.map((attempt) => attempt.orderId)).toEqual([pendingOrderId]);
 
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests, committedOrders, groupState });
   await page.getByRole('button', { name: '그룹방 생성' }).click();
 
@@ -1702,7 +1687,6 @@ test('고객 그룹 생성 주문은 확인 불가와 복구 실행 뒤에도 �
 test('고객 그룹 생성 주문이 영구 거절되면 공개 그룹과 create 예약을 원복하고 새 ID로 재시도한다', async ({ page }) => {
   const failedRequests = [];
   const groupState = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     failOrderPublish: true,
     dealDeleteAlreadyDeleted: true,
@@ -1744,7 +1728,6 @@ test('고객 그룹 생성 주문이 영구 거절되면 공개 그룹과 create
   ))).toEqual({});
 
   const retryRequests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests: retryRequests, groupState });
   await page.getByRole('button', { name: /그룹방 생성/ }).click();
 
@@ -1760,7 +1743,6 @@ test('고객 그룹 생성 주문이 영구 거절되면 공개 그룹과 create
 test('주문 저장이 영구 거절되면 예약 수량을 복구하고 새 ID로 재시도한다', async ({ page }) => {
   const firstRequests = [];
   const groupState = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { failOrderPublish: true, requests: firstRequests, groupState });
   await page.goto('/customer');
   await completeOnboarding(page, { name: '예약 복구 검수' });
@@ -1779,7 +1761,6 @@ test('주문 저장이 영구 거절되면 예약 수량을 복구하고 새 ID�
     .toEqual([]);
 
   const retryRequests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests: retryRequests, groupState });
   await page.getByRole('button', { name: '참여 완료하기' }).click();
   await expect(page.getByRole('heading', { name: '그룹 참여 완료' })).toBeVisible();
@@ -1791,7 +1772,6 @@ test('주문 저장이 영구 거절되면 예약 수량을 복구하고 새 ID�
 test('주문 저장 후 응답만 유실되면 중앙 주문을 재확인하고 중복 없이 완료한다', async ({ page }) => {
   const requests = [];
   const committedOrders = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     abortCommittedOrderResponses: true,
     requests,
@@ -1821,7 +1801,6 @@ test('그룹 채팅의 입금확인 요청은 즉시 내 주문 상태와 안내
   const requests = [];
   const committedOrders = new Map();
   const groupState = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests, committedOrders, groupState });
   await page.goto('/customer');
   await completeOnboarding(page, { name: '입금 상태 연동 검수' });
@@ -1877,7 +1856,6 @@ test('그룹 채팅의 입금확인 요청은 즉시 내 주문 상태와 안내
 test('주문 연결을 검증할 수 없으면 입금 상태를 바꾸지 않고 관리자 점검을 안내한다', async ({ page }) => {
   const requests = [];
   const committedOrders = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     requests,
     committedOrders,
@@ -1918,7 +1896,6 @@ test('호스트 자기 입금은 지연·실패·재시도가 버튼 옆에 보�
   let heldSnapshots = 0;
   let releaseFailureSnapshot;
   const failureSnapshotResponse = new Promise((resolve) => { releaseFailureSnapshot = resolve; });
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests });
   await page.route('**/api/group-ops', async (route) => {
     const request = route.request().postDataJSON() || {};
@@ -2001,7 +1978,6 @@ test('호스트 자기 입금은 지연·실패·재시도가 버튼 옆에 보�
 
 test('사라진 참여자의 보류된 입금 요청은 같은 요청으로 확인한 뒤 현재 입금 버튼 잠금을 해제한다', async ({ page }, testInfo) => {
   const paymentRequests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page);
   await page.route('**/api/group-ops', async (route) => {
     const request = route.request().postDataJSON() || {};
@@ -2047,7 +2023,6 @@ test('사라진 참여자의 보류된 입금 요청은 같은 요청으로 확�
 
 test('호스트 입금완료 되돌리기와 요청 취소는 참여 취소 숨김과 무관하게 작동한다', async ({ page }) => {
   const requests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests });
   await page.goto('/customer');
   await completeOnboarding(page, { name: '입금 복구 검수' });
@@ -2086,7 +2061,6 @@ test('사용자 생성 그룹은 중앙 주문 저장 확인 뒤에만 입금 �
   let failPublication = false;
   let rejectStaleReservation = false;
   let canonicalReservation = null;
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     requests, committedOrders,
     shouldFailOrderPublish: (request) => failPublication
@@ -2187,7 +2161,6 @@ test('다른 기기의 입금완료·되돌리기는 채팅 갱신 후 내 주�
   const requests = [];
   const committedOrders = new Map();
   const groupState = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests, committedOrders, groupState });
   await page.goto('/customer');
   await completeOnboarding(page, { name: '외부 입금 변경 검수' });
@@ -2248,7 +2221,6 @@ test('주문 저장 여부를 확인할 수 없으면 완료로 넘기지 않고
   const requests = [];
   const committedOrders = new Map();
   const groupState = new Map();
-  await page.unroute('**/api/**');
   await mockCentralApis(page, {
     abortCommittedOrderResponses: true,
     abortOrderReads: true,
@@ -2273,7 +2245,6 @@ test('주문 저장 여부를 확인할 수 없으면 완료로 넘기지 않고
   expect(pendingOrders).toHaveLength(1);
   const pendingOrderId = pendingOrders[0].id;
 
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests, committedOrders, groupState });
   await page.getByRole('button', { name: '참여 완료하기' }).click();
 
@@ -2472,7 +2443,6 @@ test('사장님 읽기 전용 상품 열기는 상태 알림을 읽음 처리하
 
 test('사장님 사용자 미리보기는 탐색만 가능하고 고객 데이터를 변경하지 않는다', async ({ page }) => {
   const requests = [];
-  await page.unroute('**/api/**');
   await mockCentralApis(page, { requests });
   await page.goto('/owner');
   await completeOnboarding(page, { name: '미리보기 사장님' });

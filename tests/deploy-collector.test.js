@@ -44,9 +44,9 @@ test('웹 앱 실행 계정 설정을 매니페스트에서 읽는다', () => {
   assert.deepEqual(webAppSettings('not json'), { executeAs: 'UNKNOWN', access: 'UNKNOWN' });
 });
 
-test('배포를 갱신하면 실행 계정이 바뀌는 설정에서는 명시적 수락 없이 거부한다', () => {
+test('매니페스트만으로 실행 계정을 확정할 수 없는 설정은 검토 수락 없이 갱신하지 않는다', () => {
   for (const executeAs of ['USER_DEPLOYING', 'UNKNOWN']) {
-    assert.throws(() => assertMayUpdateDeployment({ executeAs }, false), /would_run_collector_as_this_account/);
+    assert.throws(() => assertMayUpdateDeployment({ executeAs }, false), /requires_run_as_review/);
     assert.doesNotThrow(() => assertMayUpdateDeployment({ executeAs }, true));
   }
   assert.doesNotThrow(() => assertMayUpdateDeployment({ executeAs: 'USER_ACCESSING' }, false));
@@ -65,10 +65,12 @@ test('명령 인자를 해석한다', () => {
   assert.equal(parseArgs(['--probe']).mode, 'probe');
 });
 
-test('소유자 안내는 버전만 고르고 실행 계정·액세스 설정은 그대로 두게 한다', () => {
+test('배포 권한이 확인된 계정 안내는 기존 배포의 버전만 고르고 실행·액세스 설정을 유지한다', () => {
   const steps = ownerSteps('32');
   assert.match(steps, /버전 32/);
   assert.match(steps, /바꾸지 않는다/);
+  assert.match(steps, /배포 갱신 권한이 확인된 계정/);
+  assert.match(steps, /기존 웹 앱 배포 선택/);
 });
 
 test('배포를 바꾸는 명령은 모두 복제한 프로젝트 폴더 안에서 실행한다', () => {

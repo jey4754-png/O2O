@@ -4,18 +4,22 @@
 //
 //   node scripts/deploy-collector.mjs --check          read-only: access, deployment, versions, run-as account
 //   node scripts/deploy-collector.mjs --stage [-d "설명"]    push this repo's Code.gs and create a version,
-//                                                      WITHOUT changing the live deployment; the owner then
+//                                                      WITHOUT changing the live deployment; an authorized account then
 //                                                      points the deployment at that version in the editor
 //   node scripts/deploy-collector.mjs --deploy [-d "설명"]   stage, then point the live deployment at it
 //   node scripts/deploy-collector.mjs --probe          point the deployment at its CURRENT version again
 //   node scripts/deploy-collector.mjs --rollback <N>   point the deployment back at version N
 //
-// --deploy, --probe and --rollback update the live deployment. When the web app
-// is set to execute as the deploying user (executeAs USER_DEPLOYING), Google runs
-// it as whoever updated the deployment last: "The web app runs as the user who
-// deployed it." Doing that from an editor account moves production onto that
-// account, which fails if the account never authorized the script. These modes
-// therefore refuse unless --accept-run-as-this-account is given; use --stage.
+// --deploy, --probe and --rollback update the live deployment. A versioned
+// deployment retains its owner when its version changes; manifest executeAs
+// alone does not identify the actual execution account or the caller's update
+// permission. Verify the existing deployment's execution/access settings and
+// the account's permission before promoting. A shared editor can update this
+// project's deployment when Google allows that account to do so; ownership is
+// not the only possible authorization. The CLI conservatively requires
+// --accept-run-as-this-account for USER_DEPLOYING/unknown settings; --stage
+// prepares a version without changing production.
+// https://developers.google.com/apps-script/concepts/deployments
 //
 // The remote project is cloned into a private temporary directory outside the
 // repository. The real SPREADSHEET_ID / INGEST_TOKEN lines are read from the
@@ -75,12 +79,12 @@ export function webAppSettings(manifestText) {
   }
 }
 
-// Updating the live deployment is only identity-neutral when the web app runs as
-// the visitor. Anything else needs the caller's explicit acceptance.
+// Keep the explicit execution-account review for modes whose actual execution
+// identity cannot be established from the manifest alone.
 export function assertMayUpdateDeployment(settings, acceptRunAsThisAccount) {
   if (settings.executeAs === 'USER_ACCESSING' || acceptRunAsThisAccount) return;
-  throw new Error(`deployment_update_would_run_collector_as_this_account(executeAs=${settings.executeAs}); `
-    + `use --stage and ask the script owner to deploy the version, or pass ${ACCEPT_RUN_AS_FLAG}`);
+  throw new Error(`deployment_update_requires_run_as_review(executeAs=${settings.executeAs}); `
+    + `use --stage and update with an account whose deployment permission and execution settings have been verified, or pass ${ACCEPT_RUN_AS_FLAG} after that review`);
 }
 
 export function parseArgs(argv) {
@@ -97,7 +101,7 @@ export function parseArgs(argv) {
 }
 
 export function ownerSteps(version) {
-  return `owner (script owner account) in the Apps Script editor: 배포 → 배포 관리 → 웹 앱 배포 선택 → 연필 → 버전 ${version} → 배포 `
+  return `배포 갱신 권한이 확인된 계정으로 Apps Script 편집기에서: 배포 → 배포 관리 → 기존 웹 앱 배포 선택 → 연필 → 버전 ${version} → 배포 `
     + '(\'다음 사용자 인증 정보로 실행\'·\'액세스 권한\'은 바꾸지 않는다)';
 }
 
@@ -140,8 +144,8 @@ function cloneRemote(version) {
 function printSettings(settings) {
   console.log(`web app: executeAs ${settings.executeAs}, access ${settings.access}`);
   if (settings.executeAs !== 'USER_ACCESSING') {
-    console.log('note: updating the live deployment from this account would make the collector run as this account; '
-      + 'use --stage and let the script owner deploy the version');
+    console.log('note: the manifest alone does not establish the actual execution account or deployment update permission; '
+      + 'verify the existing deployment settings and authorized account, or use --stage');
   }
 }
 
@@ -236,7 +240,7 @@ async function deploy(description, { promote, acceptRunAsThisAccount }) {
     if (!promote) {
       console.log(`staged: version ${version} created; live deployment still at version ${before}`);
       console.log(ownerSteps(version));
-      console.log(`owner rollback if needed: ${ownerSteps(before)}`);
+      console.log(`rollback with a verified deployment account if needed: ${ownerSteps(before)}`);
       return;
     }
     clasp(['update-deployment', DEPLOYMENT_ID, '-V', version, '-d', description], dir);
