@@ -436,10 +436,12 @@ export default function GroupRoom({
   }, [deal.id, role, adminMode]);
 
   useEffect(() => {
-    if (RELEASE_FEATURES.chat) {
+    // Payment recovery/feedback scrolls its control into view above. A newly
+    // loaded chat sequence must not immediately scroll that control away.
+    if (RELEASE_FEATURES.chat && !missingPendingPaymentParticipant && !paymentFeedback) {
       messageEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }
-  }, [snapshot?.lastSeq]);
+  }, [snapshot?.lastSeq, missingPendingPaymentParticipant, paymentFeedback]);
 
   useEffect(() => {
     if (!group || !onDealUpdate) return;

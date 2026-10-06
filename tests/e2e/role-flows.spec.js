@@ -1999,7 +1999,7 @@ test('호스트 자기 입금은 지연·실패·재시도가 버튼 옆에 보�
   }
 });
 
-test('사라진 참여자의 보류된 입금 요청은 같은 요청으로 확인한 뒤 현재 입금 버튼 잠금을 해제한다', async ({ page }) => {
+test('사라진 참여자의 보류된 입금 요청은 같은 요청으로 확인한 뒤 현재 입금 버튼 잠금을 해제한다', async ({ page }, testInfo) => {
   const paymentRequests = [];
   await page.unroute('**/api/**');
   await mockCentralApis(page);
@@ -2029,6 +2029,12 @@ test('사라진 참여자의 보류된 입금 요청은 같은 요청으로 확�
   await expect(page.getByRole('button', { name: '입금했어요', exact: true })).toBeDisabled();
   const retry = page.getByRole('button', { name: '이전 입금 요청 결과 확인', exact: true });
   await expect(retry).toBeInViewport({ ratio: 1 });
+  expect(await retry.evaluate((element) => {
+    const rect = element.getBoundingClientRect();
+    const foreground = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    return element === foreground || element.contains(foreground);
+  })).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath('pending-payment-recovery-visible.png'), fullPage: true });
   page.once('dialog', (dialog) => dialog.accept());
   await retry.click();
   await expect.poll(() => paymentRequests.length).toBe(1);
