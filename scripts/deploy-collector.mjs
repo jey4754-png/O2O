@@ -195,9 +195,25 @@ async function check() {
   await healthCheck();
 }
 
+// 2026-10-07: 운영 배포는 Joo 가 한다(AGENTS.md "배포 책임"). 권한 문제가 아니라
+// 기록의 일관성 때문이다. 도구를 바꿔 가며 작업하는 동안 배포 권한에 대해 서로
+// 다른 결론이 커밋으로 남았고, 운영에 올라간 버전이 어느 작업분인지 흐려졌다.
+// stage 는 막지 않는다. 버전만 만들어 두면 Joo 는 그 버전을 고르기만 하면 된다.
+export const DEPLOY_OVERRIDE = 'O2O_ALLOW_COLLECTOR_DEPLOY';
+
+export function assertDeploymentAllowed() {
+  if (process.env[DEPLOY_OVERRIDE] === '1') return;
+  throw new Error(
+    '운영 배포는 Joo 가 합니다(AGENTS.md "배포 책임"). '
+    + '먼저 `--stage` 로 버전만 만든 뒤 Joo 에게 그 버전 번호로 배포를 요청하세요. '
+    + `직접 배포해야 한다면 ${DEPLOY_OVERRIDE}=1 을 붙여 의도를 분명히 하세요.`
+  );
+}
+
 // update-deployment needs a project settings file in its working directory, so
 // every deployment change runs inside the private clone.
 function updateDeployment(version, description, acceptRunAsThisAccount) {
+  assertDeploymentAllowed();
   const { dir, settings } = cloneRemote();
   try {
     printSettings(settings);
@@ -220,6 +236,9 @@ async function probe({ acceptRunAsThisAccount }) {
 // Pushes the repository code with the remote's real configuration lines and
 // creates a version. With promote=false the live deployment is not touched.
 async function deploy(description, { promote, acceptRunAsThisAccount }) {
+  // promote 는 updateDeployment_ 를 거치지 않고 clasp 를 직접 부르므로 여기서도
+  // 막는다. 버전을 만들기 전에 멈춰야 운영에 올리지 못할 버전만 쌓이지 않는다.
+  if (promote) assertDeploymentAllowed();
   assertPublishedSource();
   const before = currentVersion();
   const { dir, file, source, settings } = cloneRemote();

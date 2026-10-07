@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   ACCEPT_RUN_AS_FLAG, assertPublishedSource, assertMayUpdateDeployment, bodyDigest, deploymentVersion, DEPLOYMENT_ID, mergeRealConfig,
-  ownerSteps, parseArgs, webAppSettings,
+  assertDeploymentAllowed, DEPLOY_OVERRIDE, ownerSteps, parseArgs, webAppSettings,
 } from '../scripts/deploy-collector.mjs';
 
 const repo = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
@@ -90,4 +90,28 @@ test('staging rejects uncommitted source before reaching a remote and refuses un
     return '';
   }), /not_published/);
   assert.doesNotThrow(() => assertPublishedSource(() => ''));
+});
+
+test('운영 배포·롤백은 막히고, 버전만 만드는 staging 은 열려 있다', () => {
+  const kept = process.env[DEPLOY_OVERRIDE];
+  try {
+    delete process.env[DEPLOY_OVERRIDE];
+    assert.throws(() => assertDeploymentAllowed(), /배포 책임/,
+      '기본값은 거부다. 배포 주체를 Joo 한 곳으로 고정해 기록 혼선을 없앤다');
+    process.env[DEPLOY_OVERRIDE] = '1';
+    assert.doesNotThrow(() => assertDeploymentAllowed(),
+      '의도를 밝힌 직접 배포까지 막지는 않는다');
+  } finally {
+    if (kept === undefined) delete process.env[DEPLOY_OVERRIDE];
+    else process.env[DEPLOY_OVERRIDE] = kept;
+  }
+
+  // 운영 배포를 바꾸는 호출이 더 생기면 그 경로도 잠금을 거쳐야 한다. promote 는
+  // updateDeployment_ 를 거치지 않고 clasp 를 직접 부르므로 각각 확인한다.
+  const source = readFileSync(new URL('../scripts/deploy-collector.mjs', import.meta.url), 'utf8');
+  assert.match(source, /function updateDeployment\([^)]*\) \{\n\s*assertDeploymentAllowed\(\);/);
+  assert.match(source, /if \(promote\) assertDeploymentAllowed\(\);/);
+  assert.equal((source.match(/assertDeploymentAllowed\(\);/g) || []).length,
+    (source.match(/clasp\(\['update-deployment'/g) || []).length,
+    '운영 배포를 바꾸는 호출 수와 잠금 호출 수가 같아야 한다');
 });
