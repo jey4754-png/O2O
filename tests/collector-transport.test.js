@@ -74,8 +74,21 @@ async function transportFixture(t) {
         response.end(result ?? store.context.doGet().contents);
         return;
       }
+      const postNumber = received.filter(({ method }) => method === 'POST').length;
+      if (postNumber === 1 && ['health-once', 'html-once', 'invalid-then-body-timeout'].includes(mode)) {
+        if (mode === 'invalid-then-body-timeout') {
+          await new Promise((resolve) => setTimeout(resolve, 800));
+        }
+        if (mode === 'html-once') {
+          response.setHeader('Content-Type', 'text/html');
+          response.end('<html><title>Temporary provider response</title></html>');
+        } else {
+          response.writeHead(302, { Location: '/exec' }).end();
+        }
+        return;
+      }
       if (mode === 'headers-timeout') return;
-      if (mode === 'body-timeout') {
+      if (mode === 'body-timeout' || mode === 'invalid-then-body-timeout') {
         response.writeHead(200);
         response.write('{"ok":');
         notifyBodyStarted();
@@ -195,8 +208,36 @@ test('snapshot health response cannot become an empty successful group snapshot'
   const result = await store.invoke(snapshot);
   assert.equal(result.statusCode, 502);
   assert.deepEqual(result.body, { ok: false, error: 'upstream_invalid_response' });
-  assert.equal(store.received.filter(({ method }) => method === 'POST').length, 1);
+  assert.equal(store.received.filter(({ method }) => method === 'POST').length, 2);
   assert.equal(JSON.stringify([...store.sheets].map(([name, sheet]) => [name, sheet.rows])), before);
+});
+
+for (const mode of ['health-once', 'html-once']) {
+  test(`an invalid ${mode} read retries once and returns the real stored snapshot`, async (t) => {
+    const store = await transportFixture(t);
+    store.setMode(mode);
+    const before = JSON.stringify([...store.sheets].map(([name, sheet]) => [name, sheet.rows]));
+    const result = await store.invoke(snapshot);
+    assert.equal(result.statusCode, 200);
+    assert.equal(result.body.snapshot.group.groupId, groupId);
+    assert.equal(result.body.snapshot.participants[0].paymentStatus, 'pending');
+    assert.equal(store.received.filter(({ method }) => method === 'POST').length, 2);
+    assert.equal(store.gasCalls.length, 1);
+    assert.equal(JSON.stringify([...store.sheets].map(([name, sheet]) => [name, sheet.rows])), before);
+  });
+}
+
+test('read retry shares the original deadline instead of extending a slow provider request', async (t) => {
+  const store = await transportFixture(t);
+  store.setMode('invalid-then-body-timeout');
+  process.env.O2O_UPSTREAM_TIMEOUT_MS = '1000';
+  const start = Date.now();
+  const result = await store.invoke(snapshot);
+  assert.equal(result.statusCode, 504);
+  assert.equal(result.body.error, 'upstream_timeout');
+  assert.equal(store.received.filter(({ method }) => method === 'POST').length, 2);
+  assert.ok(Date.now() - start < 1500, 'the second request must use the original 1s deadline');
+  assert.equal(store.payments().length, 0);
 });
 
 for (const phase of ['headers', 'body']) {

@@ -93,12 +93,26 @@ export async function fetchUpstreamJson(url, options = {}) {
   // A cold Apps Script run can exceed the shared default before it answers at
   // all. Callers whose request is a single short round trip may wait longer
   // instead of turning that start-up delay into a user-visible failure.
-  const { timeoutMs, ...fetchOptions } = options;
+  const { timeoutMs, retryInvalidRead = false, ...fetchOptions } = options;
+  // Only explicitly read-only callers may replay an invalid result. Both
+  // attempts share one deadline; a cold run cannot double the function budget.
+  const signal = timeoutSignal(options.signal, timeoutMs);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fetchUpstreamJsonOnce(url, fetchOptions, signal);
+    } catch (error) {
+      if (!retryInvalidRead || attempt !== 0 || signal?.aborted
+        || error?.code !== 'upstream_invalid_response') throw error;
+    }
+  }
+}
+
+async function fetchUpstreamJsonOnce(url, options, signal) {
   let upstream;
   try {
     upstream = await fetch(url, {
-      ...fetchOptions,
-      signal: timeoutSignal(options.signal, timeoutMs),
+      ...options,
+      signal,
     });
   } catch (error) {
     throw normalizeFetchError(error);

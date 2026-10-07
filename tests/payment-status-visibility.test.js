@@ -41,8 +41,8 @@ test('a payment control blocked by another pending request explains what to pres
 test('the admin credential round trip may outlast the shared upstream default without replaying', () => {
   assert.match(adminAuthSource, /const ADMIN_CREDENTIAL_TIMEOUT_MS = 25000;/);
   assert.match(adminAuthSource, /timeoutMs: ADMIN_CREDENTIAL_TIMEOUT_MS/);
-  assert.match(dataUpstreamSource, /const \{ timeoutMs, \.\.\.fetchOptions \} = options;/);
-  assert.match(dataUpstreamSource, /signal: timeoutSignal\(options\.signal, timeoutMs\)/);
+  assert.match(dataUpstreamSource, /const \{ timeoutMs,[^}]*\.\.\.fetchOptions \} = options;/);
+  assert.match(dataUpstreamSource, /const signal = timeoutSignal\(options\.signal, timeoutMs\)/);
   assert.match(dataUpstreamSource, /function upstreamTimeoutMs\(overrideMs\)/);
   assert.match(dataUpstreamSource, /Number\(overrideMs \?\? process\.env\.O2O_UPSTREAM_TIMEOUT_MS\)/);
   assert.match(adminAuthSource, /\['rate_begin', 'rate_success'\]\.includes\(payload\.operation\)/,

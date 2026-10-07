@@ -582,6 +582,7 @@ async function callUpstream(payload, allowProxy = true) {
   const token = serviceSecret();
   const proxied = allowProxy ? await callDataApiJson('/api/group-ops', {
     method: 'POST',
+    retryInvalidRead: payload.action === 'snapshot',
     headers: {
       'Content-Type': 'application/json',
       ...(token ? { 'x-o2o-service-token': token } : {}),
@@ -599,6 +600,7 @@ async function callUpstream(payload, allowProxy = true) {
   }
   const { upstream, result } = await fetchUpstreamJson(collectorUrl, {
     method: 'POST',
+    retryInvalidRead: payload.action === 'snapshot',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       token: collectorToken,

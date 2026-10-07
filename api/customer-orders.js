@@ -362,6 +362,7 @@ async function directCollector(body) {
   if (!collectorUrl || !collectorToken) throw new Error('collector_not_configured');
   const { upstream, result } = await fetchUpstreamJson(collectorUrl, {
     method: 'POST',
+    retryInvalidRead: ['customer_orders', 'customer_orders_group', 'customer_orders_owner'].includes(body.action),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ token: collectorToken, ...body }),
     redirect: 'follow',
@@ -383,6 +384,7 @@ async function dataApiRequest(body) {
   const token = serviceSecret();
   const proxied = await callDataApiJson('/api/customer-orders', {
     method: 'POST',
+    retryInvalidRead: ['list', 'list_group', 'list_owner'].includes(body.action),
     headers: {
       'Content-Type': 'application/json',
       ...(token ? { 'x-o2o-service-token': token } : {}),

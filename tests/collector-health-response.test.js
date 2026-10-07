@@ -91,7 +91,8 @@ for (const proxy of [false, true]) {
         const response = await invoke(customerOrdersHandler, body);
         assert.equal(response.statusCode, 502);
         assert.deepEqual(response.body, { ok: false, error: 'upstream_invalid_response' });
-        assert.equal(calls.length, 1, 'invalid publication must not trigger a legacy snapshot event');
+        assert.equal(calls.length, body.action.startsWith('list') ? 2 : 1,
+          'only reads may retry; an invalid publication must not create a snapshot event');
         assert.match(calls[0].url, proxy ? /health-proxy/ : /health-collector/);
       });
     });
@@ -102,7 +103,7 @@ for (const proxy of [false, true]) {
         const response = await invoke(groupOpsHandler, body);
         assert.equal(response.statusCode, 502);
         assert.deepEqual(response.body, { ok: false, error: 'upstream_invalid_response' });
-        assert.equal(calls.length, 1);
+        assert.equal(calls.length, body.action === 'snapshot' ? 2 : 1);
       });
     });
   }
