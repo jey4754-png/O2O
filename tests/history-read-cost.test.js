@@ -56,6 +56,70 @@ test('an administrator order response shares reservation history only within tha
   assert.equal(historyReads, 2, 'the next request must not reuse stale reservation evidence');
 });
 
+test('many owned orders share one participant read and refresh payment on the next response', () => {
+  const { context, data, order } = adminStore();
+  data.groupParticipants.rows[1][5] = 'pending';
+  data.customerOrders.rows.splice(1);
+  for (let index = 0; index < 12; index += 1) {
+    const candidate = { ...order, id: `order-${1700000000900 + index}`, customerPhone: '01011112222', paymentStatus: 'pending', paymentConfirmedAt: '' };
+    data.customerOrders.rows.push(['', candidate.id, candidate.customerPhone, JSON.stringify(candidate)]);
+  }
+  let participantReads = 0;
+  const getRange = data.groupParticipants.getRange.bind(data.groupParticipants);
+  data.groupParticipants.getRange = (...args) => {
+    const range = getRange(...args);
+    const read = range.getValues.bind(range);
+    range.getValues = () => { participantReads++; return read(); };
+    return range;
+  };
+  const read = () => context.getCustomerOrdersResponse_('01011112222', 'member-test', 'b'.repeat(64));
+  const first = read();
+  assert.equal(first.ok, true, first.error);
+  assert.equal(first.orders.length, 12);
+  assert.equal(participantReads, 1);
+  assert.equal(first.orders.every(item => item.paymentStatus === 'pending'), true);
+  data.groupParticipants.rows[1][5] = 'requested';
+  const second = read();
+  assert.equal(second.ok, true, second.error);
+  assert.equal(participantReads, 2, 'participant state is never retained across requests');
+  assert.equal(second.orders.every(item => item.paymentStatus === 'requested'), true);
+  assert.equal(second.orders.every(item => item._customerCapabilityHash === undefined), true);
+  const rejected = context.getCustomerOrdersResponse_('01011112222', 'member-test', 'd'.repeat(64));
+  assert.equal(rejected.ok, true, rejected.error);
+  assert.equal(rejected.orders.length, 0, 'batching cannot bypass the customer proof');
+});
+
+test('order payment projection separates the same actor in different groups and never changes locked authority', () => {
+  const { context, data, dealId, order } = adminStore();
+  const otherGroupId = 'customer-other-projection';
+  const neighbor = [...data.groupParticipants.rows[1]];
+  neighbor[0] = otherGroupId;
+  neighbor[5] = 'requested';
+  data.groupParticipants.rows.push(neighbor);
+  const reservation = [...data.groupHistory.rows[1]];
+  reservation[1] = otherGroupId;
+  data.groupHistory.rows.push(reservation);
+  const projection = {};
+  const pendingOrder = { ...order, paymentStatus: 'pending', paymentConfirmedAt: '' };
+  const first = context.projectStoredGroupOrderPayment_(data, pendingOrder, projection);
+  const other = context.projectStoredGroupOrderPayment_(data, { ...pendingOrder, groupId: otherGroupId, dealId: otherGroupId }, projection);
+  assert.equal(first.paymentStatus, 'confirmed');
+  assert.equal(other.paymentStatus, 'requested');
+  data.groupParticipants.rows[1][5] = 'pending';
+  assert.equal(context.projectStoredGroupOrderPayment_(data, pendingOrder, {}).paymentStatus, 'pending');
+  data._lockedGroupReadMemo = { groups: Object.create(null) };
+  try {
+    assert.equal(context.participantForOrderProjection_(data, dealId, 'member-test', projection).paymentStatus, 'pending',
+      'a locked operation must ignore an earlier unlocked projection');
+    data._lockedGroupReadMemo.participantRows = undefined;
+    data.groupParticipants.rows[1][7] = 'e'.repeat(64);
+    assert.throws(() => context.authorizeGroupActor_(data, dealId, { actorId: 'member-test', capabilityHash: 'c'.repeat(64) }),
+      error => error.code === 'invalid_capability');
+  } finally {
+    delete data._lockedGroupReadMemo;
+  }
+});
+
 test('nearby matching historical events use bounded reads without returning neighboring users', () => {
   const phone = '01011112222';
   const records = Array.from({ length: 205 }, (_, index) => historyOrder(String(1700000000200 + index), {

@@ -1744,6 +1744,28 @@ function projectOrderPaymentFromParticipant_(orderValue, participantValue) {
   return order;
 }
 
+function participantForOrderProjection_(sheets, groupId, actorId, projectionContext) {
+  // A history response may contain many orders for the same participant. Read
+  // the current table once for this response, without caching authorization or
+  // reusing these rows in a later request or a locked mutation.
+  if (!projectionContext || sheets._lockedGroupReadMemo) {
+    return getParticipantRecord_(sheets, groupId, actorId, false);
+  }
+  if (!projectionContext.orderProjectionParticipantRows) {
+    const sheet = sheets.groupParticipants;
+    const lastRow = sheet.getLastRow();
+    projectionContext.orderProjectionParticipantRows = lastRow < 2 ? [] : sheet
+      .getRange(2, 1, lastRow - 1, GROUP_PARTICIPANT_HEADERS.length).getValues();
+  }
+  const rows = projectionContext.orderProjectionParticipantRows;
+  for (let index = 0; index < rows.length; index += 1) {
+    if (String(rows[index][0]) === groupId && String(rows[index][1]) === actorId) {
+      return participantFromRow_(rows[index], index + 2, false);
+    }
+  }
+  return null;
+}
+
 function projectStoredGroupOrderPayment_(sheets, orderValue, projectionContext) {
   const order = Object.assign({}, orderValue || {});
   const groupId = String(order.groupId || '');
@@ -1753,14 +1775,14 @@ function projectStoredGroupOrderPayment_(sheets, orderValue, projectionContext) 
   if (!verifiedBoundGroupPurchaseOrder_(order, groupId, actorId, reservationHistory)) {
     const recovered = recoverableGroupPaymentOrder_(sheets, order, groupId, actorId, reservationHistory);
     if (!recovered) return Object.assign({}, order, { paymentSyncStatus: 'repair_required' });
-    const recoveredParticipant = getParticipantRecord_(sheets, groupId, actorId, false);
+    const recoveredParticipant = participantForOrderProjection_(sheets, groupId, actorId, projectionContext);
     return recoveredParticipant
       ? Object.assign(projectOrderPaymentFromParticipant_(recovered, recoveredParticipant), {
           paymentSyncStatus: 'verified_history'
         })
       : order;
   }
-  const participant = getParticipantRecord_(sheets, groupId, actorId, false);
+  const participant = participantForOrderProjection_(sheets, groupId, actorId, projectionContext);
   return participant ? projectOrderPaymentFromParticipant_(order, participant) : order;
 }
 
