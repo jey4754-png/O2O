@@ -9,6 +9,7 @@ const PHONE = '01055556666';
 const LOST = 'a'.repeat(64);
 const DEVICE = 'b'.repeat(64);
 const STRANGER = 'd'.repeat(64);
+const SECOND_DEVICE = 'e'.repeat(64);
 const RECOVERY_HEADERS = ['등록시각', '갱신시각', '식별키', '검증자', '결박해시', '현재해시',
   '결박주문', '결박그룹', '결박상품', '참여자ID', '버전', '마지막변경ID'];
 
@@ -150,6 +151,53 @@ test('한 기기에 두 번째 승계를 기록해 기존 승계를 무효로 �
   // 허용하면 이미 되살린 주문까지 다시 사라진다.
   assert.equal(second.error, 'recovery_succession_exists');
   assert.deepEqual(readOrderIds(built.context, DEVICE), [ids[0]], '첫 승계는 그대로 살아 있다');
+});
+
+// 재연결을 한 상품씩 안내하는 화면 때문에, 사장님이 상품 A 를 되살린 뒤 상품 B
+// 를 이어서 되살리려는 것이 자연스러운 수순이 된다. 그 두 번째가 어디서 막히는지
+// 를 고정해 둔다. 위 검사는 두 주문의 소유 키가 달랐으므로 거절 이유를 '키가
+// 다르다'로 읽을 여지가 있었다. 여기서는 같은 기기가 소유한 두 상품으로, 거절이
+// 승계 규칙 자체에서 나온다는 것을 분명히 한다.
+test('한 기기에는 상품 하나 분량만 재연결된다 — 소유 키가 같아도 두 번째는 거절한다', () => {
+  const built = store();
+  const [tamsa] = seed(built, { 'order-1700000009901': LOST });
+  const rice = order('order-1700000009902', LOST, 'owner-gyeongi-rice');
+  built.data.customerOrders.rows.push(['', rice.id, PHONE, JSON.stringify(rice)]);
+
+  assert.equal(built.context.handleAdminOperation_(request(built, { orderIds: [tamsa] })).ok, true);
+
+  const second = built.context.handleAdminOperation_(request(built, {
+    dealId: 'owner-gyeongi-rice', orderIds: [rice.id], clientMutationId: 'admin-recovery-0002',
+  }));
+  assert.equal(second.error, 'recovery_succession_exists',
+    '두 번째 상품은 선택이 올바르더라도 같은 복구 코드로는 되살릴 수 없다');
+
+  assert.deepEqual(readOrderIds(built.context, DEVICE), [tamsa],
+    '새 기기는 첫 번째 상품만 보고, 두 번째 상품은 끝내 보이지 않는다');
+  assert.deepEqual(readOrderIds(built.context, LOST), [rice.id, tamsa].sort(),
+    '원래 기기의 소유는 그대로 남는다');
+  assert.equal(built.recovery.rows.length, 2, '거절된 두 번째는 행을 남기지 않는다');
+});
+
+// 위 한계를 저장소를 비워 새 복구 코드를 받는 식으로 우회할 수 있는지. 한계는
+// 전화번호가 아니라 복구 코드마다 걸리므로 두 번째 코드는 자기 몫을 받는다.
+// 다만 한 브라우저가 두 코드를 동시에 들 수 없어, 두 번째 코드를 받으려면 첫
+// 번째 코드를 버려야 하고 그때 첫 상품의 주문을 다시 잃는다.
+test('복구 코드가 다르면 각자 한 번씩 재연결되지만 한 기기가 둘을 함께 들 수는 없다', () => {
+  const built = store();
+  const [tamsa] = seed(built, { 'order-1700000010001': LOST });
+  const rice = order('order-1700000010002', LOST, 'owner-gyeongi-rice');
+  built.data.customerOrders.rows.push(['', rice.id, PHONE, JSON.stringify(rice)]);
+
+  assert.equal(built.context.handleAdminOperation_(request(built, { orderIds: [tamsa] })).ok, true);
+  assert.equal(built.context.handleAdminOperation_(request(built, {
+    dealId: 'owner-gyeongi-rice', orderIds: [rice.id],
+    capabilityHash: SECOND_DEVICE, clientMutationId: 'admin-recovery-0002',
+  })).ok, true, '다른 코드에는 그 코드 몫의 승계가 따로 기록된다');
+
+  assert.deepEqual(readOrderIds(built.context, DEVICE), [tamsa]);
+  assert.deepEqual(readOrderIds(built.context, SECOND_DEVICE), [rice.id]);
+  assert.equal(built.recovery.rows.length, 3, '코드마다 한 행씩만 쌓인다');
 });
 
 test('소유 키가 서로 다르거나 없는 주문은 한 번에 결박하지 않는다', () => {
