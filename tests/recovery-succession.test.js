@@ -609,3 +609,58 @@ test('그룹 주문 결박은 참여자 자격 확인에 승계 근거를 넘겨
     /requireParticipantCapability_\(participant, participantCapabilityHashValue, sheets, groupId, visitorId\);/,
   );
 });
+
+// ── 자가 되살리기의 기기당 한도 ─────────────────────────────────────────────
+// 관리자 재연결에만 '기기 하나에 승계 하나' 한도가 있는 것이 아니다. 고객이
+// 직접 확인번호를 넣는 되살리기도 같은 보호를 받는다. 두 등록이 한 기기를
+// 가리키면 recoverySuccession_ 이 모호로 판정해 null 을 돌려주고, 그 기기가
+// 이미 되살린 주문까지 함께 사라지기 때문이다. 안내문이 이 한도를 설명해야
+// 하므로 동작으로 고정해 둔다.
+const IDENTITY = '7'.repeat(64);
+
+const redeemStore = () => {
+  const built = storeWithRecovery();
+  const properties = new Map();
+  built.context.PropertiesService = {
+    getScriptProperties: () => ({
+      getProperty: (key) => (properties.has(key) ? properties.get(key) : null),
+      setProperty: (key, value) => { properties.set(key, String(value)); },
+      deleteProperty: (key) => { properties.delete(key); },
+    }),
+  };
+  return built;
+};
+
+// 되살리기는 ref 로 등록 행을 고르는데, 그 ref 는 Vercel 이 확인번호로 맞춘
+// 행의 결박해시다. 그래서 등록마다 결박해시가 달라야 서로 다른 행이 된다.
+const enrollRow = (recovery, boundHash, orderIds) => recovery.rows.push([
+  '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', IDENTITY,
+  JSON.stringify({ algorithm: 'scrypt-v1' }), boundHash, boundHash,
+  JSON.stringify(orderIds), '[]', '[]', 'visitor-laptop', 1, 'enrolled-' + boundHash.slice(0, 8),
+]);
+
+const redeem = (context, boundHash, newHash, mutationId) => context.handleRecoveryCredentials_({
+  operation: 'redeem', identityKey: IDENTITY, ref: boundHash, capabilityHash: newHash,
+  redeemAssertion: true, clientMutationId: mutationId,
+});
+
+test('되살리기는 등록 당시 묶인 주문만 돌려주고, 한 기기는 등록 하나만 받는다', () => {
+  const { context, data } = redeemStore();
+  const laptop = 'a'.repeat(64);
+  const tablet = 'c'.repeat(64);
+  const pc = 'b'.repeat(64);
+  enrollRow(data.recovery, laptop, ['order-1700000031001']);
+  enrollRow(data.recovery, tablet, ['order-1700000031002']);
+
+  const first = redeem(context, laptop, pc, 'redeem-0000001');
+  assert.equal(first.ok, true, first.error);
+  assert.equal(first.bound.orders, 1, '돌려받는 범위는 등록 시점에 묶인 주문뿐이다');
+
+  const second = redeem(context, tablet, pc, 'redeem-0000002');
+  assert.equal(second.error, 'recovery_succession_exists',
+    '같은 기기로 두 번째 등록까지 되살릴 수는 없다');
+
+  // 거절된 두 번째는 자기 행을 건드리지 않았어야 한다.
+  assert.equal(String(data.recovery.rows.at(-1)[5]).toLowerCase(), tablet,
+    '두 번째 등록 행의 현재 해시가 그대로 남는다');
+});
