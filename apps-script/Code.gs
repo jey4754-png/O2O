@@ -4195,6 +4195,26 @@ function recoveryError_(code) { return groupOperationError_(code); }
 
 const RECOVERY_ROWS_PER_IDENTITY = 8;
 
+// 한 등록에 연결할 수 있는 기기 수. 되살리기는 기기를 옮기지 않고 추가한다.
+// 기기마다 확인번호를 통과해야 하므로 증명 기준은 그대로다.
+const RECOVERY_DEVICES_PER_ROW = 5;
+
+// 현재해시 칸은 예전에 64자리 한 개였고 지금은 JSON 배열이다. 운영에 이미 쓰인
+// 행이 있으므로 두 형태를 모두 읽는다.
+function recoveryCurrentHashes_(value) {
+  const raw = String(value || '').trim();
+  if (RECOVERY_HASH.test(raw.toLowerCase())) return [raw.toLowerCase()];
+  let parsed = null;
+  try { parsed = JSON.parse(raw); } catch (error) { return []; }
+  if (!Array.isArray(parsed)) return [];
+  const hashes = [];
+  parsed.forEach(function(item) {
+    const hash = String(item || '').toLowerCase();
+    if (RECOVERY_HASH.test(hash) && hashes.indexOf(hash) === -1) hashes.push(hash);
+  });
+  return hashes;
+}
+
 // 한 전화번호 아래에 여러 등록이 공존할 수 있다. 등록 행의 주인은 전화번호가
 // 아니라 그 행을 만든 권한 키다. 전화번호만으로 행을 특정하면, 번호만 아는
 // 제3자가 남의 등록을 덮어써 이미 복구해 둔 접근까지 되돌릴 수 있다.
@@ -4227,7 +4247,9 @@ function recoveryRowsRaw_(sheets) {
 function invalidateRecoveryRows_() { RECOVERY_ROWS_CACHE_ = null; }
 
 // 등록 시점에 살아있는 키가 실제로 소유한 항목만 모은다. 전화번호는 쓰지 않는다.
-function recoveryBoundSet_(sheets, capabilityHash, groupClaims, dealClaims) {
+// 이 해시가 소유를 증명하는 주문 번호. 등록과 되살리기가 같은 기준을 써야
+// 하므로 한 곳에 둔다.
+function recoveryOwnedOrderIds_(sheets, capabilityHash) {
   const orderIds = [];
   const orders = sheets.customerOrders;
   if (orders.getLastRow() >= 2) {
@@ -4247,6 +4269,11 @@ function recoveryBoundSet_(sheets, capabilityHash, groupClaims, dealClaims) {
   historicCustomerOrdersForHash_(sheets.events, capabilityHash).forEach(function(order) {
     if (orderIds.indexOf(String(order.id)) === -1) orderIds.push(String(order.id));
   });
+  return orderIds;
+}
+
+function recoveryBoundSet_(sheets, capabilityHash, groupClaims, dealClaims) {
+  const orderIds = recoveryOwnedOrderIds_(sheets, capabilityHash);
   const groups = [];
   (groupClaims || []).forEach(function(claim) {
     if (!claim || typeof claim !== 'object') return;
@@ -4334,7 +4361,7 @@ function adminRecoveryReassign_(sheets, request) {
     const previous = rows[index];
     const sameOrders = (previous.boundOrderIds || []).length === orderIds.length
       && orderIds.every(function(orderId) { return previous.boundOrderIds.indexOf(orderId) !== -1; });
-    if (previous.currentHash !== newHash || !sameOrders) {
+    if (previous.currentHashes.indexOf(newHash) === -1 || !sameOrders) {
       throw groupOperationError_('client_mutation_conflict');
     }
     return json_({ ok: true, duplicate: true, recovery: { version: previous.version, orders: orderIds.length } });
@@ -4342,8 +4369,8 @@ function adminRecoveryReassign_(sheets, request) {
   // recoverySuccession_ 은 승계가 하나로 확정될 때만 권한을 준다. 같은 기기에
   // 승계를 두 번 기록하면 둘 다 무효가 되므로, 덮어쓰는 대신 여기서 거절한다.
   const ambiguous = rows.some(function(row) {
-    return RECOVERY_HASH.test(row.boundHash) && RECOVERY_HASH.test(row.currentHash)
-      && row.currentHash === newHash && row.boundHash !== newHash;
+    return RECOVERY_HASH.test(row.boundHash) && row.currentHashes.indexOf(newHash) !== -1
+      && row.boundHash !== newHash;
   });
   if (ambiguous) throw groupOperationError_('recovery_succession_exists');
 
@@ -4376,7 +4403,7 @@ function adminRecoveryReassign_(sheets, request) {
     result: { ok: true, dealId: request.dealId, orderIds: orderIds, identityKey: identityKey }
   });
   sheets.recovery.appendRow([
-    now, now, identityKey, '', boundHash, newHash,
+    now, now, identityKey, '', boundHash, JSON.stringify([newHash]),
     JSON.stringify(orderIds), '[]', '[]', safeCell_(boundActorId), 1,
     safeCell_(request.clientMutationId)
   ]);
@@ -4476,7 +4503,8 @@ function handleRecoveryCredentials_(payload) {
       const now = new Date().toISOString();
       const values = [
         own ? own.createdAt || now : now, now, identityKey,
-        JSON.stringify(payload.verifier), capabilityHash, own ? own.currentHash : capabilityHash,
+        JSON.stringify(payload.verifier), capabilityHash,
+        JSON.stringify(own && own.currentHashes.length ? own.currentHashes : [capabilityHash]),
         JSON.stringify(bound.orderIds), JSON.stringify(bound.groups), JSON.stringify(bound.deals),
         actorId, (own ? own.version : 0) + 1, clientMutationId
       ];
@@ -4514,14 +4542,26 @@ function handleRecoveryCredentials_(payload) {
     // 이미 같은 이유로 막고 있다. 같은 보호를 여기에도 둔다.
     const ambiguous = recoveryRowsRaw_(sheets).some(function(row) {
       return row.rowNumber !== existing.rowNumber
-        && String(row.currentHash || '').toLowerCase() === newHash
+        && row.currentHashes.indexOf(newHash) !== -1
         && String(row.boundHash || '').toLowerCase() !== newHash;
     });
     if (ambiguous) throw recoveryError_('recovery_succession_exists');
+    // 되살리기는 기기를 옮기지 않고 더한다. 옮기기였을 때는 PC 에서 확인번호를
+    // 넣으면 휴대폰 목록이 비어, 사용자가 기기 하나를 골라야 했다.
+    const devices = existing.currentHashes.slice();
+    if (devices.indexOf(newHash) === -1) devices.push(newHash);
+    if (devices.length > RECOVERY_DEVICES_PER_ROW) throw recoveryError_('recovery_device_limit');
+    // 더하는 기기가 이미 자기 이름으로 가진 주문도 공유 목록에 합친다. 그래야
+    // 연결된 기기들이 같은 목록을 본다. 합치는 것은 그 기기가 소유를 증명한
+    // 주문뿐이므로 볼 수 있는 범위가 늘어나지 않는다.
+    const boundOrderIds = (existing.boundOrderIds || []).map(String);
+    recoveryOwnedOrderIds_(sheets, newHash).forEach(function(orderId) {
+      if (boundOrderIds.indexOf(orderId) === -1) boundOrderIds.push(orderId);
+    });
     const now = new Date().toISOString();
     sheets.recovery.getRange(existing.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([[
       existing.createdAt || now, now, identityKey, JSON.stringify(existing.verifier),
-      existing.boundHash, newHash, JSON.stringify(existing.boundOrderIds),
+      existing.boundHash, JSON.stringify(devices), JSON.stringify(boundOrderIds),
       JSON.stringify(existing.boundGroups), JSON.stringify(existing.boundDeals),
       existing.actorId, existing.version + 1, clientMutationId
     ]]);
@@ -4530,7 +4570,7 @@ function handleRecoveryCredentials_(payload) {
     return json_({
       ok: true, actorId: existing.actorId,
       bound: {
-        orders: (existing.boundOrderIds || []).length,
+        orders: boundOrderIds.length,
         groups: (existing.boundGroups || []).length,
         deals: (existing.boundDeals || []).length
       },
@@ -4557,7 +4597,7 @@ function recoveryRowValue_(row, rowNumber) {
     identityKey: String(row[2] || ''),
     verifier: parse(row[3], null),
     boundHash: String(row[4] || '').toLowerCase(),
-    currentHash: String(row[5] || '').toLowerCase(),
+    currentHashes: recoveryCurrentHashes_(row[5]),
     boundOrderIds: parse(row[6], []),
     boundGroups: parse(row[7], []),
     boundDeals: parse(row[8], []),
@@ -4569,7 +4609,7 @@ function recoveryRowValue_(row, rowNumber) {
 
 function recoveryRows_(sheets) {
   return recoveryRowsRaw_(sheets).filter(function(record) {
-    return RECOVERY_HASH.test(record.boundHash) && RECOVERY_HASH.test(record.currentHash);
+    return RECOVERY_HASH.test(record.boundHash) && record.currentHashes.length > 0;
   });
 }
 
@@ -4597,7 +4637,11 @@ function recoverySuccession_(sheets, capabilityHash) {
   const hash = String(capabilityHash || '').toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(hash)) return null;
   const matches = recoveryRows_(sheets).filter(function(record) {
-    return record.currentHash === hash && record.boundHash !== hash;
+    // 등록한 기기 자신도 연결된 기기에 포함한다. 되살리기가 다른 기기의 주문을
+    // 공유 목록에 합치므로, 여기서 제외하면 등록한 기기만 합쳐진 목록을 보지
+    // 못해 양쪽 화면이 끝내 같아지지 않는다. 쓰기 경로는 제시한 해시와 저장된
+    // 해시가 같을 때 먼저 반환하므로 이 완화의 영향을 받지 않는다.
+    return record.currentHashes.indexOf(hash) !== -1;
   });
   // 한 키가 여러 등록을 승계하는 것은 정상 경로로 생길 수 없다. 모호하면 승계하지 않는다.
   return matches.length === 1 ? matches[0] : null;
@@ -4661,9 +4705,18 @@ function filterCustomerOrdersForProof_(orders, visitorId, customerCapabilityHash
   });
   // 승계된 옛 해시는 등록 시점에 증명된 주문에 한해서만 인정한다.
   const successionOrderIds = Object.create(null);
+  // 한 등록에 연결된 기기들. 결박해시(등록한 기기)와 되살리기로 더해진 기기가
+  // 모두 들어간다. 기기마다 확인번호를 통과했으므로, 그중 어느 기기가 소유한
+  // 주문이든 이 등록의 주문이다. 결박해시 하나만 인정하면 나중에 더해진 기기가
+  // 넣은 주문은 끝내 다른 기기에서 보이지 않는다.
+  const successionHashes = Object.create(null);
   if (succession) {
     (succession.boundOrderIds || []).forEach(function(orderId) {
       successionOrderIds[String(orderId)] = true;
+    });
+    successionHashes[String(succession.boundHash || '').toLowerCase()] = true;
+    (succession.currentHashes || []).forEach(function(hash) {
+      successionHashes[String(hash || '').toLowerCase()] = true;
     });
   }
   return orders.filter(function(order) {
@@ -4674,7 +4727,7 @@ function filterCustomerOrdersForProof_(orders, visitorId, customerCapabilityHash
       if (ownership.hash === customerCapabilityHash) return true;
       return Boolean(succession)
         && successionOrderIds[String(order.id)] === true
-        && ownership.hash === succession.boundHash;
+        && successionHashes[ownership.hash] === true;
     }
     // Phone numbers and visitor ids are exposed to the merchant/group owner
     // views and therefore cannot authenticate old unhashed rows. Legacy rows

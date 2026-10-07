@@ -133,7 +133,9 @@ test(partial ? '일부 주문이 있는 기기도 이전 주문을 복구하고 
     }
     await page.getByLabel('복구 확인번호').fill(PIN);
     await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
-    await expect(page.getByRole('status').filter({ hasText: '주문 3건' })).toBeVisible();
+    // 안내 숫자와 실제 목록이 같아야 한다. 되살리기가 이 기기의 기존 주문까지
+    // 공유 목록에 합치므로, 안내가 되살린 건수만 세면 화면과 어긋난다.
+    await expect(page.getByRole('status').filter({ hasText: `주문 ${partial ? 4 : 3}건` })).toBeVisible();
     await expect(page.locator('.order-card')).toHaveCount(partial ? 4 : 3);
     await expect(page.locator('.order-card-list')).toContainText('노트북에서 넣은 경기미');
     await expect(page.locator('.order-card-list')).toContainText('과거 스냅샷 주문');

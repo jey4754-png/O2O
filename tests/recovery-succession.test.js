@@ -633,6 +633,8 @@ const redeemStore = () => {
 
 // 되살리기는 ref 로 등록 행을 고르는데, 그 ref 는 Vercel 이 확인번호로 맞춘
 // 행의 결박해시다. 그래서 등록마다 결박해시가 달라야 서로 다른 행이 된다.
+// 현재해시 칸을 운영에 이미 쓰인 구 형식(64자리 한 개)으로 적는다. 되살리기가
+// 그 행을 기기 목록으로 올려 쓰는 것까지 아래 검사들이 함께 확인한다.
 const enrollRow = (recovery, boundHash, orderIds) => recovery.rows.push([
   '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z', IDENTITY,
   JSON.stringify({ algorithm: 'scrypt-v1' }), boundHash, boundHash,
@@ -644,23 +646,57 @@ const redeem = (context, boundHash, newHash, mutationId) => context.handleRecove
   redeemAssertion: true, clientMutationId: mutationId,
 });
 
-test('되살리기는 등록 당시 묶인 주문만 돌려주고, 한 기기는 등록 하나만 받는다', () => {
+test('되살리기는 기기를 옮기지 않고 더해서 두 기기가 같은 목록을 본다', () => {
+  const { context, data } = redeemStore();
+  const laptop = 'a'.repeat(64);
+  const pc = 'b'.repeat(64);
+  // 노트북에서 넣은 주문 하나, PC 에서 넣은 주문 하나. 사장님이 겪은 상황 그대로다.
+  const idLaptop = 'order-1700000031001';
+  const idPc = 'order-1700000031002';
+  data.customerOrders.rows.push(['', idLaptop, PHONE, JSON.stringify(order(idLaptop, laptop))]);
+  data.customerOrders.rows.push(['', idPc, PHONE, JSON.stringify(order(idPc, pc))]);
+  // 등록은 노트북에서 했으므로 그 시점에 묶인 것은 노트북 주문뿐이다.
+  enrollRow(data.recovery, laptop, [idLaptop]);
+  assert.deepEqual(read(context, laptop).ids, [idLaptop], '되살리기 전에는 각자 자기 것만 본다');
+  assert.deepEqual(read(context, pc).ids, [idPc]);
+
+  const redeemed = redeem(context, laptop, pc, 'redeem-0000001');
+  assert.equal(redeemed.ok, true, redeemed.error);
+
+  // 핵심. 옮기기였을 때는 PC 가 받고 노트북이 비었다. 이제 둘 다 같은 목록이다.
+  const onPc = read(context, pc).ids;
+  const onLaptop = read(context, laptop).ids;
+  assert.deepEqual(onPc.slice().sort(), onLaptop.slice().sort(),
+    '되살린 뒤에는 두 기기가 같은 목록을 본다');
+  assert.equal(onLaptop.includes(idLaptop), true, '노트북 주문이 노트북에 그대로 남는다');
+  assert.equal(onPc.includes(idLaptop), true, '노트북 주문이 PC 에서도 보인다');
+  // PC 가 자기 이름으로 가지고 있던 주문도 공유 목록에 합쳐진다. 이것이 없으면
+  // PC 에서만 넣은 주문은 노트북에서 끝내 보이지 않는다.
+  assert.equal(onLaptop.includes(idPc), true, 'PC 에서 넣은 주문이 노트북에도 보인다');
+  assert.deepEqual(onPc.slice().sort(), [idLaptop, idPc].sort());
+
+  const devices = JSON.parse(data.recovery.rows.at(-1)[5]);
+  assert.deepEqual(devices.slice().sort(), [laptop, pc].sort(),
+    '등록한 기기와 더해진 기기가 함께 적힌다');
+});
+
+test('한 기기가 두 등록에 걸치지는 못한다', () => {
   const { context, data } = redeemStore();
   const laptop = 'a'.repeat(64);
   const tablet = 'c'.repeat(64);
   const pc = 'b'.repeat(64);
-  enrollRow(data.recovery, laptop, ['order-1700000031001']);
+  const idLaptop = 'order-1700000031001';
+  data.customerOrders.rows.push(['', idLaptop, PHONE, JSON.stringify(order(idLaptop, laptop))]);
+  enrollRow(data.recovery, laptop, [idLaptop]);
   enrollRow(data.recovery, tablet, ['order-1700000031002']);
 
-  const first = redeem(context, laptop, pc, 'redeem-0000001');
-  assert.equal(first.ok, true, first.error);
-  assert.equal(first.bound.orders, 1, '돌려받는 범위는 등록 시점에 묶인 주문뿐이다');
-
-  const second = redeem(context, tablet, pc, 'redeem-0000002');
-  assert.equal(second.error, 'recovery_succession_exists',
-    '같은 기기로 두 번째 등록까지 되살릴 수는 없다');
-
-  // 거절된 두 번째는 자기 행을 건드리지 않았어야 한다.
+  assert.equal(redeem(context, laptop, pc, 'redeem-0000001').ok, true);
+  // 두 등록이 한 기기를 가리키면 recoverySuccession_ 이 모호로 판정해, 그 기기가
+  // 이미 되살린 주문까지 함께 사라진다. 그래서 더하기가 되어도 이것만은 막는다.
+  assert.equal(redeem(context, tablet, pc, 'redeem-0000002').error,
+    'recovery_succession_exists');
   assert.equal(String(data.recovery.rows.at(-1)[5]).toLowerCase(), tablet,
-    '두 번째 등록 행의 현재 해시가 그대로 남는다');
+    '거절된 등록 행은 손대지 않은 채 그대로 남는다');
+  assert.equal(read(context, pc).ids.includes(idLaptop), true,
+    '먼저 되살린 접근은 그대로 유지된다');
 });

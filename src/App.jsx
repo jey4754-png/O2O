@@ -5572,7 +5572,7 @@ function CustomerHistoryNotice({ status, onRetry, emptyList = false, orderCount 
         <p role="alert">이전에 주문한 적이 있는데 목록이 비어 있다면, 브라우저가 이 사이트의 저장 공간을 비우면서 주문 확인 키가 사라진 상태입니다. 주문 기록은 그대로 남아 있습니다. 확인번호를 등록해 두셨다면 아래에서 바로 되살릴 수 있고, 아니면 복구 코드를 관리자에게 알려 주면 이 기기에서 다시 볼 수 있게 연결해 줍니다.</p>
       )}
       {recovered && (
-        <p role="status">{`주문 ${recovered.bound?.orders || 0}건·그룹 ${recovered.bound?.groups || 0}개·상품 ${recovered.bound?.deals || 0}개를 이 브라우저에 다시 연결했습니다. 목록을 새로 불러옵니다.`}</p>
+        <p role="status">{`이제 이 브라우저에서 주문 ${recovered.bound?.orders || 0}건·그룹 ${recovered.bound?.groups || 0}개·상품 ${recovered.bound?.deals || 0}개를 볼 수 있습니다. 같은 확인번호로 연결한 다른 기기에서도 같은 목록이 보입니다. 목록을 새로 불러옵니다.`}</p>
       )}
       {showRecovery && <CustomerRecoveryRedeem onRecovered={(result) => { setRecovered(result); onRetry?.(); }} />}
       <details open={showRecovery}>
@@ -5757,7 +5757,7 @@ function CustomerRecoveryRedeem({ onRecovered }) {
   return (
     <form className="form-stack compact-form customer-recovery" onSubmit={submit}>
       <p><strong>확인번호를 등록해 두셨나요?</strong> 전화번호 {phone}로 등록할 때 <strong>새로 정한 숫자</strong>(전화번호·관리자 PIN 아님)를 넣으면 그때 묶어 둔 주문·그룹·상품을 이 브라우저로 바로 되살립니다. 등록한 기기의 내 주문 화면에서 등록한 자리 수를 확인할 수 있습니다.</p>
-      <p>이 브라우저의 기존 주문은 유지됩니다. 같은 확인번호로 다른 기기에 되살린 적이 있다면, 그 기기에 연결했던 복구 권한은 이 브라우저로 옮겨집니다. 여러 기기에 동시에 복사하는 기능은 아닙니다.</p>
+      <p>이 브라우저의 기존 주문은 유지됩니다. 같은 확인번호로 되살린 다른 기기가 있다면 그 기기도 그대로 유지되고, 이 브라우저가 거기에 더해집니다. 되살린 뒤에는 연결된 기기들이 같은 주문 목록을 봅니다.</p>
       <label>확인번호
         <input {...recoveryPinInput({ 'aria-label': '복구 확인번호', value: pin, disabled: busy,
           onChange: (event) => setPin(event.target.value.replace(/\D/g, '')) }, visible)} />

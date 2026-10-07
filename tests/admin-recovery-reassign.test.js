@@ -87,7 +87,8 @@ test('관리자 승계 등록은 지정한 주문만 결박하고 사유를 상�
 
   const row = built.recovery.rows.at(-1);
   assert.equal(row[4], LOST, '옛 소유 해시를 그대로 결박한다');
-  assert.equal(row[5], DEVICE, '새 기기 해시가 현재 해시가 된다');
+  assert.deepEqual(JSON.parse(row[5]), [DEVICE],
+    '연결된 기기는 목록으로 적는다. 되살리기가 기기를 더할 수 있어야 하기 때문이다');
   assert.deepEqual(JSON.parse(row[6]), [picked], '지정한 주문만 결박한다');
   assert.equal(String(row[2]).startsWith('admin:'), true,
     '관리자 승계 행의 식별키는 전화번호 sha256 공간과 겹치지 않는다');

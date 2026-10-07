@@ -175,7 +175,9 @@ test('빈 목록에서 확인번호로 되살리면 그룹·상품 권한을 이
 
     await page.getByLabel('복구 확인번호').fill('482913');
     await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
-    await expect(page.getByRole('status').filter({ hasText: '주문 1건·그룹 1개·상품 1개를 이 브라우저에 다시 연결했습니다' })).toBeVisible();
+    await expect(page.getByRole('status').filter({ hasText: '이제 이 브라우저에서 주문 1건·그룹 1개·상품 1개를 볼 수 있습니다' })).toBeVisible();
+    // 되살리기는 기기를 옮기지 않고 더한다. 안내도 그렇게 읽혀야 한다.
+    await expect(page.getByRole('status').filter({ hasText: '연결한 다른 기기에서도 같은 목록이 보입니다' })).toBeVisible();
     await expect.poll(() => f.state.reads.length).toBe(readsBefore + 1);
 
     const sent = f.state.recovery.at(-1);
