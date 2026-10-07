@@ -9,6 +9,7 @@ export function fakeSheet() {
     rows,
     appendRow(value) { this.getRange(rows.length + 1, 1, 1, value.length).setValues([value]); },
     getLastRow: () => rows.length,
+    getLastColumn: () => Math.max(0, ...rows.map((row) => row.length)),
     getMaxColumns: () => columns,
     getMaxRows: () => 1000,
     insertColumnsAfter(_after, count) { columns += count; },

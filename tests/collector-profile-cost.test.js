@@ -95,6 +95,26 @@ test('a room request only initializes accessed tables and reuses their metadata 
   assert.equal(sheets.size, 1, 'background room writes must not initialize analytics/survey/order tables');
 });
 
+test('schema checks initialize empty sheets and upgrade old headers with one metadata read', () => {
+  const context = {};
+  runInNewContext(source, context);
+  for (const state of ['empty', 'old', 'current']) {
+    const sheet = fakeSheet();
+    if (state === 'old') sheet.rows.push(['old header']);
+    if (state === 'current') sheet.rows.push(['a', 'b', 'c']);
+    let columnReads = 0;
+    let frozen = 0;
+    const lastColumn = sheet.getLastColumn;
+    sheet.getLastColumn = () => { columnReads++; return lastColumn(); };
+    sheet.getLastRow = () => { throw Error('redundant remote dimension query'); };
+    sheet.setFrozenRows = () => { frozen++; };
+    context.ensureHeader_(sheet, ['a', 'b', 'c']);
+    assert.equal(columnReads, 1);
+    assert.deepEqual(sheet.rows[0], ['a', 'b', 'c']);
+    assert.equal(frozen, state === 'empty' ? 1 : 0);
+  }
+});
+
 test('repeat login with 1,000 historic visitor events uses bounded reads and batches only missing cells', () => {
   const context = {};
   runInNewContext(source, context);

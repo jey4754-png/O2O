@@ -27,6 +27,40 @@ function hostPaymentFixture(pastReads = 0) {
   return { context, data, dealId, payload };
 }
 
+test('a message checks the published product once while retaining durable replay and fresh permissions', () => {
+  const { context, data, dealId } = hostPaymentFixture();
+  let locked = false;
+  let productLookups = 0;
+  context.acquireScriptLock_ = () => { locked = true; return { releaseLock() { locked = false; } }; };
+  const getRange = data.publicDeals.getRange.bind(data.publicDeals);
+  data.publicDeals.getRange = (...args) => {
+    const range = getRange(...args);
+    const finder = range.createTextFinder.bind(range);
+    range.createTextFinder = (...query) => {
+      const result = finder(...query);
+      const find = result.findNext;
+      result.findNext = () => { if (locked) productLookups++; return find(); };
+      return result;
+    };
+    return range;
+  };
+  const payload = { groupId: dealId, actorId: 'member-test', capabilityHash: 'c'.repeat(64),
+    body: 'Synthetic single product lookup', clientMutationId: 'single-product-message-001' };
+  const sent = context.handleGroupOperation_('send_message', payload);
+  assert.equal(sent.ok, true, sent.error);
+  assert.equal(productLookups, 1);
+  assert.equal(sent.snapshot.messages.length, 1);
+  const replay = context.handleGroupOperation_('send_message', payload);
+  assert.equal(replay.ok, true, replay.error);
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.snapshot.messages.length, 1);
+  data.groupParticipants.rows[1][7] = 'd'.repeat(64);
+  const rejected = context.handleGroupOperation_('send_message', { ...payload,
+    clientMutationId: 'single-product-revoked-001' });
+  assert.equal(rejected.error, 'invalid_capability');
+  assert.equal(data.groupChat.rows.length, 2);
+});
+
 test('host payment with 250 completed read receipts avoids one locked remote read per receipt', () => {
   const { context, data, payload } = hostPaymentFixture(250);
   let locked = false;

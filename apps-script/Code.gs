@@ -2233,10 +2233,10 @@ function storePublicImage_(imageValue) {
 function repairPendingMerchantDealPublish_(sheets, dealIdValue) {
   const dealId = String(dealIdValue || '');
   const sheet = sheets && sheets.publicDeals;
-  if (!sheet || typeof sheet.getLastRow !== 'function' || sheet.getLastRow() < 2) return null;
-  const rowNumber = findExactRow_(sheet, 2, dealId);
-  if (!rowNumber) return null;
-  const deal = publicDealRecord_(sheet, dealId);
+  const record = publicDealRecordWithRow_(sheet, dealId);
+  if (!record) return null;
+  const rowNumber = record.rowNumber;
+  const deal = record.deal;
   if (!deal || deal._groupPublishPending !== true) return deal;
   const repair = deal._groupPublishRepair;
   const target = repair && repair.target;
@@ -2300,17 +2300,27 @@ function requireHostClaimEligibility_(sheets, participant, groupId, actorId) {
   return true;
 }
 
-function publicDealRecord_(sheet, dealId) {
-  if (!sheet || sheet.getLastRow() < 2) return null;
-  const match = sheet.getRange(2, 2, sheet.getLastRow() - 1, 1)
+function publicDealRecordWithRow_(sheet, dealId) {
+  if (!sheet || typeof sheet.getLastRow !== 'function') return null;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return null;
+  const match = sheet.getRange(2, 2, lastRow - 1, 1)
     .createTextFinder(String(dealId || '')).matchEntireCell(true).findNext();
   if (!match) return null;
   try {
-    const deal = JSON.parse(sheet.getRange(match.getRow(), 7).getValue() || '{}');
-    return deal && typeof deal === 'object' && !Array.isArray(deal) ? deal : null;
+    const rowNumber = match.getRow();
+    const deal = JSON.parse(sheet.getRange(rowNumber, 7).getValue() || '{}');
+    return deal && typeof deal === 'object' && !Array.isArray(deal)
+      ? { rowNumber: rowNumber, deal: deal }
+      : null;
   } catch (error) {
     return null;
   }
+}
+
+function publicDealRecord_(sheet, dealId) {
+  const record = publicDealRecordWithRow_(sheet, dealId);
+  return record ? record.deal : null;
 }
 
 function activePublicDealRecord_(sheet, dealId) {
@@ -4983,8 +4993,9 @@ function findExactRow_(sheet, column, value) {
 }
 
 function findGroupParticipantRow_(sheet, groupId, actorId) {
-  if (sheet.getLastRow() < 2) return 0;
-  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  const rows = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
   for (let index = 0; index < rows.length; index += 1) {
     if (String(rows[index][0]) === groupId && String(rows[index][1]) === actorId) return index + 2;
   }
@@ -5154,8 +5165,9 @@ function getParticipantsForGroup_(sheets, groupId, includeSecret) {
       .filter(function(participant) { return participant && participant.groupId === groupId; });
   }
   const sheet = sheets.groupParticipants;
-  if (sheet.getLastRow() < 2) return [];
-  return sheet.getRange(2, 1, sheet.getLastRow() - 1, GROUP_PARTICIPANT_HEADERS.length)
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  return sheet.getRange(2, 1, lastRow - 1, GROUP_PARTICIPANT_HEADERS.length)
     .getValues()
     .map(function(row, index) { return participantFromRow_(row, index + 2, includeSecret); })
     .filter(function(participant) { return participant && participant.groupId === groupId; });
@@ -5178,7 +5190,6 @@ function scanLatestGroupRows_(sheet, groupId, columnCount, limit) {
 }
 
 function messagesForGroup_(sheets, groupId) {
-  if (sheets.groupChat.getLastRow() < 2) return [];
   return scanLatestGroupRows_(sheets.groupChat, groupId, GROUP_CHAT_HEADERS.length, GROUP_MESSAGE_LIMIT)
     .map(function(row) {
       return {
@@ -5197,7 +5208,6 @@ function messagesForGroup_(sheets, groupId) {
 }
 
 function historyForGroup_(sheets, groupId) {
-  if (sheets.groupHistory.getLastRow() < 2) return [];
   const rowsForGroup = [];
   let endRow = sheets.groupHistory.getLastRow();
   while (endRow >= 2 && rowsForGroup.length < GROUP_MESSAGE_LIMIT) {
@@ -7152,10 +7162,13 @@ function sheetByNameOrInsert_(spreadsheet, name) {
 }
 
 function ensureHeader_(sheet, headers) {
-  if (sheet.getLastRow() === 0) {
+  // The last populated column also identifies an empty sheet. Asking for both
+  // dimensions added a remote metadata read to every table in every request.
+  const lastColumn = sheet.getLastColumn();
+  if (lastColumn === 0) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.setFrozenRows(1);
-  } else if (sheet.getLastColumn() < headers.length) {
+  } else if (lastColumn < headers.length) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
   }
 }
