@@ -247,12 +247,27 @@ async function deploy(description, { promote, acceptRunAsThisAccount }) {
     printSettings(settings);
     if (promote) assertMayUpdateDeployment(settings, acceptRunAsThisAccount);
     const merged = mergeRealConfig(source, readFileSync(REPO_CODE, 'utf8'));
-    if (bodyDigest(merged) === bodyDigest(source)) {
-      console.log('remote code already matches this repository; nothing to push');
-      return;
+    // 편집기가 저장소와 같다고 해서 할 일이 없는 것은 아니다. 운영은 고정된
+    // 버전을 띄우므로, 편집기만 최신이고 그 내용으로 만든 버전이 없으면 고를
+    // 것이 없다. 2026-10-08 에 편집기에는 수정이 들어가 있는데 배포된 v38 은
+    // 옛 본문이어서, 여기서 그냥 돌아가는 바람에 버전이 만들어지지 않았다.
+    const alreadyPushed = bodyDigest(merged) === bodyDigest(source);
+    if (alreadyPushed) {
+      console.log('remote code already matches this repository; skipping push');
+      if (/^\d+$/.test(before)) {
+        const live = cloneRemote(before);
+        const liveDigest = bodyDigest(live.source);
+        rmSync(live.dir, { recursive: true, force: true });
+        if (liveDigest === bodyDigest(merged)) {
+          console.log(`nothing to do: live version ${before} already serves this code`);
+          return;
+        }
+        console.log(`live version ${before} serves ${liveDigest}; creating a version from the current code`);
+      }
+    } else {
+      writeFileSync(join(dir, file), merged, { mode: 0o600 });
+      clasp(['push', '--force'], dir);
     }
-    writeFileSync(join(dir, file), merged, { mode: 0o600 });
-    clasp(['push', '--force'], dir);
     const created = clasp(['create-version', description], dir);
     version = created.match(/version\s+(\d+)/i)?.[1];
     if (!version) throw new Error('could_not_read_new_version_number');

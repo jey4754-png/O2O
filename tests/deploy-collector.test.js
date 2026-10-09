@@ -115,3 +115,18 @@ test('운영 배포·롤백은 막히고, 버전만 만드는 staging 은 열려
     (source.match(/clasp\(\['update-deployment'/g) || []).length,
     '운영 배포를 바꾸는 호출 수와 잠금 호출 수가 같아야 한다');
 });
+
+test('편집기가 저장소와 같아도 그 내용의 버전이 없으면 버전을 만든다', () => {
+  const source = readFileSync(new URL('../scripts/deploy-collector.mjs', import.meta.url), 'utf8');
+  // 운영은 고정된 버전을 띄운다. 편집기만 최신이고 그 내용으로 만든 버전이
+  // 없으면 Joo 가 배포 관리에서 고를 것이 없다. 2026-10-08 에 편집기에는 수정이
+  // 들어가 있는데 배포된 v38 은 옛 본문이었고, staging 이 '푸시할 게 없다'며
+  // 그냥 돌아가 버려 버전이 만들어지지 않았다.
+  assert.equal(/nothing to push';\s*\n\s*return;/.test(source), false,
+    '푸시할 것이 없다고 해서 버전 생성까지 건너뛰지 않는다');
+  assert.match(source, /const alreadyPushed = bodyDigest\(merged\) === bodyDigest\(source\);/);
+  // 돌아가도 되는 경우는 하나뿐이다: 운영 버전이 이미 이 코드를 띄우고 있을 때.
+  assert.match(source, /if \(liveDigest === bodyDigest\(merged\)\) \{\s*\n\s*console\.log\(`nothing to do: live version \$\{before\} already serves this code`\);\s*\n\s*return;/);
+  // create-version 은 두 갈래가 합쳐진 뒤에 한 번만 불린다.
+  assert.equal((source.match(/clasp\(\['create-version'/g) || []).length, 1);
+});
