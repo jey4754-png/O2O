@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import handler from '../api/recovery.js';
 import { adminStore } from './helpers/admin-store.js';
 import { fakeSheet, imageResponse, imageDeal } from './helpers/product-image-store.js';
@@ -280,4 +281,15 @@ test('숫자가 맞았는데 기록이 끝나지 못하면 그렇게 알리고, 
   const again = await invoke(redeemBody());
   assert.equal(again.statusCode, 200, JSON.stringify(again.body));
   assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)), [ORDER]);
+});
+
+test('같은 확인번호가 여러 등록과 맞으면 이 기기가 아닌 다른 기기의 등록으로 되살린다', () => {
+  const source = readFileSync(new URL('../api/recovery.js', import.meta.url), 'utf8');
+  // 이 기기가 등록한 행으로 되살리면 이 기기를 이 기기에 더하는 셈이라 바뀌는 것이
+  // 없다. 예전에는 마지막으로 맞은 행이 걸렸고 후보가 ref 순이라 사실상 무작위였다.
+  assert.match(source, /const matched = matchedRefs\.find\(\(ref\) => ref !== own\) \|\| matchedRefs\[0\];/);
+  assert.match(source, /if \(timingSafeEqual\(key, Buffer\.from\(item\.verifier\.hash, 'hex'\)\)\) matchedRefs\.push\(item\.ref\);/);
+  // 모든 후보를 끝까지 계산하는 것은 그대로다. 몇 개가 맞았는지가 시간으로 새지 않는다.
+  assert.equal(/break;/.test(source.slice(source.indexOf('async function matchEnrollment'), source.indexOf('async function verify'))), false);
+  assert.match(source, /thisDevice: matchedRefs\.includes\(sha256\(body\.capabilityToken\)\)/);
 });

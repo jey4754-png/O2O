@@ -700,3 +700,60 @@ test('한 기기가 두 등록에 걸치지는 못한다', () => {
   assert.equal(read(context, pc).ids.includes(idLaptop), true,
     '먼저 되살린 접근은 그대로 유지된다');
 });
+
+// ── 2026-10-12 실제 고객 상태 재현 ─────────────────────────────────────────
+// 옛 기기 X 의 주문이 예전 '옮기기' 되살리기로 휴대폰에 승계돼 있고(구 형식
+// 단일 해시), PC 는 10/5 에 자기 등록을 해 둔 상태. v40 은 자기 등록만 한 행까지
+// 승계로 세어 PC 가 두 행에 걸렸고, 되살리기 후 PC 는 그대로·휴대폰은 비었다.
+const X_OLD = '1'.repeat(64);
+const MOBILE = '2'.repeat(64);
+const PC_DEVICE = '3'.repeat(64);
+
+const realState = ({ mobileSelfEnrolled }) => {
+  const built = redeemStore();
+  const { data } = built;
+  const put = (id, hash) => data.customerOrders.rows.push(['', id, PHONE, JSON.stringify(order(id, hash))]);
+  ['order-1700000041001', 'order-1700000041002', 'order-1700000041003'].forEach((id) => put(id, X_OLD));
+  put('order-1700000041004', MOBILE);
+  put('order-1700000041005', PC_DEVICE);
+  put('order-1700000041006', PC_DEVICE);
+  const row = (bound, current, ids) => data.recovery.rows.push(['t', 't', IDENTITY,
+    JSON.stringify({ algorithm: 'scrypt-v1' }), bound, current, JSON.stringify(ids), '[]', '[]',
+    'visitor-laptop', 1, 'enrolled-' + bound.slice(0, 8)]);
+  row(X_OLD, MOBILE, ['order-1700000041001', 'order-1700000041002', 'order-1700000041003']);
+  row(PC_DEVICE, PC_DEVICE, ['order-1700000041005', 'order-1700000041006']);
+  if (mobileSelfEnrolled) row(MOBILE, MOBILE, ['order-1700000041004']);
+  return built;
+};
+
+for (const mobileSelfEnrolled of [false, true]) {
+  test(`자기 등록이 있는 PC 를 다른 등록에 더해도 두 기기가 같은 목록을 본다 (휴대폰 자기 등록 ${mobileSelfEnrolled ? '있음' : '없음'})`, () => {
+    const { context } = realState({ mobileSelfEnrolled });
+    const before = read(context, MOBILE).ids.slice().sort();
+    assert.equal(before.length, 4, '되살리기 전 휴대폰은 승계 3건 + 자기 주문 1건');
+    // 자기 등록만 해 둔 행은 승계가 아니다. 이것을 세면 휴대폰이 지금 당장 모호해진다.
+    assert.deepEqual(read(context, PC_DEVICE).ids.slice().sort(),
+      ['order-1700000041005', 'order-1700000041006']);
+
+    const redeemed = redeem(context, X_OLD, PC_DEVICE, 'redeem-pc-0000001');
+    assert.equal(redeemed.ok, true, redeemed.error);
+
+    const onMobile = read(context, MOBILE).ids.slice().sort();
+    const onPc = read(context, PC_DEVICE).ids.slice().sort();
+    assert.deepEqual(onPc, onMobile, '되살린 뒤 두 기기의 목록이 같다');
+    assert.equal(onMobile.length, 6, '옛 기기 3건 + 휴대폰 1건 + PC 2건이 모두 보인다');
+    for (const id of before) assert.equal(onMobile.includes(id), true, `휴대폰이 보던 ${id} 가 사라지지 않는다`);
+  });
+}
+
+test('여러 기기 행에 이미 걸린 기기를 또 다른 여러 기기 행에 더하지 않는다', () => {
+  const { context, data } = realState({ mobileSelfEnrolled: false });
+  assert.equal(redeem(context, X_OLD, PC_DEVICE, 'redeem-pc-0000001').ok, true);
+  // PC 자기 행에 휴대폰을 더하면 PC 자기 행이 여러 기기 행이 되어 PC 가 두 승계에
+  // 걸린다. 더해지는 휴대폰만이 아니라 기존 기기 PC 까지 확인해야 막힌다.
+  const second = redeem(context, PC_DEVICE, MOBILE, 'redeem-mobile-000001');
+  assert.equal(second.error, 'recovery_succession_exists');
+  assert.equal(read(context, PC_DEVICE).ids.length, 6, '거절된 시도는 PC 가 보던 목록을 건드리지 않는다');
+  assert.equal(read(context, MOBILE).ids.length, 6);
+  assert.equal(data.recovery.rows.filter((r) => String(r[4]) === PC_DEVICE).length, 1);
+});

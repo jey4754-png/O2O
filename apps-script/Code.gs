@@ -4540,23 +4540,31 @@ function handleRecoveryCredentials_(payload) {
     // 한 키가 두 등록을 승계하면 recoverySuccession_ 이 모호로 판정해 null 을
     // 돌려주고, 그 키가 이미 되살린 접근까지 한꺼번에 사라진다. 관리자 경로는
     // 이미 같은 이유로 막고 있다. 같은 보호를 여기에도 둔다.
-    const ambiguous = recoveryRowsRaw_(sheets).some(function(row) {
-      return row.rowNumber !== existing.rowNumber
-        && row.currentHashes.indexOf(newHash) !== -1
-        && String(row.boundHash || '').toLowerCase() !== newHash;
-    });
-    if (ambiguous) throw recoveryError_('recovery_succession_exists');
     // 되살리기는 기기를 옮기지 않고 더한다. 옮기기였을 때는 PC 에서 확인번호를
     // 넣으면 휴대폰 목록이 비어, 사용자가 기기 하나를 골라야 했다.
     const devices = existing.currentHashes.slice();
     if (devices.indexOf(newHash) === -1) devices.push(newHash);
     if (devices.length > RECOVERY_DEVICES_PER_ROW) throw recoveryError_('recovery_device_limit');
-    // 더하는 기기가 이미 자기 이름으로 가진 주문도 공유 목록에 합친다. 그래야
-    // 연결된 기기들이 같은 목록을 본다. 합치는 것은 그 기기가 소유를 증명한
-    // 주문뿐이므로 볼 수 있는 범위가 늘어나지 않는다.
+    // 한 기기가 의미 있는 승계 두 개에 걸리면 recoverySuccession_ 이 모호로 판정해
+    // 그 기기가 이미 보던 주문까지 사라진다. 더해지는 기기만이 아니라, 이 행이
+    // 처음으로 여러 기기 행이 되면서 승계가 생기는 기존 기기까지 모두 확인한다.
+    const after = { boundHash: existing.boundHash, currentHashes: devices };
+    const ambiguous = recoveryRowsRaw_(sheets).some(function(row) {
+      if (row.rowNumber === existing.rowNumber) return false;
+      return devices.some(function(device) {
+        return recoveryRowGrantsTo_(after, device) && recoveryRowGrantsTo_(row, device);
+      });
+    });
+    if (ambiguous) throw recoveryError_('recovery_succession_exists');
+    // 연결된 모든 기기가 이미 자기 이름으로 가진 주문을 공유 목록에 합친다. 새로
+    // 더해진 기기만 합치면, 예전 '옮기기'로 연결된 기기의 직접 주문은 다른
+    // 기기에서 끝내 보이지 않는다. 합치는 것은 각 기기가 소유를 증명한 주문뿐이라
+    // 볼 수 있는 범위가 이 등록 바깥으로 늘어나지 않는다.
     const boundOrderIds = (existing.boundOrderIds || []).map(String);
-    recoveryOwnedOrderIds_(sheets, newHash).forEach(function(orderId) {
-      if (boundOrderIds.indexOf(orderId) === -1) boundOrderIds.push(orderId);
+    devices.forEach(function(device) {
+      recoveryOwnedOrderIds_(sheets, device).forEach(function(orderId) {
+        if (boundOrderIds.indexOf(orderId) === -1) boundOrderIds.push(orderId);
+      });
     });
     const now = new Date().toISOString();
     sheets.recovery.getRange(existing.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([[
@@ -4633,15 +4641,25 @@ function recoveryActsAsHash_(sheets, presentedHash, storedHash, orderId) {
   });
 }
 
+// 이 행이 이 해시에게 승계로서 의미가 있는가. 행의 기기가 이 해시 하나뿐이면
+// (자기 등록만 해 둔 행) 그 기기가 이미 직접 소유한 것 외에 줄 것이 없다. 그런
+// 행까지 승계로 세면, 자기 등록이 있는 기기가 다른 등록에 더해졌을 때 두 행에
+// 걸려 모호해지고 승계 전체가 무효가 된다(2026-10-12 실제 고객 상태로 재현).
+function recoveryRowGrantsTo_(record, hash) {
+  if (record.currentHashes.indexOf(hash) === -1) return false;
+  if (record.boundHash && record.boundHash !== hash) return true;
+  return record.currentHashes.some(function(device) { return device !== hash; });
+}
+
 function recoverySuccession_(sheets, capabilityHash) {
   const hash = String(capabilityHash || '').toLowerCase();
   if (!/^[a-f0-9]{64}$/.test(hash)) return null;
   const matches = recoveryRows_(sheets).filter(function(record) {
-    // 등록한 기기 자신도 연결된 기기에 포함한다. 되살리기가 다른 기기의 주문을
-    // 공유 목록에 합치므로, 여기서 제외하면 등록한 기기만 합쳐진 목록을 보지
-    // 못해 양쪽 화면이 끝내 같아지지 않는다. 쓰기 경로는 제시한 해시와 저장된
-    // 해시가 같을 때 먼저 반환하므로 이 완화의 영향을 받지 않는다.
-    return record.currentHashes.indexOf(hash) !== -1;
+    // 등록한 기기 자신도 다른 기기가 더해진 뒤에는 연결된 기기로 센다. 되살리기가
+    // 다른 기기의 주문을 공유 목록에 합치므로, 제외하면 등록한 기기만 합쳐진
+    // 목록을 보지 못한다. 쓰기 경로는 제시한 해시와 저장된 해시가 같을 때 먼저
+    // 반환하므로 이 판정의 영향을 받지 않는다.
+    return recoveryRowGrantsTo_(record, hash);
   });
   // 한 키가 여러 등록을 승계하는 것은 정상 경로로 생길 수 없다. 모호하면 승계하지 않는다.
   return matches.length === 1 ? matches[0] : null;

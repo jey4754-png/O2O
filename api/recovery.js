@@ -253,24 +253,30 @@ async function matchEnrollment(request, body) {
   }
   // Every candidate is derived, including the decoys the collector pads with,
   // so the work done never reveals how many real enrollments this number has.
-  let matched = '';
+  const matchedRefs = [];
   for (const item of candidates) {
     const key = await deriveKey(body.pin, Buffer.from(item.verifier.salt, 'hex'), 64, SCRYPT_OPTIONS);
-    if (timingSafeEqual(key, Buffer.from(item.verifier.hash, 'hex'))) matched = item.ref;
+    if (timingSafeEqual(key, Buffer.from(item.verifier.hash, 'hex'))) matchedRefs.push(item.ref);
   }
-  if (!matched) {
+  if (!matchedRefs.length) {
     await recordFailure(request, identity);
     throw recoveryError('invalid_recovery_pin', 403);
   }
-  return { identity, matched };
+  // 같은 숫자를 여러 기기에서 등록해 두면 여러 행이 함께 맞는다. 이 기기가 직접
+  // 등록한 행으로 되살리면 이 기기를 이 기기에 더하는 셈이라 아무것도 바뀌지
+  // 않는다. 예전에는 마지막으로 맞은 행을 골랐고, 후보가 ref 순으로 정렬되어
+  // 있어 어느 행이 걸릴지 사실상 무작위였다. 다른 기기가 등록한 행을 먼저 고른다.
+  const own = body.capabilityToken ? sha256(body.capabilityToken) : '';
+  const matched = matchedRefs.find((ref) => ref !== own) || matchedRefs[0];
+  return { identity, matched, matchedRefs };
 }
 
 // Checks a number right after registering it, on the device that holds it,
 // without restoring anything. A pass there and a failure on another device
 // then points at the device or phone, never at the digits typed.
 async function verify(request, body) {
-  const { matched } = await matchEnrollment(request, body);
-  return { ok: true, verified: true, thisDevice: matched === sha256(body.capabilityToken) };
+  const { matchedRefs } = await matchEnrollment(request, body);
+  return { ok: true, verified: true, thisDevice: matchedRefs.includes(sha256(body.capabilityToken)) };
 }
 
 async function redeem(request, body) {
