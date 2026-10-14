@@ -4247,6 +4247,35 @@ function recoveryRowsRaw_(sheets) {
 function invalidateRecoveryRows_() { RECOVERY_ROWS_CACHE_ = null; }
 
 // 등록 시점에 살아있는 키가 실제로 소유한 항목만 모은다. 전화번호는 쓰지 않는다.
+// 이미 묶여 있던 결박 집합에 새로 증명된 것을 더한다. 등록을 다시 해도 기존 것을
+// 지우지 않는다. 되살리기가 다른 기기의 주문을 이 행에 합쳐 두므로, 덮어쓰면 그
+// 기기들이 보던 주문이 사라진다. 그룹·상품은 같은 대상이면 새로 증명된 해시가
+// 이긴다. 옛 해시와 새 해시가 같이 남으면 recoveryBoundEntryHash_ 가 모호로
+// 판정해 그 대상의 승계가 통째로 무효가 된다.
+function recoveryMergeBound_(existing, proven) {
+  const orderIds = (existing && existing.boundOrderIds || []).map(String);
+  proven.orderIds.forEach(function(orderId) {
+    if (orderIds.indexOf(String(orderId)) === -1) orderIds.push(String(orderId));
+  });
+  const byKey = function(entries, keyOf, fresh) {
+    const merged = [];
+    const freshKeys = fresh.map(keyOf);
+    (entries || []).forEach(function(entry) {
+      if (entry && typeof entry === 'object' && freshKeys.indexOf(keyOf(entry)) === -1) merged.push(entry);
+    });
+    return merged.concat(fresh);
+  };
+  return {
+    orderIds: orderIds,
+    groups: byKey(existing && existing.boundGroups, function(entry) {
+      return String(entry.groupId || '') + '\u0000' + String(entry.actorId || '');
+    }, proven.groups),
+    deals: byKey(existing && existing.boundDeals, function(entry) {
+      return String(entry.dealId || '');
+    }, proven.deals)
+  };
+}
+
 // 이 해시가 소유를 증명하는 주문 번호. 등록과 되살리기가 같은 기준을 써야
 // 하므로 한 곳에 둔다.
 function recoveryOwnedOrderIds_(sheets, capabilityHash) {
@@ -4486,30 +4515,52 @@ function handleRecoveryCredentials_(payload) {
       if (!validAdminCredentialVerifier_(payload.verifier)) throw recoveryError_('invalid_recovery_verifier');
       const actorId = String(payload.actorId || '');
       if (!validVisitorId_(actorId)) throw recoveryError_('invalid_actor_id');
+      const identityRows = recoveryIdentityRows_(sheets, identityKey);
+      // 이 기기가 되살리기로 이미 연결돼 읽고 있는 등록. 그 기기에서 번호를 새로
+      // 정하면 새 행을 만들지 않고 그 등록의 번호를 바꾼다. 새 행을 만들면 다른
+      // 기기가 그 행에 더해지는 순간 이 기기가 두 승계에 걸려 거절된다. 그래서
+      // 예전 번호를 잊은 고객은 주문이 보이는 기기에서조차 새 번호를 걸 수 없었다
+      // (2026-10-14, 휴대폰의 28건이 9/23 번호에 묶여 있던 사례). 연결된 기기만
+      // 이 경로에 들어오므로, 전화번호만 아는 사람은 여전히 자기 행만 만든다.
+      // 관리자 재연결 행은 식별키가 달라 여기 잡히지 않고, 복구 API 밖에 남는다.
+      const joined = identityRows.filter(function(row) {
+        return row.boundHash !== capabilityHash && recoveryRowGrantsTo_(row, capabilityHash);
+      });
+      if (joined.length > 1) throw recoveryError_('recovery_succession_exists');
       const own = recoveryOwnRow_(sheets, identityKey, capabilityHash);
-      if (own && own.lastMutationId === clientMutationId) {
+      const target = joined[0] || own;
+      if (target && target.lastMutationId === clientMutationId) {
         return json_({ ok: true, duplicate: true });
       }
       // 등록 수를 제한해 한 번호 아래에 행이 무한히 쌓이지 않게 한다.
-      if (!own && recoveryIdentityRows_(sheets, identityKey).length >= RECOVERY_ROWS_PER_IDENTITY) {
+      if (!target && identityRows.length >= RECOVERY_ROWS_PER_IDENTITY) {
         throw recoveryError_('recovery_enrollment_limit');
       }
-      const bound = recoveryBoundSet_(sheets, capabilityHash, payload.groups, payload.deals);
+      const proven = recoveryBoundSet_(sheets, capabilityHash, payload.groups, payload.deals);
       // 소유를 하나도 증명하지 못하면 등록하지 않는다. 등록 자체가 권한 근거가 되므로
-      // 아무 키나 등록해 두고 나중에 남의 것을 가져가는 경로를 막는다.
-      if (!bound.orderIds.length && !bound.groups.length && !bound.deals.length) {
+      // 아무 키나 등록해 두고 나중에 남의 것을 가져가는 경로를 막는다. 이미 연결된
+      // 등록의 번호를 바꾸는 경우는 연결 자체가 증명이고 그 등록에 묶인 것이 있다.
+      if (!joined.length && !proven.orderIds.length && !proven.groups.length && !proven.deals.length) {
         throw recoveryError_('recovery_nothing_to_bind');
       }
+      const bound = recoveryMergeBound_(target, proven);
       const now = new Date().toISOString();
-      const values = [
-        own ? own.createdAt || now : now, now, identityKey,
-        JSON.stringify(payload.verifier), capabilityHash,
-        JSON.stringify(own && own.currentHashes.length ? own.currentHashes : [capabilityHash]),
-        JSON.stringify(bound.orderIds), JSON.stringify(bound.groups), JSON.stringify(bound.deals),
-        actorId, (own ? own.version : 0) + 1, clientMutationId
-      ];
-      if (own) {
-        sheets.recovery.getRange(own.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([values]);
+      const values = joined.length
+        ? [
+          target.createdAt || now, now, identityKey,
+          JSON.stringify(payload.verifier), target.boundHash, JSON.stringify(target.currentHashes),
+          JSON.stringify(bound.orderIds), JSON.stringify(bound.groups), JSON.stringify(bound.deals),
+          target.actorId, target.version + 1, clientMutationId
+        ]
+        : [
+          own ? own.createdAt || now : now, now, identityKey,
+          JSON.stringify(payload.verifier), capabilityHash,
+          JSON.stringify(own && own.currentHashes.length ? own.currentHashes : [capabilityHash]),
+          JSON.stringify(bound.orderIds), JSON.stringify(bound.groups), JSON.stringify(bound.deals),
+          actorId, (own ? own.version : 0) + 1, clientMutationId
+        ];
+      if (target) {
+        sheets.recovery.getRange(target.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([values]);
       } else {
         sheets.recovery.appendRow(values);
       }

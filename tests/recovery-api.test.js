@@ -318,3 +318,39 @@ test('이 기기 등록에 대한 안내는 다른 기기에서 등록한 번호
   assert.match(app, /recovery_own_enrollment: '확인번호는 맞지만, 이 기기에서 직접 등록한 번호입니다\./);
   assert.match(app, /이전 주문이 보이는 다른 기기에서 등록했던 번호를 넣어 주세요\./);
 });
+
+test('예전 번호를 잊어도 연결된 기기에서 새 번호를 정하면 다른 기기가 그 번호로 되살린다', async (t) => {
+  // 2026-10-14: 고객이 "9월 23일 번호 알려주세요"라고 했다. 확인번호는 원문으로
+  // 저장하지 않으므로 누구도 알려 줄 수 없다. 남은 길은 주문이 보이는 기기에서
+  // 새 번호를 정하는 것인데, 예전에는 그 기기 자기 행이 새로 생겨 쓸모가 없었다.
+  const store = fixture(t);
+  const NEW_PIN = '730418';
+  const PC_TOKEN = 'pc-customer-capability-token-0000000000003';
+  assert.equal((await invoke(enrollBody())).statusCode, 200, '원래 기기가 처음 번호를 등록');
+  assert.equal((await invoke(redeemBody())).statusCode, 200, '휴대폰(NEW_TOKEN)이 그 번호로 연결됨');
+  const rowsBefore = store.recovery.rows.length;
+
+  // 휴대폰에서 새 번호를 정한다. 처음 번호는 잊었다고 본다.
+  const reset = await invoke(enrollBody({
+    pin: NEW_PIN, customerCapabilityToken: NEW_TOKEN, actorId: 'visitor-after-wipe',
+    clientMutationId: 'recovery-enroll-phone1', groups: [], deals: [],
+  }));
+  assert.equal(reset.statusCode, 200, JSON.stringify(reset.body));
+  assert.equal(store.recovery.rows.length, rowsBefore, '새 행이 아니라 휴대폰이 연결된 등록의 번호가 바뀐다');
+
+  // PC 에서 새 번호로 되살리면 원래 주문이 보인다.
+  const pc = await invoke(redeemBody({
+    pin: NEW_PIN, customerCapabilityToken: PC_TOKEN, clientMutationId: 'recovery-redeem-pc0001',
+  }));
+  assert.equal(pc.statusCode, 200, JSON.stringify(pc.body));
+  assert.deepEqual(orderIds(store.context, sha(PC_TOKEN)), [ORDER]);
+  assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)), [ORDER], '휴대폰도 그대로 본다');
+
+  // 처음 번호는 더 이상 통하지 않는다.
+  const stale = await invoke(redeemBody({
+    customerCapabilityToken: 'late-customer-capability-token-00000000004', clientMutationId: 'recovery-redeem-late01',
+  }));
+  assert.equal(stale.statusCode, 403);
+  assert.equal(stale.body.error, 'invalid_recovery_pin');
+  assert.equal(JSON.stringify([store.recovery.rows, store.calls]).includes(NEW_PIN), false, '새 번호 원문도 어디에도 없다');
+});

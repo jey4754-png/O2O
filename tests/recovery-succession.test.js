@@ -120,7 +120,11 @@ test('복구 레이트리밋은 관리자 자격증명을 절대 돌려주지 �
 
 test('등록은 소유를 증명하지 못하면 거부한다', () => {
   const source = readFileSync(new URL('../apps-script/Code.gs', import.meta.url), 'utf8');
-  assert.match(source, /if \(!bound\.orderIds\.length && !bound\.groups\.length && !bound\.deals\.length\) \{\s*\n\s*throw recoveryError_\('recovery_nothing_to_bind'\);/);
+  // 예외는 하나뿐이다: 이 기기가 이미 연결된 등록의 번호를 새로 정할 때. 연결되려면
+  // 그 등록의 번호를 알았거나 관리자 본인확인을 거쳤으므로 연결 자체가 증명이다.
+  assert.match(source, /if \(!joined\.length && !proven\.orderIds\.length && !proven\.groups\.length && !proven\.deals\.length\) \{\s*\n\s*throw recoveryError_\('recovery_nothing_to_bind'\);/);
+  assert.match(source, /return row\.boundHash !== capabilityHash && recoveryRowGrantsTo_\(row, capabilityHash\);/,
+    '연결 여부도 전화번호가 아니라 제시된 권한 키로 판정한다');
   // 결박 집합은 전화번호가 아니라 제시된 해시의 실제 소유로만 만든다.
   assert.match(source, /if \(String\(order\._customerCapabilityHash \|\| ''\)\.toLowerCase\(\) !== capabilityHash\) return;/);
   assert.equal(/recoveryBoundSet_\(sheets, phone/.test(source), false, '전화번호로 결박 집합을 만들지 않는다');
@@ -319,7 +323,9 @@ test('등록 행의 주인은 전화번호가 아니라 그 행을 만든 권한
   assert.equal(/function recoveryIdentityRow_\(/.test(source), false,
     '전화번호 단독으로 등록 행을 특정하는 경로는 남아 있으면 안 된다');
   assert.match(source, /const own = recoveryOwnRow_\(sheets, identityKey, capabilityHash\);/);
-  assert.match(source, /if \(own\) \{\s*\n\s*sheets\.recovery\.getRange\(own\.rowNumber/);
+  // 쓰는 행은 이 키가 직접 만든 행이거나, 이 키가 이미 연결된 행이다. 둘 다 키로 잡는다.
+  assert.match(source, /const target = joined\[0\] \|\| own;/);
+  assert.match(source, /if \(target\) \{\s*\n\s*sheets\.recovery\.getRange\(target\.rowNumber/);
   assert.match(source, /const RECOVERY_ROWS_PER_IDENTITY = 8;/);
   assert.match(source, /throw recoveryError_\('recovery_enrollment_limit'\);/);
 });
@@ -756,4 +762,111 @@ test('여러 기기 행에 이미 걸린 기기를 또 다른 여러 기기 행�
   assert.equal(read(context, PC_DEVICE).ids.length, 6, '거절된 시도는 PC 가 보던 목록을 건드리지 않는다');
   assert.equal(read(context, MOBILE).ids.length, 6);
   assert.equal(data.recovery.rows.filter((r) => String(r[4]) === PC_DEVICE).length, 1);
+});
+
+// ── 휴대폰에서 번호 새로 정하기 (2026-10-14) ─────────────────────────────────
+// 운영 '복구 등록' 3개 행 그대로: 2번 관리자 재연결, 3번 옛 기기 → 휴대폰(28건,
+// 9/23 번호), 4번 PC 자기 등록. 고객이 9/23 번호를 잊으면 길이 없었다. 휴대폰에서
+// 등록하면 휴대폰 자기 행이 새로 생기고, PC 가 그 행에 더해지는 순간 휴대폰이
+// 두 승계에 걸려 거절됐다.
+const OLD_DEVICE = '05cc7d09' + '0'.repeat(56);
+const ADMIN_DEVICE = 'ce270b36' + '0'.repeat(56);
+const PHONE_DEVICE = '466db5f6' + '0'.repeat(56);
+const PC_ONLY = '02e779df' + '0'.repeat(56);
+const OLD_28 = Array.from({ length: 28 }, (_, i) => `order-17000000600${String(i).padStart(2, '0')}`);
+const verifierOf = (seed) => ({ algorithm: 'scrypt-v1', salt: seed.repeat(32).slice(0, 32), hash: seed.repeat(128).slice(0, 128) });
+
+const productionRows = () => {
+  const built = redeemStore();
+  const { data } = built;
+  const put = (id, hash) => data.customerOrders.rows.push(['', id, PHONE, JSON.stringify(order(id, hash))]);
+  OLD_28.forEach((id) => put(id, OLD_DEVICE));
+  put('order-1700000061001', PHONE_DEVICE);
+  put('order-1700000062001', PC_ONLY);
+  put('order-1700000062002', PC_ONLY);
+  data.recovery.rows.push(['2026-09-23T03:22:21Z', '2026-09-23T03:22:21Z', 'admin:' + 'a'.repeat(64), '',
+    OLD_DEVICE, ADMIN_DEVICE, JSON.stringify([OLD_28[0]]), '[]', '[]', 'visitor-laptop', 1, 'admin_recovery-0923']);
+  data.recovery.rows.push(['2026-09-23T05:00:12Z', '2026-09-23T10:15:46Z', IDENTITY, JSON.stringify(verifierOf('1')),
+    OLD_DEVICE, PHONE_DEVICE, JSON.stringify(OLD_28), '[]', '[]', 'visitor-laptop', 5, 'recovery-redeem-0923']);
+  data.recovery.rows.push(['2026-10-02T03:59:48Z', '2026-10-14T07:30:13Z', IDENTITY, JSON.stringify(verifierOf('2')),
+    PC_ONLY, PC_ONLY, JSON.stringify(['order-1700000062001', 'order-1700000062002']), '[]', '[]', 'visitor-laptop', 4,
+    'recovery-redeem-1014']);
+  return built;
+};
+
+const enrollOnDevice = (context, hash, seed, mutationId) => context.handleRecoveryCredentials_({
+  operation: 'enroll', identityKey: IDENTITY, capabilityHash: hash, verifier: verifierOf(seed),
+  actorId: '7aec5215-d6c9-4a11-8173-ef6d9ebae2db', clientMutationId: mutationId, groups: [], deals: [],
+});
+
+test('예전 번호를 잊어도 주문이 보이는 휴대폰에서 새 번호를 정하면 PC 가 그 번호로 같은 목록을 본다', () => {
+  const { context, data } = productionRows();
+  assert.equal(read(context, PHONE_DEVICE).ids.length, 29);
+  assert.equal(read(context, PC_ONLY).ids.length, 2);
+  const rowsBefore = data.recovery.rows.length;
+
+  const enrolled = enrollOnDevice(context, PHONE_DEVICE, '3', 'recovery-enroll-phone01');
+  assert.equal(enrolled.ok, true, enrolled.error);
+  assert.equal(data.recovery.rows.length, rowsBefore, '새 행을 만들지 않는다');
+  const row3 = data.recovery.rows.find((row) => String(row[11]) === 'recovery-enroll-phone01');
+  assert.equal(String(row3[4]), OLD_DEVICE, '휴대폰이 연결된 바로 그 등록(3번 행)의 번호가 바뀐다');
+  assert.deepEqual(JSON.parse(row3[3]), verifierOf('3'), '새 번호의 검증자가 걸린다');
+  assert.equal(enrolled.bound.orders, 29, '휴대폰이 직접 가진 주문도 그 등록에 합쳐진다');
+  assert.equal(read(context, PHONE_DEVICE).ids.length, 29, '등록만으로 휴대폰 목록은 바뀌지 않는다');
+
+  // PC 에서 새 번호로 되살리기. Vercel 은 맞은 행의 ref(결박해시)를 넘긴다.
+  const redeemed = redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001');
+  assert.equal(redeemed.ok, true, redeemed.error);
+  const onPhone = read(context, PHONE_DEVICE).ids.slice().sort();
+  const onPc = read(context, PC_ONLY).ids.slice().sort();
+  assert.deepEqual(onPc, onPhone, '휴대폰과 PC 가 같은 목록을 본다');
+  assert.equal(onPc.length, 31);
+});
+
+test('번호를 다시 정해도 다른 기기가 합쳐 둔 주문을 지우지 않는다', () => {
+  const { context } = productionRows();
+  assert.equal(enrollOnDevice(context, PHONE_DEVICE, '3', 'recovery-enroll-phone01').ok, true);
+  assert.equal(redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001').ok, true);
+  // 이제 3번 행에는 PC 주문 2건이 합쳐져 있다. 휴대폰에서 번호를 한 번 더 바꾼다.
+  const again = enrollOnDevice(context, PHONE_DEVICE, '4', 'recovery-enroll-phone02');
+  assert.equal(again.ok, true, again.error);
+  assert.equal(again.bound.orders, 31, '덮어쓰지 않고 합친다');
+  assert.equal(read(context, PC_ONLY).ids.length, 31, 'PC 가 보던 목록이 그대로다');
+  assert.equal(read(context, PHONE_DEVICE).ids.length, 31);
+});
+
+test('자기 행을 다시 등록해도 그 행에 더해진 기기의 주문이 남는다', () => {
+  // 덮어쓰기는 '옮기기' 시절에는 무해했다. 되살리기가 다른 기기의 주문을 합치면서
+  // 재등록이 그 주문들을 지우는 경로가 됐다.
+  const { context, data } = productionRows();
+  const third = 'aa11bb22' + '0'.repeat(56);
+  data.customerOrders.rows.push(['', 'order-1700000063001', PHONE, JSON.stringify(order('order-1700000063001', third))]);
+  assert.equal(redeem(context, PC_ONLY, third, 'recovery-redeem-third1').ok, true, 'third 가 PC 자기 행에 더해진다');
+  assert.equal(read(context, PC_ONLY).ids.includes('order-1700000063001'), true);
+
+  const reenrolled = enrollOnDevice(context, PC_ONLY, '5', 'recovery-enroll-pc0001');
+  assert.equal(reenrolled.ok, true, reenrolled.error);
+  assert.equal(read(context, PC_ONLY).ids.includes('order-1700000063001'), true, 'third 의 주문이 지워지지 않는다');
+  assert.equal(read(context, third).ids.length, 3);
+});
+
+test('연결되지 않은 기기는 남의 등록 번호를 바꾸지 못한다', () => {
+  const { context, data } = productionRows();
+  const stranger = 'dd44ee55' + '0'.repeat(56);
+  const before = JSON.stringify(data.recovery.rows.slice(1).map((row) => row[3]));
+  // 같은 전화번호지만 3번 행에 연결된 적이 없고, 직접 가진 주문도 없다.
+  assert.equal(enrollOnDevice(context, stranger, '6', 'recovery-enroll-strng1').error, 'recovery_nothing_to_bind');
+  assert.equal(JSON.stringify(data.recovery.rows.slice(1).map((row) => row[3])), before, '어느 행의 검증자도 바뀌지 않는다');
+  assert.equal(read(context, stranger).ids.length, 0);
+});
+
+test('관리자 재연결 행은 확인번호 등록으로 잡히지 않는다', () => {
+  // 관리자 행(식별키 admin:…)에만 연결된 기기가 등록하면, 관리자 행에 번호를 거는 대신
+  // 그 기기 자기 행을 만든다. 관리자 재연결은 복구 API 바깥에 남는다.
+  const { context, data } = productionRows();
+  data.customerOrders.rows.push(['', 'order-1700000064001', PHONE, JSON.stringify(order('order-1700000064001', ADMIN_DEVICE))]);
+  const adminRowBefore = JSON.stringify(data.recovery.rows[1]);
+  assert.equal(enrollOnDevice(context, ADMIN_DEVICE, '7', 'recovery-enroll-admin1').ok, true);
+  assert.equal(JSON.stringify(data.recovery.rows[1]), adminRowBefore, '관리자 행은 그대로다');
+  assert.equal(String(data.recovery.rows.at(-1)[4]), ADMIN_DEVICE, '그 기기 자기 행이 새로 생긴다');
 });
