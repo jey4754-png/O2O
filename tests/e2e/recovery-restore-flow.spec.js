@@ -131,6 +131,13 @@ test(partial ? '일부 주문이 있는 기기도 이전 주문을 복구하고 
       await expect(page.getByRole('heading', { name: '조회 가능한 참여 내역이 없습니다' })).toBeVisible();
 
     }
+    if (partial) {
+      // 2026-10-14 PC 처럼 이 기기에 예전 등록 기록(주문 1건 시점)이 남아 있는 상태.
+      // 되살리기로 늘어난 주문을 '등록 이후 새 주문'으로 세어 재등록을 권하면, 따르는
+      // 순간 다른 기기에서 정한 번호가 이 기기에서 친 번호로 바뀐다.
+      await page.evaluate(() => localStorage.setItem('o2o_mvp_recovery_enrollment_v1',
+        JSON.stringify({ enrolledAt: '2026-10-11T00:00:00.000Z', orderCount: 1, bound: null, pinLength: 6 })));
+    }
     await page.getByLabel('복구 확인번호').fill(PIN);
     await page.getByRole('button', { name: '확인번호로 되살리기', exact: true }).click();
     // 안내 숫자와 실제 목록이 같아야 한다. 되살리기가 이 기기의 기존 주문까지
@@ -146,6 +153,8 @@ test(partial ? '일부 주문이 있는 기기도 이전 주문을 복구하고 
       await page.reload();
       await page.locator('.bottom-nav').getByRole('button', { name: '내 주문', exact: true }).click();
       await expect(page.locator('.order-card')).toHaveCount(4);
+      await expect(page.getByText(/등록 이후 새 주문/)).toHaveCount(0);
+      await expect(page.locator('summary').filter({ hasText: '등록됨' })).toBeVisible();
       await page.screenshot({ path: testInfo.outputPath('partial-history-restored.png'), fullPage: true });
     }
   } finally {

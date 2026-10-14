@@ -711,6 +711,16 @@ async function redeemRecovery(pin) {
     customerCapabilityToken: getCustomerOrderCapability(),
   });
   applyRecoveredAccess(result);
+  // 되살리기로 늘어난 주문은 '등록 이후 새 주문'이 아니다. 이 기기는 방금 그 번호의
+  // 등록에 연결됐고, 그 등록이 이 주문들을 이미 묶고 있다. 기록을 그대로 두면 화면이
+  // 늘어난 건수를 새 주문으로 세어 재등록을 권하고, 따르면 다른 기기에서 정한 번호가
+  // 이 기기에서 친 번호로 바뀐다(2026-10-14 PC: '등록 이후 새 주문 29건').
+  if (result?.duplicate !== true && result?.bound) {
+    saveJson(RECOVERY_ENROLLMENT_KEY, {
+      enrolledAt: new Date().toISOString(), orderCount: Number(result.bound.orders || 0),
+      bound: result.bound, pinLength: pin.length,
+    });
+  }
   return result;
 }
 
