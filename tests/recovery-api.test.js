@@ -293,3 +293,28 @@ test('같은 확인번호가 여러 등록과 맞으면 이 기기가 아닌 다
   assert.equal(/break;/.test(source.slice(source.indexOf('async function matchEnrollment'), source.indexOf('async function verify'))), false);
   assert.match(source, /thisDevice: matchedRefs\.includes\(sha256\(body\.capabilityToken\)\)/);
 });
+
+test('이 기기가 직접 등록한 번호로 이 기기를 되살리면 성공인 척하지 않고 무엇을 할지 알려 준다', async (t) => {
+  // 2026-10-14 16:30 실제 사례: PC 에서 등록한 번호를 그 PC 에 넣었다. 되살리기는
+  // 성공으로 답했고 화면은 '주문 2건을 볼 수 있습니다'라고 했지만 목록은 그대로였다.
+  const store = fixture(t);
+  assert.equal((await invoke(enrollBody())).statusCode, 200);
+  const rowBefore = JSON.stringify(store.recovery.rows);
+
+  const response = await invoke(redeemBody({ customerCapabilityToken: TOKEN }));
+  assert.equal(response.statusCode, 409, JSON.stringify(response.body));
+  assert.equal(response.body.error, 'recovery_own_enrollment');
+  // 숫자는 맞았으므로 틀린 시도로 세지 않고, 수집기에 승계 쓰기도 하지 않는다.
+  assert.deepEqual(store.calls.map((call) => call.payload.operation), ['begin', 'enroll', 'begin']);
+  assert.equal(JSON.stringify(store.recovery.rows), rowBefore, '등록 행이 그대로다');
+
+  // 다른 기기에서는 같은 번호가 그대로 된다.
+  const other = await invoke(redeemBody({ clientMutationId: 'recovery-redeem-0002' }));
+  assert.equal(other.statusCode, 200, JSON.stringify(other.body));
+});
+
+test('이 기기 등록에 대한 안내는 다른 기기에서 등록한 번호를 쓰라고 말한다', () => {
+  const app = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
+  assert.match(app, /recovery_own_enrollment: '확인번호는 맞지만, 이 기기에서 직접 등록한 번호입니다\./);
+  assert.match(app, /이전 주문이 보이는 다른 기기에서 등록했던 번호를 넣어 주세요\./);
+});

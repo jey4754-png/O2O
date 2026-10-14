@@ -280,7 +280,15 @@ async function verify(request, body) {
 }
 
 async function redeem(request, body) {
-  const { identity, matched } = await matchEnrollment(request, body);
+  const { identity, matched, matchedRefs } = await matchEnrollment(request, body);
+  // 맞은 등록이 모두 이 기기가 직접 한 등록이면, 되살리기는 이 기기를 이 기기에
+  // 더할 뿐이라 아무것도 바뀌지 않는다. 그런데도 성공으로 답하면 화면은 '주문 N건을
+  // 볼 수 있습니다'라고 하고 목록은 그대로라, 고객은 기능이 고장 났다고 본다
+  // (2026-10-14 16:30 실제 사례: PC 에서 PC 의 번호로 되살리기). 숫자는 맞았으니
+  // 틀린 횟수로 세지 않고, 무엇을 해야 하는지 알려 준다.
+  if (matchedRefs.every((ref) => ref === sha256(body.capabilityToken))) {
+    throw recoveryError('recovery_own_enrollment', 409);
+  }
   let result;
   try {
     result = await collector({
