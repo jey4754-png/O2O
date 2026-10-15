@@ -224,7 +224,36 @@ export function getGroupCredential(groupId, actorId) {
 // the credential is stored under that id rather than this browser's visitor.
 export function adoptRecoveredGroupCredential(groupId, actorId, capabilityToken) {
   if (!groupId || !actorId || typeof capabilityToken !== 'string' || capabilityToken.length < 32) return null;
-  return saveGroupCredential(groupId, { actorId, capabilityToken, role: 'member', recovered: true });
+  // 이 기기가 원래 가진 자격은 덮어쓰지 않는다. 그 토큰은 참여자 행과 바로 맞는 진짜
+  // 열쇠이고, 되살린 자격은 등록을 거쳐야만 통하는 대체 열쇠다. 덮어쓰면 그 방의
+  // 승계가 이 기기의 다른 등록에 없을 때 기기가 자기 방에서 쫓겨나고 역할도 host 에서
+  // member 로 내려간다(2026-10-14 17:45 PC 되살리기 직후 자기 방 두 곳 거절).
+  const existing = getGroupCredential(groupId, actorId);
+  if (existing?.capabilityToken && existing.recovered !== true) return existing;
+  return saveGroupCredential(groupId, {
+    actorId, capabilityToken, role: existing?.role || 'member', recovered: true,
+  });
+}
+
+// 이 그룹에서 이 기기가 쓸 자격. 원하는 참여자ID 의 자격이 있으면 그것을, 없으면 이
+// 기기가 가진 그 그룹의 다른 자격을 쓴다. 되살린 자격은 원래 참여자ID 밑에 저장되므로
+// 이 기기 방문자ID 로만 찾으면 보이지 않는다. 그래서 되살린 방은 상세 화면에 채팅
+// 버튼 대신 '모집 종료'만 보였다(2026-10-15 경기미, 휴대폰·PC 동일). 기기 자신의
+// 자격을 되살린 것보다 먼저 고른다.
+export function getGroupRoomCredential(groupId, preferredActorId) {
+  if (!groupId) return null;
+  const exact = preferredActorId ? getGroupCredential(groupId, preferredActorId) : null;
+  if (exact) return exact;
+  const credentials = getGroupCredentials();
+  const candidates = [];
+  [credentials[groupId], ...Object.values(credentials)].forEach((credential) => {
+    if (!credential || typeof credential !== 'object' || !credential.capabilityToken || !credential.actorId) return;
+    if (credential !== credentials[groupId] && credential.groupId !== groupId) return;
+    if (!candidates.includes(credential)) candidates.push(credential);
+  });
+  return candidates.find((credential) => credential.recovered !== true && credential.active !== false)
+    || candidates.find((credential) => credential.active !== false)
+    || null;
 }
 
 function saveGroupCredential(groupId, credential) {
@@ -1113,6 +1142,10 @@ export async function fetchGroupSnapshot(
         saveGroupCredential(groupId, {
           ...credential,
           actorId,
+          // 서버가 인정한 이 참여자의 역할로 맞춘다. 되살리기가 자격을 덮어썼던 기기는
+          // host 가 member 로 남아, 입금 확인 같은 호스트 처리가 화면에서 막혔다.
+          ...(credential.role !== 'admin' && ['host', 'member'].includes(viewer?.role)
+            ? { role: viewer.role } : {}),
           active: credential.role === 'admin'
             ? true
             : Boolean(normalized.viewer?.active !== false && viewer && viewer.counted !== false),

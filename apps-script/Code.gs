@@ -803,7 +803,9 @@ function authorizedOwnerDealIds_(sheets, claimsValue) {
     // 승계도 직접 소유와 같은 판정기를 통과해야 한다. 결박 당시 해시를 주장으로
     // 되돌려 ownerClaimMatchesDeal_ 에 그대로 태우면, 상품 행이 그 사이 바뀐
     // 경우가 자동으로 걸러지고 두 경로의 기준이 갈라지지 않는다.
-    const inherited = recoveryDealSuccessionHash_(sheets, claim.dealId, claim.ownerCapabilityHash);
+    const inherited = recoveryDealSuccessionHash_(
+      sheets, claim.dealId, claim.ownerCapabilityHash, deal && deal._ownerCapabilityHash
+    );
     if (inherited && ownerClaimMatchesDeal_(
       { dealId: claim.dealId, ownerCapabilityHash: inherited }, deal
     )) {
@@ -2426,7 +2428,7 @@ function publishPublicDeal_(deal, ownerCapabilityHash) {
         return json_({ ok: false, error: 'deal_ownership_unclaimable' });
       }
       if (existingHash !== incomingHash) {
-        if (recoveryDealSuccessionHash_(sheets, deal.id, incomingHash) !== existingHash) {
+        if (recoveryDealSuccessionHash_(sheets, deal.id, incomingHash, existingHash) !== existingHash) {
           return json_({ ok: false, error: 'forbidden' });
         }
         inheritedOwnerHash = existingHash;
@@ -2813,7 +2815,7 @@ function deletePublicDeal_(dealId, ownerCapabilityHash, expectedPublishVersionVa
       return json_({ ok: false, error: 'deal_ownership_unclaimable' });
     }
     if (existingHash !== incomingHash
-      && recoveryDealSuccessionHash_(sheets, dealId, incomingHash) !== existingHash) {
+      && recoveryDealSuccessionHash_(sheets, dealId, incomingHash, existingHash) !== existingHash) {
       return json_({ ok: false, error: 'forbidden' });
     }
     if (String(existingDeal._lastDealDeleteMutationId || '') === clientMutationId) {
@@ -3217,7 +3219,9 @@ function requireParticipantCapability_(
     // 조회 전용 복구가 된다. 결박 당시 해시가 지금 참여자 행의 값과 아직
     // 같을 때만 인정한다.
     const inherited = sheets
-      ? recoveryGroupSuccessionHash_(sheets, groupId, actorId, participantCapabilityHash)
+      ? recoveryGroupSuccessionHash_(
+        sheets, groupId, actorId, participantCapabilityHash, participant.capabilityHash
+      )
       : '';
     if (!inherited || inherited !== participant.capabilityHash) {
       throw groupOperationError_('invalid_participant_capability');
@@ -4734,26 +4738,57 @@ function recoveryBoundEntryHash_(entries, matches) {
   return ambiguous ? '' : found;
 }
 
-// 그룹 축 승계. 주문 축과 같은 원칙이다: 등록 시점에 살아있는 키로 증명된
-// (그룹, 참여자) 한 쌍에만 적용하고, 전화번호나 actorId 는 근거로 쓰지 않는다.
-// 호출자는 결박 당시 해시가 지금도 참여자 행의 값과 같은지 확인해야 한다.
-function recoveryGroupSuccessionHash_(sheets, groupId, actorId, capabilityHash) {
-  const succession = recoverySuccession_(sheets, capabilityHash);
-  if (!succession) return '';
-  return recoveryBoundEntryHash_(succession.boundGroups, function(entry) {
-    return String(entry.groupId || '') === String(groupId)
-      && String(entry.actorId || '') === String(actorId);
+// 이 해시가 속한 모든 등록. 그 등록을 만든 기기(결박해시)이거나 되살리기로 더해진
+// 기기(현재해시)다. 그룹·상품 승계는 이 모두를 본다. 항목마다 지금의 참여자·상품
+// 해시와 정확히 대조하므로, 여러 등록을 함께 봐도 엉뚱한 권한이 생기지 않는다.
+// 주문은 결박 목록과 소유 해시로 읽기 범위를 정하므로 계속 승계 하나만 쓴다.
+//
+// 하나만 보던 때의 실제 사고(2026-10-14 17:45): PC 가 다른 등록에 되살리기로 더해지는
+// 순간, PC 자기 등록에 묶어 둔 자기 방(우유·탐사)의 승계가 그 다른 등록에 가려졌다.
+// 그 사이 브라우저의 참여자 토큰이 고객 키로 바뀌어 있으면 자기 방에 다시 들어갈
+// 길이 없어, 이튿날까지 그 두 방 조회가 1분에 12번씩 거절됐다.
+function recoveryRowsForDevice_(sheets, capabilityHash) {
+  const hash = String(capabilityHash || '').toLowerCase();
+  if (!RECOVERY_HASH.test(hash)) return [];
+  return recoveryRows_(sheets).filter(function(record) {
+    return record.boundHash === hash || record.currentHashes.indexOf(hash) !== -1;
   });
 }
 
-// 상품 축 승계. 돌려주는 값은 '결박 당시의 사장님 해시'일 뿐이고, 그 해시가 지금도
-// 상품 행에 그대로 있는지는 호출자가 ownerClaimMatchesDeal_ 로 확인한다.
-function recoveryDealSuccessionHash_(sheets, dealId, ownerCapabilityHash) {
-  const succession = recoverySuccession_(sheets, ownerCapabilityHash);
-  if (!succession) return '';
-  return recoveryBoundEntryHash_(succession.boundDeals, function(entry) {
-    return String(entry.dealId || '') === String(dealId);
+// 기기가 속한 등록들 가운데, 대상에 대해 지금의 해시와 같은 값으로 묶인 항목이 있으면
+// 그 값을 돌려준다. 없으면 빈 문자열이다. 호출자의 '지금 값과 같은가' 비교는 그대로다.
+function recoveryLiveBoundHash_(rows, entriesOf, matches, liveHash) {
+  const live = String(liveHash || '').toLowerCase();
+  if (!RECOVERY_HASH.test(live)) return '';
+  const found = rows.some(function(row) {
+    const entries = entriesOf(row);
+    return Array.isArray(entries) && entries.some(function(entry) {
+      return entry && typeof entry === 'object' && !Array.isArray(entry) && matches(entry)
+        && String(entry.hash || '').toLowerCase() === live;
+    });
   });
+  return found ? live : '';
+}
+
+// 그룹 축 승계. 등록 시점에 살아있는 키로 증명된 (그룹, 참여자) 한 쌍에만 적용하고,
+// 전화번호나 actorId 는 근거로 쓰지 않는다. liveHash 는 지금 참여자 행의 해시다.
+function recoveryGroupSuccessionHash_(sheets, groupId, actorId, capabilityHash, liveHash) {
+  return recoveryLiveBoundHash_(recoveryRowsForDevice_(sheets, capabilityHash), function(row) {
+    return row.boundGroups;
+  }, function(entry) {
+    return String(entry.groupId || '') === String(groupId)
+      && String(entry.actorId || '') === String(actorId);
+  }, liveHash);
+}
+
+// 상품 축 승계. liveHash 는 지금 상품 행의 사장님 해시다. 돌려준 값이 지금도 상품 행에
+// 그대로 있는지는 호출자가 다시 확인한다.
+function recoveryDealSuccessionHash_(sheets, dealId, ownerCapabilityHash, liveHash) {
+  return recoveryLiveBoundHash_(recoveryRowsForDevice_(sheets, ownerCapabilityHash), function(row) {
+    return row.boundDeals;
+  }, function(entry) {
+    return String(entry.dealId || '') === String(dealId);
+  }, liveHash);
 }
 
 function filterCustomerOrdersForProof_(orders, visitorId, customerCapabilityHash, succession) {
@@ -5264,7 +5299,9 @@ function authorizeGroupActor_(sheets, groupId, payload) {
     // 결박 당시 해시가 지금 행의 값과 다르면 그 사이 정상 경로로 권한 토큰이
     // 바뀐 것이므로 승계는 무효다 — 옛 등록이 이후의 정상 교체를 되돌리면 안 된다.
     // actorId 일치는 증명이 아니다: actorId 는 사장님 주문 화면에 노출된다.
-    const inherited = recoveryGroupSuccessionHash_(sheets, groupId, actorId, suppliedHash);
+    const inherited = recoveryGroupSuccessionHash_(
+      sheets, groupId, actorId, suppliedHash, participant.capabilityHash
+    );
     if (!inherited || inherited !== participant.capabilityHash) {
       throw groupOperationError_('invalid_capability');
     }

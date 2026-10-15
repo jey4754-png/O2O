@@ -64,6 +64,7 @@ import {
   fetchGroupSnapshot,
   fetchUnreadCounts,
   getGroupCredential,
+  getGroupRoomCredential,
   getGroupCredentials,
   adoptRecoveredGroupCredential,
   hasLegacyCustomerGroupRecoveryState,
@@ -687,7 +688,8 @@ function applyRecoveredAccess(result) {
     const capabilities = loadJson(PUBLIC_DEAL_CAPABILITIES_KEY, {});
     let scopeByDeal = loadJson(OWNER_DEAL_SCOPES_KEY, {});
     result.deals.forEach((dealId) => {
-      capabilities[dealId] = capabilityToken;
+      // 이 기기가 원래 가진 사장님 키는 덮어쓰지 않는다. 그룹 자격과 같은 이유다.
+      if (!capabilities[dealId]) capabilities[dealId] = capabilityToken;
       const assignment = assignOwnerDealScope(scopeByDeal, dealId, `phone:${phone}`);
       if (assignment.allowed) scopeByDeal = assignment.scopeByDeal;
     });
@@ -4616,9 +4618,16 @@ function CustomerApp({
   const [orderRoomAccess, setOrderRoomAccess] = useState(null);
   const accessOptions = { adminMode, readOnly };
   const visitorId = profile ? getVisitorId() : '';
-  const selectedRoomActorId = !adminMode && orderRoomAccess?.groupId === selectedDeal?.id
-    && orderRoomAccess.visitorId === visitorId && orderRoomAccess.phone === profile?.phone
-    ? orderRoomAccess.actorId : visitorId;
+  const orderRoomMatches = !adminMode && orderRoomAccess?.groupId === selectedDeal?.id
+    && orderRoomAccess.visitorId === visitorId && orderRoomAccess.phone === profile?.phone;
+  // 주문 카드에서 연 게 아니면, 이 기기 방문자ID 의 자격이 없을 때 이 기기가 가진 그
+  // 방의 다른 자격(되살린 것 포함)으로 연다. 되살린 방은 원래 참여자ID 로 저장돼 있다.
+  const fallbackRoomCredential = !adminMode && !orderRoomMatches && visitorId && selectedDeal?.id
+    ? getGroupRoomCredential(selectedDeal.id, visitorId)
+    : null;
+  const selectedRoomActorId = orderRoomMatches
+    ? orderRoomAccess.actorId
+    : fallbackRoomCredential?.actorId || visitorId;
   const selectedGroupCredential = visitorId && selectedDeal?.id
     ? getGroupCredential(selectedDeal.id, selectedRoomActorId)
     : null;
@@ -6251,7 +6260,7 @@ function DealDetail({
   const merchantPurchaseClosed = dealQuantity.remaining <= 0
     || (isMerchantGroup && !recruitmentOpen);
   const existingGroupCredential = isGroupDeal
-    ? (roomCredential || getGroupCredential(deal.id, getVisitorId()))
+    ? (roomCredential || getGroupRoomCredential(deal.id, getVisitorId()))
     : null;
   const canOpenGroupRoom = customerCanOpenGroupRoom({
     adminMode,
@@ -7770,6 +7779,7 @@ function OwnerApp({
       onOpenOrders={() => onScreen('orders')}
       onOpenProducts={() => onScreen('products')}
       orderDisplay={ownerOrderDisplay}
+      workspaceStatus={workspaceStatus}
       recoveryCount={ownerRecoveryCount}
       recoveryBusy={ownerRecoveryBusy}
       recoveryError={ownerRecoveryError}
@@ -7792,6 +7802,7 @@ function OwnerForm({
   onOpenOrders,
   onOpenProducts,
   orderDisplay = summarizeOwnerOrderDisplay(),
+  workspaceStatus = 'ready',
   recoveryCount = 0,
   recoveryBusy = false,
   recoveryError = '',
@@ -7923,8 +7934,11 @@ function OwnerForm({
           <button className="owner-orders-button" onClick={onOpenOrders}>
             <ShoppingBag size={18} />
             <span>
-              주문 {orderDisplay.activeOrderCount}건
-              {orderDisplay.pendingDetailQuantity > 0
+              {/* 목록을 못 받았는데 0건이라고 하면 '연동이 안 된다'로 읽힌다(2026-10-15). */}
+              {workspaceStatus === 'loading' ? '주문 확인 중'
+                : workspaceStatus === 'error' ? '주문 확인 실패'
+                  : `주문 ${orderDisplay.activeOrderCount}건`}
+              {workspaceStatus !== 'loading' && workspaceStatus !== 'error' && orderDisplay.pendingDetailQuantity > 0
                 ? ` · 동기화 ${orderDisplay.pendingDetailQuantity}개`
                 : ''}
             </span>

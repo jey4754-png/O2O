@@ -870,3 +870,57 @@ test('관리자 재연결 행은 확인번호 등록으로 잡히지 않는다',
   assert.equal(JSON.stringify(data.recovery.rows[1]), adminRowBefore, '관리자 행은 그대로다');
   assert.equal(String(data.recovery.rows.at(-1)[4]), ADMIN_DEVICE, '그 기기 자기 행이 새로 생긴다');
 });
+
+// ── 기기가 속한 모든 등록으로 그룹·상품 승계 (2026-10-15) ────────────────────
+// 10/14 17:45 PC 가 3번 행에 되살리기로 더해진 직후부터 PC 자기 방 두 곳(우유·탐사)
+// 조회가 1분에 12번씩 invalid_capability 로 거절됐다(그 전 분 0건). PC 자기 방은
+// PC 자기 등록(4번 행)에 묶여 있는데, 승계를 등록 하나로만 보던 때는 3번 행이 그
+// 자리를 차지해 4번 행이 보이지 않았다. 브라우저 쪽 참여자 토큰이 고객 키로 바뀌어
+// 있으면 다시 들어갈 길이 없었다.
+const PC_ROOM = 'owner-pc-milk-room';
+const PC_PARTICIPANT = '7'.repeat(63) + '1';
+
+const pcWithOwnRoom = () => {
+  const built = productionRows();
+  const { data } = built;
+  addGroup(data, PC_ROOM, PC_PARTICIPANT);
+  // 4번 행(PC 자기 등록)에 PC 자기 방과 사장님 상품이 묶여 있다.
+  const row4 = data.recovery.rows.find((row) => String(row[4]) === PC_ONLY);
+  row4[7] = JSON.stringify([{ groupId: PC_ROOM, actorId: 'member-test', hash: PC_PARTICIPANT }]);
+  row4[8] = JSON.stringify([{ dealId: built.dealId, hash: DEAL_OWNER }]);
+  return built;
+};
+
+test('다른 등록에 더해진 PC 도 자기 등록에 묶어 둔 자기 방에 고객 키로 들어간다', () => {
+  const { context } = pcWithOwnRoom();
+  assert.equal(redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001').ok, true, 'PC 가 3번 행에 더해진다');
+  // 참여자 토큰 대신 고객 키(PC_ONLY)로 들어오는 경우. 되살리기가 토큰을 덮어쓴 상태다.
+  assert.equal(snapshot(context, PC_ROOM, PC_ONLY).ok, true,
+    '3번 행에 더해졌어도 4번 행에 묶어 둔 자기 방은 계속 열린다');
+  assert.equal(snapshot(context, PC_ROOM, PC_PARTICIPANT).ok, true, '원래 참여자 토큰도 그대로 된다');
+});
+
+test('자기 등록만 있는 기기도 묶어 둔 방에 고객 키로 들어간다', () => {
+  const { context } = pcWithOwnRoom();
+  assert.equal(snapshot(context, PC_ROOM, PC_ONLY).ok, true);
+});
+
+test('여러 등록을 봐도 지금 참여자 해시와 다른 항목으로는 들어가지 못한다', () => {
+  const { context, data } = pcWithOwnRoom();
+  assert.equal(redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001').ok, true);
+  data.groupParticipants.rows.at(-1)[7] = ROTATED;  // 그 뒤 정상 경로로 토큰이 바뀜
+  assert.equal(snapshot(context, PC_ROOM, PC_ONLY).error, 'invalid_capability',
+    '옛 등록이 이후의 정상 교체를 되돌리지 않는다');
+  assert.equal(snapshot(context, PC_ROOM, STRANGER).error, 'invalid_capability', '제3자 키는 여전히 안 된다');
+  // 휴대폰은 3번 행에만 있고 이 방은 4번 행에만 묶여 있다. 같은 사람이라도 묶인 적 없는
+  // 등록의 방을 얻지는 못한다.
+  data.groupParticipants.rows.at(-1)[7] = PC_PARTICIPANT;
+  assert.equal(snapshot(context, PC_ROOM, PHONE_DEVICE).error, 'invalid_capability');
+});
+
+test('다른 등록에 더해진 PC 도 자기 등록에 묶어 둔 사장님 상품을 본다', () => {
+  const { context, dealId } = pcWithOwnRoom();
+  assert.equal(redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001').ok, true);
+  assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: PC_ONLY }]).ids, [dealId]);
+  assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: STRANGER }]).ids, []);
+});
