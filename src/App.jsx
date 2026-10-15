@@ -372,6 +372,10 @@ const COUNTED_PARTICIPATIONS_KEY = 'o2o_mvp_counted_participations';
 const PUBLIC_DEAL_SYNC_INTERVAL_MS = 60000;
 const CUSTOMER_ORDER_SYNC_INTERVAL_MS = 30000;
 const CUSTOMER_ORDER_PUBLISH_BUDGET = 3;
+// 수집기가 이 코드로 거절하면 그 주문은 이미 서버에 있거나 이 기기의 주문이 아니다.
+const ORDER_EXISTS_SYNC_ERRORS = new Set([
+  'forbidden', 'order_ownership_unclaimable', 'order_deal_conflict', 'client_mutation_conflict', 'invalid_order_owner',
+]);
 const EVENT_MIN_RELEASE_PHASE = Object.freeze({
   chat_message_sent: 8,
   chat_lock_changed: 8,
@@ -1729,6 +1733,9 @@ function App() {
       setUnreadCounts({});
       return undefined;
     }
+    // 배지는 사용자·관리자 화면에만 그려진다. 사장님 화면에서도 손님 방을 계속 조회해
+    // 사장님 목록 요청이 그 뒤에 밀려 시간 초과됐다(2026-10-15 17:18).
+    if (!['/customer', '/admin'].includes(route)) return undefined;
     let cancelled = false;
     let refreshingUnread = false;
     let nextRefreshAt = 0;
@@ -1810,8 +1817,12 @@ function App() {
     const actorId = customerAdminMode ? `${getVisitorId()}_admin` : getVisitorId();
     const seen = loadJson(GROUP_STATUS_SEEN_KEY, {});
     const next = {};
+    // 되살린 방의 자격은 원래 참여자ID 밑에 있어 방문자ID 로만 찾으면 '모집 완료'가 뜨지 않는다.
+    const hasRoom = (dealId) => Boolean(customerAdminMode
+      ? getGroupCredential(dealId, actorId)
+      : getGroupRoomCredential(dealId, actorId));
     deals.forEach((deal) => {
-      if (deal.source !== 'customer' || !getGroupCredential(deal.id, actorId)) return;
+      if (deal.source !== 'customer' || !hasRoom(deal.id)) return;
       const status = deal.groupStatus || 'recruiting';
       if (status !== 'recruiting' && seen[`${deal.id}::${actorId}`] !== status) {
         next[deal.id] = status;
@@ -2755,7 +2766,13 @@ function App() {
               previousIssue: issues[order.id],
               currentIssue: loadJson(CUSTOMER_ORDER_SYNC_ISSUES_KEY, {})[order.id],
             });
+            // 이미 서버에 있는 주문을 고치지 못했거나 이 기기가 그 주문의 주인이 아닌 실패다.
+            // 그 예약은 살아 있는 참여라서 되돌리면 정상 참여 수량이 줄어든다. 서버는 주문에
+            // 묶인 예약만 막고, 예약 표시가 없는 예전 주문은 막지 못한다.
+            const orderExistsElsewhere = centralById.has(order.id)
+              || ORDER_EXISTS_SYNC_ERRORS.has(String(error?.code || ''));
             if (!failureWasSuperseded
+              && !orderExistsElsewhere
               && isTerminalOrderSyncError(error)
               && order.groupId
               && reservationMutationId) {

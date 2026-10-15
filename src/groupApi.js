@@ -248,6 +248,9 @@ export function getGroupRoomCredential(groupId, preferredActorId) {
   const candidates = [];
   [credentials[groupId], ...Object.values(credentials)].forEach((credential) => {
     if (!credential || typeof credential !== 'object' || !credential.capabilityToken || !credential.actorId) return;
+    // 관리자 자격은 관리자 PIN 과 함께 관리자 화면에서만 통한다. 사용자 화면에서 고르면
+    // 참여하지 않은 방에 채팅 버튼이 뜨고 눌러도 열리지 않는다.
+    if (credential.role === 'admin') return;
     if (credential !== credentials[groupId] && credential.groupId !== groupId) return;
     if (!candidates.includes(credential)) candidates.push(credential);
   });
@@ -2024,32 +2027,100 @@ export function setGroupChatLocked(groupId, locked, actorId) {
   }, { allowLocalFallback: false });
 }
 
-export async function fetchUnreadCounts({ adminMode = false, onSnapshot, onUnreadCount, onError, skipGroupId, previousCounts = {} } = {}) {
-  const entries = Object.entries(getGroupCredentials())
+// 배지 조회는 방마다 방 전체를 읽는 무거운 요청이다(수집기에서 한 건에 약 4초).
+// 되살리기로 자격이 10개가 된 PC 가 10건씩 한꺼번에 보내고 휴대폰까지 열리자 20건이
+// 겹쳐 구글이 요청을 거절했고, 그 순간 사장님 목록도 시간 초과로 비었다
+// (2026-10-15 17:18·17:20). 방마다 한 건, 동시에 몇 건만, 한 번에 한 묶음만 보낸다.
+const UNREAD_POLL_CONCURRENCY = 3;
+// 권한이 맞지 않은 자격은 5초 뒤에도 맞지 않는다. 그 자격만 잠시 쉰다. 방에 직접
+// 들어가는 조회는 이 대기와 무관하다.
+const UNREAD_AUTH_RETRY_MS = 5 * 60 * 1000;
+const unreadAuthFailures = new Map();
+const unreadRounds = new Map();
+
+// 한 방에 자격이 둘이면(이 기기 자신의 것과 되살린 것) 기기 자신의 것으로 한 번만 묻는다.
+function unreadEntriesByRoom(entries) {
+  const byGroup = new Map();
+  entries.forEach((entry) => {
+    const current = byGroup.get(entry.groupId);
+    if (!current || (current.credential.recovered === true && entry.credential.recovered !== true)) {
+      byGroup.set(entry.groupId, entry);
+    }
+  });
+  return [...byGroup.values()];
+}
+
+async function mapWithConcurrency(items, limit, run) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await run(items[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+export function fetchUnreadCounts(options = {}) {
+  const mode = options.adminMode ? 'admin' : 'member';
+  const running = unreadRounds.get(mode);
+  if (running) {
+    // 화면을 옮길 때마다 새 묶음을 겹쳐 보내지 않고 진행 중인 묶음의 결과를 함께 쓴다.
+    const { skipGroupId } = options;
+    return running.then((counts) => (
+      skipGroupId && skipGroupId in counts ? { ...counts, [skipGroupId]: 0 } : counts
+    ));
+  }
+  const round = readUnreadCounts(options).finally(() => {
+    if (unreadRounds.get(mode) === round) unreadRounds.delete(mode);
+  });
+  unreadRounds.set(mode, round);
+  return round;
+}
+
+async function readUnreadCounts({ adminMode = false, onSnapshot, onUnreadCount, onError, skipGroupId, previousCounts = {} } = {}) {
+  const entries = unreadEntriesByRoom(Object.entries(getGroupCredentials())
     .map(([storageKey, credential]) => ({
       groupId: credential?.groupId || storageKey.split('::')[0],
       credential,
     }))
     .filter(({ credential }) => Boolean(credential?.actorId && credential?.capabilityToken))
     .filter(({ credential }) => credential.active !== false)
-    .filter(({ credential }) => (adminMode ? credential.role === 'admin' : credential.role !== 'admin'));
-  const snapshots = await Promise.all(entries.map(async ({ groupId, credential }) => {
+    .filter(({ credential }) => (adminMode ? credential.role === 'admin' : credential.role !== 'admin')));
+  const snapshots = await mapWithConcurrency(entries, UNREAD_POLL_CONCURRENCY, async ({ groupId, credential }) => {
     if (groupId === skipGroupId) {
       onUnreadCount?.(groupId, 0);
       return [groupId, null, 0];
     }
+    const authKey = `${groupId}::${credential.actorId}`;
+    const authFailure = unreadAuthFailures.get(authKey);
+    if (authFailure?.capabilityToken === credential.capabilityToken && Date.now() < authFailure.retryAt) {
+      const retainedCount = previousCounts[groupId] || 0;
+      onUnreadCount?.(groupId, retainedCount);
+      return [groupId, null, retainedCount];
+    }
     try {
       const snapshot = await fetchGroupSnapshot(groupId, { actorId: credential.actorId });
+      unreadAuthFailures.delete(authKey);
       onSnapshot?.(groupId, snapshot, credential.actorId);
       onUnreadCount?.(groupId, resolveUnreadCount(snapshot, getLastReadSeq(groupId)));
       return [groupId, snapshot];
     } catch (error) {
+      if ([401, 403].includes(error?.status)) {
+        unreadAuthFailures.set(authKey, {
+          capabilityToken: credential.capabilityToken,
+          retryAt: Date.now() + UNREAD_AUTH_RETRY_MS,
+        });
+      }
       onError?.(error);
       const retainedCount = error.code === 'group_not_found' ? 0 : (previousCounts[groupId] || 0);
       onUnreadCount?.(groupId, retainedCount);
       return [groupId, null, retainedCount];
     }
-  }));
+  });
   return Object.fromEntries(snapshots.map(([groupId, snapshot, retainedCount = 0]) => [
     groupId,
     snapshot ? resolveUnreadCount(snapshot, getLastReadSeq(groupId)) : retainedCount,

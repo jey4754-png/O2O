@@ -80,6 +80,64 @@ test('되살린 자격만 있는 정원 찬 방도 상세에서 채팅 버튼이
     `${ROOM}::${OLD_ACTOR}`)).toBe('host');
 });
 
+test('되살린 방도 단계가 바뀌면 목록 카드에 새 알림이 뜬다', async ({ page }) => {
+  // 모집 완료 배지도 이 기기 방문자ID 로만 자격을 찾아 되살린 방에는 뜨지 않았다.
+  const recruitedRoom = { ...fullRoom, groupStatus: 'recruited' };
+  await page.addInitScript(({ profile, room, oldActor, thisBrowser, token }) => {
+    localStorage.setItem('o2o_mvp_profile', JSON.stringify(profile));
+    localStorage.setItem('o2o_mvp_visitor_id', thisBrowser);
+    localStorage.setItem('o2o_mvp_customer_groups', JSON.stringify([room]));
+    localStorage.setItem('o2o_mvp_group_credentials_v1', JSON.stringify({ [`${room.id}::${oldActor}`]: {
+      groupId: room.id, actorId: oldActor, role: 'member', recovered: true, active: true,
+      capabilityToken: token, credentialRevision: 1,
+    } }));
+    sessionStorage.setItem('o2o_mvp_active_app_session_v1', JSON.stringify({
+      profileKey: '사용자:01011112222', startedAt: Date.now(),
+    }));
+  }, { profile: PROFILE, room: recruitedRoom, oldActor: OLD_ACTOR, thisBrowser: THIS_BROWSER, token: CUSTOMER_TOKEN });
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === '/api/public-deals' && route.request().method() === 'GET') {
+      return route.fulfill({ json: { ok: true, deals: [recruitedRoom] } });
+    }
+    return route.fulfill({ json: { ok: true, deals: [], orders: [], unreadCounts: {}, stats: {} } });
+  });
+
+  await page.goto('/customer');
+  const card = page.locator('.deal-card').filter({ hasText: recruitedRoom.title });
+  await expect(card).toContainText('새 알림 · 주문 확인');
+});
+
+test('사장님 화면에서는 손님 방 배지를 조회하지 않는다', async ({ page }) => {
+  // 같은 브라우저에서 사용자·사장님을 오가면 손님 방 자격이 남아 있다. 사장님 화면에서도
+  // 그 방들을 계속 조회해 사장님 목록 요청이 밀려 시간 초과됐다(2026-10-15 17:18).
+  const ownerProfile = { ...PROFILE, name: '사장님 부하 검증', testerType: '사장님' };
+  await page.addInitScript(({ profile, room, oldActor, token }) => {
+    localStorage.setItem('o2o_mvp_profile', JSON.stringify(profile));
+    localStorage.setItem('o2o_mvp_group_credentials_v1', JSON.stringify({ [`${room}::${oldActor}`]: {
+      groupId: room, actorId: oldActor, role: 'member', active: true, capabilityToken: token, credentialRevision: 1,
+    } }));
+    localStorage.setItem('o2o_mvp_public_deal_capabilities_v1', JSON.stringify({ 'owner-load-product': `owner-${'b'.repeat(64)}` }));
+    localStorage.setItem('o2o_mvp_owner_deal_scopes_v1', JSON.stringify({ 'owner-load-product': 'phone:01011112222' }));
+    sessionStorage.setItem('o2o_mvp_active_app_session_v1', JSON.stringify({
+      profileKey: '사장님:01011112222', startedAt: Date.now(),
+    }));
+  }, { profile: ownerProfile, room: ROOM, oldActor: OLD_ACTOR, token: CUSTOMER_TOKEN });
+  const snapshots = [];
+  let ownerLists = 0;
+  await page.route('**/api/**', async (route) => {
+    let body = {};
+    try { body = route.request().postDataJSON() || {}; } catch { /* GET */ }
+    if (body.action === 'snapshot') snapshots.push(body.groupId);
+    if (body.action === 'list_owner') ownerLists += 1;
+    return route.fulfill({ json: { ok: true, deals: [], orders: [], unreadCounts: {}, stats: {} } });
+  });
+  await page.goto('/owner');
+  await expect.poll(() => ownerLists).toBeGreaterThan(0);
+  await page.waitForTimeout(1500);
+  expect(snapshots, '사장님 화면에서 손님 방 조회가 나가지 않는다').toHaveLength(0);
+});
+
 test('사장님 목록을 못 받았을 때 첫 화면에 주문 0건 대신 확인 실패를 보인다', async ({ page }) => {
   const ownerProfile = { ...PROFILE, name: '사장님 실패 표시 검증', testerType: '사장님' };
   await page.addInitScript(({ profile }) => {
