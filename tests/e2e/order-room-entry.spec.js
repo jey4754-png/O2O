@@ -195,3 +195,59 @@ test('채팅 키가 없는 기존 주문은 재주문 화면으로 보내지 않
     expect(f.pipeline.orders()).toHaveLength(2);
   } finally { await f.pipeline.close(); await f.context.close(); }
 });
+
+test('내 주문에 있는 방인데 이 기기에 입장 정보가 없으면 상세에서 참여로 보내지 않고 되살리기를 안내한다', async ({ page, browser }, testInfo) => {
+  // 2026-10-18 휴대폰 탐사 메모지: 자리는 서버에 있는데 이 기기에 자격이 없어 상세가
+  // '참여하기'와 메뉴 선택을 띄웠고, 참여 요청은 409 actor_already_joined 로 거절됐다.
+  const f = await joinedOrder(page, browser, testInfo);
+  try {
+    const saved = await f.member.evaluate(() => localStorage.getItem('o2o_mvp_group_credentials_v1'));
+    await f.member.evaluate(() => localStorage.removeItem('o2o_mvp_group_credentials_v1'));
+    const start = f.pipeline.apiRequests.length;
+    await f.member.locator('.order-card').getByRole('button', { name: '상세보기', exact: true }).click();
+    const detail = f.member.locator('.detail-screen');
+    await expect(detail).toBeVisible();
+    await expect(detail.locator('.order-seat-elsewhere')).toContainText('확인번호로 되살려 주세요');
+    await expect(detail.getByRole('button', { name: '참여하기', exact: true })).toHaveCount(0);
+    await expect(detail.getByRole('button', { name: '그룹 채팅', exact: true })).toHaveCount(0);
+    await f.member.screenshot({ path: testInfo.outputPath('order-seat-elsewhere-detail.png') });
+    expect(f.pipeline.apiRequests.slice(start).filter(({ body }) => ['join', 'reserve_quantity', 'publish'].includes(body.action))).toEqual([]);
+
+    // 되살리기로 자격이 생기면 같은 상세에 그룹 채팅이 보이고 안내는 사라진다.
+    await f.member.evaluate((value) => localStorage.setItem('o2o_mvp_group_credentials_v1', value), saved);
+    await f.member.goBack();
+    await expect(f.member.locator('.order-card')).toHaveCount(1);
+    await f.member.locator('.order-card').getByRole('button', { name: '상세보기', exact: true }).click();
+    await expect(f.member.locator('.detail-screen').getByRole('button', { name: /^그룹 채팅/ })).toBeVisible();
+    await expect(f.member.locator('.detail-screen .order-seat-elsewhere')).toHaveCount(0);
+    expect(f.pipeline.orders()).toHaveLength(2);
+  } finally { await f.pipeline.close(); await f.context.close(); }
+});
+
+test('다른 참여자ID 로 되살린 자격만 있는 모집 중인 방은 참여 요청 없이 그룹 채팅만 보인다', async ({ page, browser }, testInfo) => {
+  // PC 방문자 f03372 가 되살린 7aec52 자리만 가진 방에서 상세가 '참여하기'를 띄웠고,
+  // 참여 요청은 지금 방문자ID 로 join 을 보냈다. 같은 고객의 두 번째 자리가 생기는 경로다.
+  const f = await joinedOrder(page, browser, testInfo);
+  try {
+    await f.member.evaluate(() => {
+      const key = 'o2o_mvp_group_credentials_v1';
+      const credentials = JSON.parse(localStorage.getItem(key) || '{}');
+      for (const credential of Object.values(credentials)) {
+        if (credential && typeof credential === 'object') credential.recovered = true;
+      }
+      localStorage.setItem(key, JSON.stringify(credentials));
+    });
+    const start = f.pipeline.apiRequests.length;
+    await f.member.goto(`/customer?group=${f.order.groupId}`);
+    const detail = f.member.locator('.detail-screen');
+    await expect(detail).toBeVisible();
+    await expect(detail.getByRole('button', { name: /^그룹 채팅/ })).toBeVisible();
+    await expect(detail.getByRole('button', { name: '참여하기', exact: true })).toHaveCount(0);
+    await expect(detail.getByRole('button', { name: '인원 마감', exact: true })).toHaveCount(0);
+    await f.member.screenshot({ path: testInfo.outputPath('recovered-other-actor-detail.png') });
+    await detail.getByRole('button', { name: /^그룹 채팅/ }).click();
+    await expect(f.member.locator('.group-room-screen')).toBeVisible();
+    expect(f.pipeline.apiRequests.slice(start).filter(({ body }) => ['join', 'reserve_quantity', 'publish'].includes(body.action))).toEqual([]);
+    expect(f.pipeline.orders()).toHaveLength(2);
+  } finally { await f.pipeline.close(); await f.context.close(); }
+});

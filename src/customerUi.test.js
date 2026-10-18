@@ -163,3 +163,22 @@ test('merchant group host state ignores stale legacy browser-only host ids', () 
     saleType: 'instant',
   }, ['merchant-instant']), true);
 });
+
+test('이미 자리가 있는 방에 다시 참여하려 하면 되살리기를 안내한다', () => {
+  for (const code of ['actor_already_joined', 'order_seat_elsewhere']) {
+    const message = joinSubmitErrorMessage(Object.assign(new Error(code), { code }));
+    assert.match(message, /새로 참여하지 않았습니다/);
+    assert.match(message, /확인번호로 되살려/);
+  }
+});
+
+test('이 기기에 그 방 자격이 있으면 되살리기 대신 상세를 다시 열라고 안내한다', () => {
+  for (const code of ['actor_already_joined', 'order_seat_elsewhere']) {
+    const error = Object.assign(new Error(code), { code });
+    const withRoom = joinSubmitErrorMessage(error, { hasRoomCredential: true });
+    assert.match(withRoom, /이미 참여된 방/);
+    assert.match(withRoom, /상세 화면을 다시 열어/);
+    assert.doesNotMatch(withRoom, /입장 정보가 없습니다|되살려/);
+    assert.match(joinSubmitErrorMessage(error), /운영자에게 이 주문의 채팅 연결 점검/);
+  }
+});

@@ -31,7 +31,7 @@ export function canSubmitDealOrder({ deal, selectedCount, remaining, submitting 
   return !dealHasGroupRoom(deal) || isDealRecruiting(deal);
 }
 
-export function joinSubmitErrorMessage(error) {
+export function joinSubmitErrorMessage(error, { hasRoomCredential = false } = {}) {
   const code = errorCode(error);
   if (code === 'order_sync_pending') {
     return '주문 저장 여부를 중앙 서버에서 확인 중입니다. 중복 주문을 막기 위해 잠시 후 같은 내용으로 다시 눌러 주세요.';
@@ -41,6 +41,16 @@ export function joinSubmitErrorMessage(error) {
   }
   if (error?.rollbackError) {
     return '주문 저장과 예약 복구를 완료하지 못했습니다. 중복 참여 방지를 위해 잠시 후 같은 수량으로 다시 시도해 주세요.';
+  }
+  if (['order_seat_elsewhere', 'actor_already_joined'].includes(code)) {
+    // 이 기기에 그 방 자격이 있으면(다른 참여자ID 로 되살린 자리 등) 되살리기 안내는
+    // 틀린 말이다. 상세를 다시 열면 그 자격으로 그룹 채팅이 보인다.
+    if (hasRoomCredential) {
+      return '이미 참여된 방이라 새로 참여하지 않았습니다. 상세 화면을 다시 열어 그룹 채팅으로 들어가 주세요.';
+    }
+    // 이 참여자ID 의 자리가 이미 있는데 이 기기에 그 자리 자격이 없다. 다시 눌러도
+    // 같은 거절이고, 다른 참여자ID 로 참여하면 같은 고객의 자리가 둘이 된다.
+    return '이미 이 공동구매에 참여한 기록이 있어 새로 참여하지 않았습니다. 이 기기에는 그 방의 입장 정보가 없습니다. 내 주문 → ‘이전 주문이 보이지 않나요?’에서 확인번호로 되살려 주세요. 되살린 뒤에도 같으면 운영자에게 이 주문의 채팅 연결 점검을 요청해 주세요.';
   }
   if (QUANTITY_CONFLICT_ERRORS.has(code)) {
     return '다른 참여자가 먼저 남은 수량을 선택했습니다. 상품 상세에서 최신 수량을 확인해 주세요.';

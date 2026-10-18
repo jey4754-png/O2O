@@ -36,3 +36,38 @@ test('cancelled orders and instant purchases cannot open an existing group room'
   }
   assert.equal(resolveOrderRoomAccess(order, { ...deal, saleType: 'instant' }, () => credential), null);
 });
+
+test('an active order for a room this device holds no credential for blocks a second join', async () => {
+  const { orderSeatWithoutRoomCredential } = await import('./orderRoomAccess.js');
+  const memo = { id: 'order-1', type: 'purchase', groupId: 'memo-room', status: 'new', paymentStatus: 'pending' };
+  assert.equal(orderSeatWithoutRoomCredential({ orders: [memo], groupIds: ['memo-room'], credential: null }), memo);
+  // A saved credential opens the room instead; nothing to guard.
+  assert.equal(orderSeatWithoutRoomCredential({ orders: [memo], groupIds: ['memo-room'], credential }), null);
+  // Cancelled orders, other rooms and no orders leave joining as it was.
+  for (const orders of [[{ ...memo, status: 'cancelled' }], [{ ...memo, paymentStatus: 'cancelled' }],
+    [{ ...memo, groupId: 'milk-room' }], []]) {
+    assert.equal(orderSeatWithoutRoomCredential({ orders, groupIds: ['memo-room'], credential: null }), null);
+  }
+  // Older snapshots without groupId match by dealId.
+  const legacy = { id: 'order-2', type: 'purchase', dealId: 'memo-room', status: 'new' };
+  assert.equal(orderSeatWithoutRoomCredential({ orders: [legacy], groupIds: ['memo-room'], credential: null }), legacy);
+});
+
+test('a room credential held under another actor id blocks joining as this visitor', async () => {
+  const { roomCredentialUnderAnotherActor, ORDER_SEAT_ELSEWHERE_MESSAGE } = await import('./orderRoomAccess.js');
+  const recovered = { ...credential, actorId: 'actor-7aec52', recovered: true };
+  // PC 방문자 f03372 가 되살린 7aec52 자리만 가진 방: 지금 방문자ID 로 join 하면 자리가 둘이 된다.
+  assert.equal(roomCredentialUnderAnotherActor({
+    exactCredential: null, roomCredential: recovered, actorId: 'visitor-f03372',
+  }), recovered);
+  // 지금 방문자ID 의 자격이 있으면 수량 추가(reserve_quantity)로 간다.
+  assert.equal(roomCredentialUnderAnotherActor({
+    exactCredential: { ...credential, actorId: 'visitor-f03372' }, roomCredential: recovered, actorId: 'visitor-f03372',
+  }), null);
+  // 자격이 없거나 같은 참여자ID 이면 막지 않는다.
+  assert.equal(roomCredentialUnderAnotherActor({ exactCredential: null, roomCredential: null, actorId: 'visitor-f03372' }), null);
+  assert.equal(roomCredentialUnderAnotherActor({
+    exactCredential: null, roomCredential: { ...recovered, actorId: 'visitor-f03372' }, actorId: 'visitor-f03372',
+  }), null);
+  assert.match(ORDER_SEAT_ELSEWHERE_MESSAGE, /되살린 뒤에도 같으면 운영자에게 이 주문의 채팅 연결 점검을 요청해 주세요/);
+});

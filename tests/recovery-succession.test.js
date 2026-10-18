@@ -924,3 +924,245 @@ test('다른 등록에 더해진 PC 도 자기 등록에 묶어 둔 사장님 �
   assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: PC_ONLY }]).ids, [dealId]);
   assert.deepEqual(ownerDeals(context, [{ dealId, ownerCapabilityHash: STRANGER }]).ids, []);
 });
+
+// ── 결박 주문의 그룹 자리를 되살리기에 싣는다 (2026-10-18, 수집기 v44) ─────────
+// 9/23 등록(3번 행)의 결박그룹에는 가장 이른 방 몇 곳만 들어 있고, 그 뒤의 방
+// (경기미·탐사 메모지)은 빠져 있었다. 그 방들의 주문은 같은 행의 결박주문에 있고
+// 예약도 묶여 있다. 10/18 휴대폰·PC 모두 경기미에 채팅 버튼이 없었고, 휴대폰은
+// 메모 방에 들어가지 못해 참여하기로 보내졌다(409 actor_already_joined). 값은 모두
+// 합성이며 행 구조만 운영과 같다.
+const SEAT_ACTOR = 'visitor-seat-0000001';   // 3번 행 참여자ID(휴대폰 방문자ID)
+const PC_ACTOR = 'visitor-pc-000000001';
+const SEAT = (n) => n.repeat(64).slice(0, 64);
+const RICE_ROOM = 'customer-rice-room';
+const MEMO_ROOM = 'customer-memo-room';
+const BOUND_ROOM = 'customer-bound-room';
+const RICE_SEAT = SEAT('4');
+const MEMO_SEAT = SEAT('5');
+const MEMO_PC_SEAT = SEAT('6');
+const BOUND_SEAT = SEAT('8');
+
+const seatOrderRows = () => {
+  const built = productionRows();
+  const { data } = built;
+  const room = (groupId, host, target) => data.groups.rows.push([groupId, groupId, groupId, 'recruiting', target,
+    false, host, 0, 1, '', '', '', host, 'recruiting', target]);
+  const seat = (groupId, actorId, role, hash) => data.groupParticipants.rows.push([groupId, actorId, '주', role,
+    true, 'pending', 0, hash, 1, '', '', 1]);
+  room(RICE_ROOM, SEAT_ACTOR, 2);
+  seat(RICE_ROOM, SEAT_ACTOR, 'host', RICE_SEAT);
+  seat(RICE_ROOM, 'visitor-lost-mobile1', 'member', SEAT('7'));
+  room(MEMO_ROOM, PC_ACTOR, 6);
+  seat(MEMO_ROOM, SEAT_ACTOR, 'member', MEMO_SEAT);
+  seat(MEMO_ROOM, PC_ACTOR, 'member', MEMO_PC_SEAT);
+  room(BOUND_ROOM, SEAT_ACTOR, 4);
+  seat(BOUND_ROOM, SEAT_ACTOR, 'host', BOUND_SEAT);
+  // 게시 때 묶인 예약: 주문 쪽 예약 칸과 그룹 이력의 join 한 줄이 같은 요청ID 를 가진다.
+  const put = (id, hash, groupId, actorId, overrides = {}) => {
+    const mutationId = 'reservation-' + id.slice(-6);
+    const placed = order(id, hash, {
+      dealId: groupId, groupId, type: 'group', visitorId: actorId, participantActorId: actorId,
+      _reservationMutationId: mutationId, reservationMutationId: mutationId,
+      _reservationAction: 'join', reservationAction: 'join', _reservationQuantity: 1, reservationQuantity: 1,
+      ...overrides,
+    });
+    data.customerOrders.rows.push(['', id, PHONE, JSON.stringify(placed)]);
+    if (placed._reservationMutationId) {
+      built.context.appendGroupHistory_(data, { groupId, action: 'join', actorId, entityId: actorId,
+        clientMutationId: placed._reservationMutationId,
+        result: { mutationContract: JSON.stringify({ selectedQuantity: 1 }) } });
+    }
+    return id;
+  };
+  const ids = {
+    rice: put('order-1700000070001', OLD_DEVICE, RICE_ROOM, SEAT_ACTOR),
+    memo: put('order-1700000070002', OLD_DEVICE, MEMO_ROOM, SEAT_ACTOR),
+    bound: put('order-1700000070003', OLD_DEVICE, BOUND_ROOM, SEAT_ACTOR),
+    memoPc: put('order-1700000070004', PC_ONLY, MEMO_ROOM, PC_ACTOR),
+  };
+  const row3 = data.recovery.rows.find((row) => String(row[11]) === 'recovery-redeem-0923');
+  row3[6] = JSON.stringify(OLD_28.concat([ids.rice, ids.memo, ids.bound]));
+  row3[7] = JSON.stringify([{ groupId: BOUND_ROOM, actorId: SEAT_ACTOR, hash: BOUND_SEAT }]);
+  const row4 = data.recovery.rows.find((row) => String(row[4]) === PC_ONLY);
+  row4[6] = JSON.stringify(['order-1700000062001', 'order-1700000062002', ids.memoPc]);
+  row4[7] = JSON.stringify([{ groupId: MEMO_ROOM, actorId: PC_ACTOR, hash: MEMO_PC_SEAT }]);
+  return { ...built, ids, row3: () => data.recovery.rows.find((row) => String(row[4]) === OLD_DEVICE
+    && String(row[2]) === IDENTITY), put };
+};
+
+const seatSnapshot = (context, groupId, actorId, hash) => {
+  const result = context.handleGroupOperation_('snapshot', { groupId, actorId, capabilityHash: hash });
+  return result.ok === true ? 'ok' : result.error;
+};
+const groupKeys = (groups) => Array.from(groups || [], (entry) => `${entry.groupId}/${entry.actorId}`).sort();
+
+test('되살리기는 예약이 묶인 결박 주문의 그룹 자리를 등록에 더하고 응답에 싣는다', () => {
+  const { context, row3 } = seatOrderRows();
+  assert.equal(seatSnapshot(context, RICE_ROOM, SEAT_ACTOR, PHONE_DEVICE), 'invalid_capability', '수정 전 상태');
+
+  const redeemed = redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001');
+  assert.equal(redeemed.ok, true, redeemed.error);
+  assert.deepEqual(groupKeys(redeemed.groups), [
+    `${BOUND_ROOM}/${SEAT_ACTOR}`, `${MEMO_ROOM}/${SEAT_ACTOR}`, `${RICE_ROOM}/${SEAT_ACTOR}`,
+  ]);
+  assert.equal(redeemed.bound.groups, 3);
+  const stored = JSON.parse(row3()[7]);
+  assert.deepEqual(groupKeys(stored), groupKeys(redeemed.groups), '행에도 같은 목록이 남는다');
+  assert.equal(stored.find((entry) => entry.groupId === RICE_ROOM).hash, RICE_SEAT, '해시는 지금 참여자 행의 값');
+  assert.equal(stored.find((entry) => entry.groupId === MEMO_ROOM).hash, MEMO_SEAT);
+
+  for (const device of [PC_ONLY, PHONE_DEVICE]) {
+    assert.equal(seatSnapshot(context, RICE_ROOM, SEAT_ACTOR, device), 'ok', '경기미 host 자리가 열린다');
+    assert.equal(seatSnapshot(context, MEMO_ROOM, SEAT_ACTOR, device), 'ok');
+  }
+});
+
+test('연결되지 않은 키나 관리자 재연결 행의 키가 가진 주문의 자리는 더하지 않는다', () => {
+  const { context, put, row3, data } = seatOrderRows();
+  const strangerKey = 'dd44ee55' + '0'.repeat(56);
+  const room = 'customer-stranger-room';
+  data.groups.rows.push([room, room, room, 'recruiting', 4, false, SEAT_ACTOR, 0, 1, '', '', '', SEAT_ACTOR, 'recruiting', 4]);
+  data.groupParticipants.rows.push([room, SEAT_ACTOR, '주', 'host', true, 'pending', 0, SEAT('3'), 1, '', '', 1]);
+  const adminRoom = 'customer-admin-room';
+  data.groups.rows.push([adminRoom, adminRoom, adminRoom, 'recruiting', 4, false, SEAT_ACTOR, 0, 1, '', '', '', SEAT_ACTOR, 'recruiting', 4]);
+  data.groupParticipants.rows.push([adminRoom, SEAT_ACTOR, '주', 'host', true, 'pending', 0, SEAT('2'), 1, '', '', 1]);
+  // 결박주문에 끼어 있어도 소유 해시가 이 등록의 기기가 아니면 자리 증명이 아니다.
+  const foreign = put('order-1700000070011', strangerKey, room, SEAT_ACTOR);
+  const viaAdmin = put('order-1700000070012', ADMIN_DEVICE, adminRoom, SEAT_ACTOR);
+  const row = row3();
+  row[6] = JSON.stringify(JSON.parse(row[6]).concat([foreign, viaAdmin]));
+  context.invalidateRecoveryRows_();
+
+  const redeemed = redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001');
+  assert.equal(redeemed.ok, true, redeemed.error);
+  const keys = groupKeys(redeemed.groups);
+  assert.equal(keys.includes(`${room}/${SEAT_ACTOR}`), false);
+  assert.equal(keys.includes(`${adminRoom}/${SEAT_ACTOR}`), false);
+  assert.equal(seatSnapshot(context, room, SEAT_ACTOR, PC_ONLY), 'invalid_capability');
+  assert.equal(seatSnapshot(context, adminRoom, SEAT_ACTOR, PC_ONLY), 'invalid_capability');
+  assert.equal(seatSnapshot(context, RICE_ROOM, SEAT_ACTOR, strangerKey), 'invalid_capability', '제3자 키는 여전히 안 된다');
+  assert.equal(seatSnapshot(context, RICE_ROOM, SEAT_ACTOR, ADMIN_DEVICE), 'invalid_capability',
+    '관리자 재연결 행의 키는 3번 행의 자리를 얻지 못한다');
+});
+
+test('예약이 묶이지 않은 옛 주문이나 취소된 주문의 자리는 더하지 않는다', () => {
+  const { context, put, row3, data } = seatOrderRows();
+  const legacy = 'customer-legacy-room';
+  const cancelled = 'customer-cancelled-room';
+  for (const [groupId, hash] of [[legacy, SEAT('3')], [cancelled, SEAT('2')]]) {
+    data.groups.rows.push([groupId, groupId, groupId, 'recruiting', 4, false, SEAT_ACTOR, 0, 1, '', '', '', SEAT_ACTOR, 'recruiting', 4]);
+    data.groupParticipants.rows.push([groupId, SEAT_ACTOR, '주', 'member', true, 'pending', 0, hash, 1, '', '', 1]);
+  }
+  const legacyId = put('order-1700000070021', OLD_DEVICE, legacy, SEAT_ACTOR, { _reservationMutationId: '' });
+  const cancelledId = put('order-1700000070022', OLD_DEVICE, cancelled, SEAT_ACTOR, { status: 'cancelled' });
+  const row = row3();
+  row[6] = JSON.stringify(JSON.parse(row[6]).concat([legacyId, cancelledId]));
+  context.invalidateRecoveryRows_();
+
+  const keys = groupKeys(redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001').groups);
+  assert.equal(keys.includes(`${legacy}/${SEAT_ACTOR}`), false);
+  assert.equal(keys.includes(`${cancelled}/${SEAT_ACTOR}`), false);
+  assert.equal(seatSnapshot(context, legacy, SEAT_ACTOR, PC_ONLY), 'invalid_capability');
+});
+
+test('결박 뒤 교체된 자리는 주문이 있어도 되살리기로 되돌아오지 않는다', () => {
+  const { context, row3, data } = seatOrderRows();
+  // 3번 행에 묶일 때의 해시와 지금 참여자 행의 해시가 다르다(정상 교체).
+  data.groupParticipants.rows.find((row) => row[0] === BOUND_ROOM)[7] = ROTATED;
+
+  const redeemed = redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001');
+  assert.equal(redeemed.ok, true, redeemed.error);
+  const bound = JSON.parse(row3()[7]).filter((entry) => entry.groupId === BOUND_ROOM);
+  assert.equal(bound.length, 1, '같은 (그룹, 참여자) 항목을 겹쳐 넣지 않는다');
+  assert.equal(bound[0].hash, BOUND_SEAT, '이미 있는 항목은 지금 해시로 바꾸지 않는다');
+  assert.equal(seatSnapshot(context, BOUND_ROOM, SEAT_ACTOR, PC_ONLY), 'invalid_capability');
+  assert.equal(seatSnapshot(context, BOUND_ROOM, SEAT_ACTOR, ROTATED), 'ok', '교체된 진짜 토큰은 그대로 된다');
+});
+
+test('같은 되살리기를 다시 보내도 같은 응답이고 참여자 행은 바뀌지 않는다', () => {
+  const { context, row3, data } = seatOrderRows();
+  const participantsBefore = JSON.stringify(data.groupParticipants.rows);
+  const first = redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001');
+  const replay = redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001');
+  assert.equal(replay.duplicate, true);
+  assert.deepEqual(groupKeys(replay.groups), groupKeys(first.groups));
+  const afterFirst = row3()[7];
+  // 다른 기기가 한 번 더 되살려도 항목이 겹쳐 늘지 않는다.
+  const phone = redeem(context, OLD_DEVICE, PHONE_DEVICE, 'recovery-redeem-phone1');
+  assert.equal(phone.ok, true, phone.error);
+  assert.deepEqual(groupKeys(phone.groups), groupKeys(first.groups));
+  assert.equal(row3()[7], afterFirst);
+  assert.equal(JSON.stringify(data.groupParticipants.rows), participantsBefore, '참여자 행을 다시 쓰지 않는다');
+});
+
+test('운영 모양 메모 방: 휴대폰 키로 3번 행의 메모 자리는 열리고 PC 자리는 계속 막힌다', () => {
+  const { context, data } = seatOrderRows();
+  const seatsBefore = data.groupParticipants.rows.filter((row) => row[0] === MEMO_ROOM).length;
+  assert.equal(seatSnapshot(context, MEMO_ROOM, SEAT_ACTOR, PHONE_DEVICE), 'invalid_capability', '10/18 상태');
+  assert.equal(redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001').ok, true);
+
+  assert.equal(seatSnapshot(context, MEMO_ROOM, SEAT_ACTOR, PHONE_DEVICE), 'ok');
+  assert.equal(seatSnapshot(context, MEMO_ROOM, PC_ACTOR, PHONE_DEVICE), 'invalid_capability',
+    'PC 자기 자리는 4번 행에만 묶여 있어 휴대폰이 대행하지 않는다');
+  assert.equal(seatSnapshot(context, MEMO_ROOM, PC_ACTOR, PC_ONLY), 'ok', 'PC 는 자기 자리를 그대로 연다');
+  assert.equal(seatSnapshot(context, MEMO_ROOM, SEAT_ACTOR, PC_ONLY), 'ok', 'PC 는 3번 행 자리도 함께 연다');
+  assert.equal(data.groupParticipants.rows.filter((row) => row[0] === MEMO_ROOM).length, seatsBefore);
+});
+
+test('되돌린 예약이나 빠진 자리, 관리자 자리의 주문은 되살리기에 자리로 싣지 않는다', () => {
+  const { context, put, row3, data } = seatOrderRows();
+  const room = (groupId, role, counted, hash) => {
+    data.groups.rows.push([groupId, groupId, groupId, 'recruiting', 4, false, SEAT_ACTOR, 0, 1, '', '', '', SEAT_ACTOR, 'recruiting', 4]);
+    data.groupParticipants.rows.push([groupId, SEAT_ACTOR, '주', role, counted, 'pending', 0, hash, 1, '', '', counted ? 1 : 0]);
+  };
+  room('customer-rolled-room', 'member', true, SEAT('3'));
+  room('customer-left-room', 'member', false, SEAT('2'));
+  room('customer-admin-seat-room', 'admin', true, SEAT('1'));
+  const rolled = put('order-1700000070031', OLD_DEVICE, 'customer-rolled-room', SEAT_ACTOR);
+  const left = put('order-1700000070032', OLD_DEVICE, 'customer-left-room', SEAT_ACTOR);
+  const adminSeat = put('order-1700000070033', OLD_DEVICE, 'customer-admin-seat-room', SEAT_ACTOR);
+  // 게시 뒤 그 예약이 되돌려졌다. 주문 행에는 예약 칸이 그대로 남아 있다.
+  context.appendGroupHistory_(data, { groupId: 'customer-rolled-room', action: 'rollback_reservation',
+    actorId: SEAT_ACTOR, entityId: SEAT_ACTOR, clientMutationId: 'rollback-070031',
+    result: { reservationMutationId: 'reservation-070031' } });
+  const row = row3();
+  row[6] = JSON.stringify(JSON.parse(row[6]).concat([rolled, left, adminSeat]));
+  context.invalidateRecoveryRows_();
+
+  const redeemed = redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001');
+  assert.equal(redeemed.ok, true, redeemed.error);
+  const keys = groupKeys(redeemed.groups);
+  for (const groupId of ['customer-rolled-room', 'customer-left-room', 'customer-admin-seat-room']) {
+    assert.equal(keys.includes(`${groupId}/${SEAT_ACTOR}`), false, groupId);
+    assert.equal(seatSnapshot(context, groupId, SEAT_ACTOR, PC_ONLY), 'invalid_capability', groupId);
+  }
+  assert.equal(keys.includes(`${RICE_ROOM}/${SEAT_ACTOR}`), true, '살아 있는 자리는 그대로 실린다');
+});
+
+test('되살리기는 결박 주문이 많아도 참여자 행과 그룹 이력을 한 번씩만 읽는다', () => {
+  const { context, put, row3, data } = seatOrderRows();
+  const extra = [];
+  for (let index = 0; index < 8; index += 1) {
+    const groupId = `customer-many-room-${index}`;
+    data.groups.rows.push([groupId, groupId, groupId, 'recruiting', 4, false, SEAT_ACTOR, 0, 1, '', '', '', SEAT_ACTOR, 'recruiting', 4]);
+    data.groupParticipants.rows.push([groupId, SEAT_ACTOR, '주', 'member', true, 'pending', 0, SEAT(String(index % 3 + 1)), 1, '', '', 1]);
+    extra.push(put(`order-17000000701${index}0`, OLD_DEVICE, groupId, SEAT_ACTOR));
+  }
+  const row = row3();
+  row[6] = JSON.stringify(JSON.parse(row[6]).concat(extra));
+  context.invalidateRecoveryRows_();
+  const counter = (sheet) => {
+    const getRange = sheet.getRange.bind(sheet);
+    const counted = { reads: 0 };
+    sheet.getRange = (...args) => { counted.reads += 1; return getRange(...args); };
+    return counted;
+  };
+  const participantReads = counter(data.groupParticipants);
+  const historyReads = counter(data.groupHistory);
+
+  const redeemed = redeem(context, OLD_DEVICE, PC_ONLY, 'recovery-redeem-pc0001');
+  assert.equal(redeemed.ok, true, redeemed.error);
+  assert.equal(redeemed.groups.length, 3 + extra.length);
+  assert.equal(participantReads.reads, 1, '주문마다 참여자 시트를 읽지 않는다');
+  assert.equal(historyReads.reads, 1, '주문마다 그룹 이력을 읽지 않는다');
+});

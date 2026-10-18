@@ -4621,11 +4621,20 @@ function handleRecoveryCredentials_(payload) {
         if (boundOrderIds.indexOf(orderId) === -1) boundOrderIds.push(orderId);
       });
     });
+    // 결박 주문의 그룹 자리도 이 등록에 묶는다. 등록 때 브라우저가 자리 토큰을 내지
+    // 못해 빠진 방(2026-09-23 등록의 경기미·탐사 메모지)이 되살리기 응답에 없으면
+    // 어느 기기도 그 방 자격을 받지 못하고, 수집기도 승계를 인정하지 않는다.
+    // 등록한 키(결박해시)가 낸 주문만 본다. 연결 기기가 직접 낸 주문의 자리는 그 기기가
+    // 진짜 토큰을 갖고 있거나 그 기기 자기 등록에 묶여 있다. 그것까지 더하면 PC 자기
+    // 자리(우유 host 등)를 휴대폰이 대신 쓰게 된다.
+    const boundGroups = (existing.boundGroups || []).concat(recoveryOrderSeats_(
+      sheets, boundOrderIds, existing.boundHash, existing.boundGroups
+    ));
     const now = new Date().toISOString();
     sheets.recovery.getRange(existing.rowNumber, 1, 1, RECOVERY_HEADERS.length).setValues([[
       existing.createdAt || now, now, identityKey, JSON.stringify(existing.verifier),
       existing.boundHash, JSON.stringify(devices), JSON.stringify(boundOrderIds),
-      JSON.stringify(existing.boundGroups), JSON.stringify(existing.boundDeals),
+      JSON.stringify(boundGroups), JSON.stringify(existing.boundDeals),
       existing.actorId, existing.version + 1, clientMutationId
     ]]);
     invalidateRecoveryRows_();
@@ -4634,10 +4643,10 @@ function handleRecoveryCredentials_(payload) {
       ok: true, actorId: existing.actorId,
       bound: {
         orders: boundOrderIds.length,
-        groups: (existing.boundGroups || []).length,
+        groups: boundGroups.length,
         deals: (existing.boundDeals || []).length
       },
-      groups: existing.boundGroups || [],
+      groups: boundGroups,
       deals: existing.boundDeals || []
     });
   } catch (error) {
@@ -4645,6 +4654,67 @@ function handleRecoveryCredentials_(payload) {
   } finally {
     if (lock) { try { lock.releaseLock(); } catch (error) {} }
   }
+}
+
+// 결박 주문이 가리키는 그룹 자리. 예약이 묶인 그룹 주문은 게시 때 그 자리의 참여자
+// 토큰을 함께 냈다(bindInitialGroupOrderReservation_ → requireParticipantCapability_).
+// 그래서 그 주문의 소유 증명은 자리의 증명과 같다. 단, 그 예약이 지금도 살아 있고
+// (되돌리기·취소 이력이 없고 수량이 맞고) 그 자리가 지금 계산되는 참여자 자리일 때만
+// 그렇다. 되돌린 자리나 빠진 자리를 승계로 되살리면 안 된다. 해시는 지금 참여자 행의
+// 값으로 고정하므로, 이후 정상 교체가 있으면 승계가 무효가 되는 규칙은 그대로다. 이미
+// 결박된 (그룹, 참여자) 항목은 건드리지 않는다. 결박 뒤 교체된 자리를 되돌리지 않기
+// 위해서다. 참여자 행과 그룹 이력은 이 되살리기에서 각각 한 번만 읽는다.
+function recoveryOrderSeats_(sheets, orderIds, ownerHash, existingGroups) {
+  const owner = String(ownerHash || '').toLowerCase();
+  if (!RECOVERY_HASH.test(owner)) return [];
+  const wanted = Object.create(null);
+  (orderIds || []).forEach(function(orderId) { wanted[String(orderId)] = true; });
+  const taken = Object.create(null);
+  (existingGroups || []).forEach(function(entry) {
+    if (entry && typeof entry === 'object') {
+      taken[String(entry.groupId || '') + '\u0000' + String(entry.actorId || '')] = true;
+    }
+  });
+  const candidates = storedCustomerOrders_(sheets.customerOrders).filter(function(order) {
+    if (!wanted[String(order.id || '')] || !activeGroupOrder_(order)) return false;
+    if (!String(order._reservationMutationId || '')) return false;
+    if (String(order._customerCapabilityHash || '').toLowerCase() !== owner) return false;
+    const groupId = String(order.groupId || '');
+    const actorId = String(order.participantActorId || order.visitorId || '');
+    return Boolean(groupId && actorId && !taken[groupId + '\u0000' + actorId]);
+  });
+  if (!candidates.length) return [];
+
+  const participants = Object.create(null);
+  const participantSheet = sheets.groupParticipants;
+  const lastParticipantRow = participantSheet ? participantSheet.getLastRow() : 0;
+  (lastParticipantRow < 2 ? [] : participantSheet
+    .getRange(2, 1, lastParticipantRow - 1, GROUP_PARTICIPANT_HEADERS.length).getValues())
+    .forEach(function(row, index) {
+      const participant = participantFromRow_(row, index + 2, true);
+      if (!participant) return;
+      const key = participant.groupId + '\u0000' + participant.actorId;
+      if (!participants[key]) participants[key] = participant;
+    });
+  const historyContext = {};
+
+  const seats = [];
+  candidates.forEach(function(order) {
+    const groupId = String(order.groupId || '');
+    const actorId = String(order.participantActorId || order.visitorId || '');
+    const key = groupId + '\u0000' + actorId;
+    if (taken[key]) return;
+    const participant = participants[key];
+    if (!participant || participant.counted !== true
+      || ['creator', 'host', 'member'].indexOf(participant.role) === -1) return;
+    const hash = String(participant.capabilityHash || '').toLowerCase();
+    if (!RECOVERY_HASH.test(hash)) return;
+    const history = customerOrderReservationHistory_(sheets, groupId, actorId, historyContext);
+    if (!verifiedBoundGroupPurchaseOrder_(order, groupId, actorId, history)) return;
+    taken[key] = true;
+    seats.push({ groupId: groupId, actorId: actorId, hash: hash });
+  });
+  return seats;
 }
 
 function recoveryRowValue_(row, rowNumber) {

@@ -105,7 +105,12 @@ import {
   shouldKeepOwnerPreview,
   shouldNavigateAfterDealDelete,
 } from './customerUi';
-import { resolveOrderRoomAccess } from './orderRoomAccess';
+import {
+  ORDER_SEAT_ELSEWHERE_MESSAGE,
+  orderSeatWithoutRoomCredential,
+  resolveOrderRoomAccess,
+  roomCredentialUnderAnotherActor,
+} from './orderRoomAccess';
 import {
   assertCustomerMutationAllowed,
   customerCanOpenGroupRoom,
@@ -3650,6 +3655,34 @@ function App() {
       : isGroupPurchase
         ? (existingGroupCredential ? 'reserve_quantity' : 'join')
         : '';
+    // 이 방의 활성 주문이 내 주문에 있는데 이 기기에 그 방 자격이 하나도 없으면 새로
+    // 참여하지 않는다. 자리는 이미 서버에 있고, 다시 참여하면 409 로 막히거나 같은
+    // 고객의 두 번째 자리와 수량 예약이 생긴다. 상세 화면이 버튼을 숨기지만, 이미 열린
+    // 참여 화면이나 다른 경로에서 와도 요청을 보내기 전에 막는다.
+    const roomCredentialForJoin = initialReservationAction === 'join'
+      ? getGroupRoomCredential(order.deal.id, actorId)
+      : null;
+    if (initialReservationAction === 'join' && roomCredentialUnderAnotherActor({
+      exactCredential: existingGroupCredential,
+      roomCredential: roomCredentialForJoin,
+      actorId,
+    })) {
+      // 이 기기가 그 방의 다른 참여자ID 자격(되살린 자리 등)을 갖고 있다. 지금
+      // 방문자ID 로 join 하면 같은 고객의 두 번째 자리가 생긴다.
+      throw Object.assign(new Error('order_seat_elsewhere'), { code: 'order_seat_elsewhere' });
+    }
+    if (initialReservationAction === 'join' && orderSeatWithoutRoomCredential({
+      orders: localOrders.filter((candidate) => (
+        candidate.id !== order.id
+        && isOrderForProfile(candidate, profile, actorId)
+        && ![candidate.reservationMutationId, candidate.clientMutationId]
+          .includes(requestedReservationMutationId)
+      )),
+      groupIds: [order.deal.id, order.groupId, order.deal.groupId],
+      credential: roomCredentialForJoin,
+    })) {
+      throw Object.assign(new Error('order_seat_elsewhere'), { code: 'order_seat_elsewhere' });
+    }
     const checkoutAttempt = needsDurableOrderSync
       ? beginCheckoutAttempt({
           ...order,
@@ -4745,6 +4778,7 @@ function CustomerApp({
         editable={editableDealIds.includes(selectedDeal.id)}
         canRepairLegacyGroup={selectedGroupCanRestore}
         roomCredential={selectedGroupCredential}
+        customerOrders={customerOrders}
         onUpdateDeal={onUpdateDeal}
         onUpdateTarget={onUpdateTarget}
         onDeleteDeal={async (deal) => {
@@ -6050,7 +6084,7 @@ function OrdersTab({ orders, orderSyncIssues = {}, historyStatus = 'ready', hist
                   )}
                   {roomErrorId === order.id && (
                     <p className="form-error" role="alert">
-                      이 주문의 기존 채팅 권한을 확인하지 못했습니다. 다시 참여하지 마세요. 주문했던 브라우저에서 확인하거나 운영자에게 주문의 채팅 연결 점검을 요청해 주세요.
+                      이 기기에는 이 주문의 채팅 입장 정보가 없습니다. 다시 참여하지 마세요. 이 화면의 ‘이전 주문이 보이지 않나요?’에서 확인번호로 되살려 주세요. 되살린 뒤에도 같으면 운영자에게 이 주문의 채팅 연결 점검을 요청해 주세요.
                     </p>
                   )}
                   {canCancel && (
@@ -6212,6 +6246,7 @@ function DealDetail({
   editable = false,
   canRepairLegacyGroup = false,
   roomCredential = null,
+  customerOrders = [],
   onUpdateDeal,
   onUpdateTarget,
   onDeleteDeal,
@@ -6286,9 +6321,37 @@ function DealDetail({
     localCreator: isCustomerGroup && canRepairLegacyGroup,
   });
   const showMerchantRoom = isMerchantGroup && canOpenGroupRoom;
+  // 내 주문에 이 방의 활성 주문이 있는데 이 기기에 그 방 자격이 없으면 참여로 보내지
+  // 않는다. 그 자리는 이미 서버에 있다(2026-10-18 휴대폰 탐사 메모지 409).
+  const orderSeatElsewhere = isGroupDeal && !writeBlocked && !canOpenGroupRoom
+    ? orderSeatWithoutRoomCredential({
+      orders: customerOrders,
+      groupIds: [deal.id, deal.groupId],
+      credential: existingGroupCredential,
+    })
+    : null;
+  const orderSeatMessage = orderSeatElsewhere ? (
+    <p className="evidence-note sticky-action-message order-seat-elsewhere" role="status">
+      {ORDER_SEAT_ELSEWHERE_MESSAGE}
+    </p>
+  ) : null;
+  // 참여하기는 이 방문자ID 의 자격으로만 판단한다. 저장된 방 자격이 다른 참여자ID 의
+  // 것(되살린 자리)이면 참여하기는 새 자리를 만든다. 그룹 채팅만 보인다.
+  const exactGroupCredential = isGroupDeal ? getGroupCredential(deal.id, getVisitorId()) : null;
+  const seatUnderAnotherActor = isGroupDeal && !writeBlocked
+    ? roomCredentialUnderAnotherActor({
+      exactCredential: exactGroupCredential,
+      roomCredential: existingGroupCredential,
+      actorId: getVisitorId(),
+    })
+    : null;
   const newParticipantCapacityReached = isCustomerGroup
-    && !existingGroupCredential
+    && !exactGroupCredential
     && split.current >= split.people;
+  // 모집이 끝난 방은 '모집 종료'(비활성)를 그대로 보인다. 열린 방에서만 참여 버튼을 감춘다.
+  const joinHiddenForOtherActor = Boolean(seatUnderAnotherActor) && (isCustomerGroup
+    ? recruitmentOpen && dealQuantity.remaining > 0
+    : !merchantPurchaseClosed);
   const canHostApply = !writeBlocked && !hostMatched && (
     (customerHostRecruiting && recruitmentOpen)
     || (isMerchantGroup && recruitmentOpen
@@ -6675,14 +6738,18 @@ function DealDetail({
         </p>
       )}
 
-      <div className={isMerchantGroup && !showMerchantRoom ? 'sticky-actions single' : 'sticky-actions'}>
+      <div className={orderSeatElsewhere
+        ? 'sticky-actions single has-message'
+        : (isMerchantGroup && !showMerchantRoom) || joinHiddenForOtherActor ? 'sticky-actions single' : 'sticky-actions'}
+      >
+        {orderSeatMessage}
         {isCustomerGroup ? (
           <>
             {canOpenGroupRoom && <button className="secondary-button room-entry-button" onClick={onOpenRoom}>
               {RELEASE_FEATURES.chat ? <MessageCircle size={18} /> : <Check size={18} />}
               {RELEASE_FEATURES.chat ? `그룹 채팅${unreadCount > 0 ? ` · ${Math.min(99, unreadCount)}` : ''}` : '거래 상태 관리'}
             </button>}
-            {!writeBlocked && (
+            {!writeBlocked && !orderSeatElsewhere && !joinHiddenForOtherActor && (
               <button
                 className="primary-button"
                 disabled={!recruitmentOpen || dealQuantity.remaining <= 0 || newParticipantCapacityReached}
@@ -6716,7 +6783,7 @@ function DealDetail({
                 <Users size={18} /> 그룹방 만들기
               </button>
             )}
-            {!writeBlocked && (
+            {!writeBlocked && !orderSeatElsewhere && !joinHiddenForOtherActor && (
               <button
                 className="primary-button"
                 disabled={merchantPurchaseClosed}
@@ -7067,7 +7134,9 @@ function JoinFlow({
               if (orderError?.reservationRolledBack) {
                 reservationMutationIdRef.current = createMutationId('checkout_quantity');
               }
-              setSubmitError(joinSubmitErrorMessage(orderError));
+              setSubmitError(joinSubmitErrorMessage(orderError, {
+                hasRoomCredential: Boolean(getGroupRoomCredential(deal.id, getVisitorId())),
+              }));
             } finally {
               setSubmitting(false);
             }

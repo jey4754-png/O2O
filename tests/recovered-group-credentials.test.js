@@ -102,3 +102,16 @@ test('비활성 자격이나 다른 방의 자격은 고르지 않는다', () =>
     assert.equal(getGroupRoomCredential('room-milk', 'actor-x'), null);
   });
 });
+
+test('되살리기 응답에 없는 방은 다른 방을 되살려도 열리지 않는다', () => {
+  // 10/16 검사는 경기미가 결박돼 있다고 가정했다. 실제로는 9/23 등록에 경기미가 없어
+  // 응답에도 없었고, 그 방은 어느 기기에서도 자격이 생기지 않았다(2026-10-18).
+  withStorage({}, () => {
+    const response = [{ groupId: 'room-bound', actorId: 'actor-old' }];
+    response.forEach(({ groupId, actorId }) => adoptRecoveredGroupCredential(groupId, actorId, CUSTOMER_TOKEN));
+    assert.equal(getGroupRoomCredential('room-bound', 'actor-this-browser')?.actorId, 'actor-old');
+    assert.equal(getGroupRoomCredential('room-rice', 'actor-this-browser'), null,
+      '응답에 없는 방은 같은 참여자ID 라도 자격이 생기지 않는다');
+    assert.equal(getGroupCredential('room-rice', 'actor-old'), null);
+  });
+});
