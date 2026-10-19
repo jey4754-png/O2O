@@ -485,6 +485,9 @@ test('사장님 기억 정보가 있어도 앱 선택의 사용자 로그인은 
   await expect(page.getByRole('button', { name: '마이', exact: true })).toBeVisible();
   await page.getByRole('button', { name: '계산', exact: true }).click();
   await expect(page.getByRole('heading', { name: '예상 부담금 계산기' })).toBeVisible();
+  // Joo 10/19: a preset example price had to be erased every time.
+  await expect(page.getByLabel('상품 판매가')).toHaveValue('');
+  await expect(page.getByRole('button', { name: '이 조건으로 그룹 만들기' })).toBeDisabled();
   await expectBottomNavigationToFillWidth(page, 6);
   await expect(page.locator('.bottom-nav button[aria-current="page"]')).toContainText('계산');
   await expect.poll(async () => JSON.parse(

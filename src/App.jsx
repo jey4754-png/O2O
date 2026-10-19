@@ -4836,7 +4836,7 @@ function CustomerApp({
     return (
       <>
         <SplitCalculator
-          initialTotal={selectedDeal?.simulation?.total || 39000}
+          initialTotal={selectedDeal?.simulation?.total || 0}
           initialPeople={selectedDeal?.simulation?.people || 3}
           initialProductQuantity={selectedDeal?.simulation?.totalQuantity || selectedDeal?.simulation?.productQuantity || 3}
           initialSelectedQuantity={selectedDeal?.simulation?.creatorQuantity || selectedDeal?.simulation?.creatorProductQuantity || 1}

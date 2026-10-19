@@ -13,7 +13,7 @@ function formatWon(value) {
 }
 
 export default function SplitCalculator({
-  initialTotal = 39000,
+  initialTotal = 0,
   initialPeople = 3,
   initialProductQuantity = 3,
   initialSelectedQuantity = 1,
@@ -26,7 +26,12 @@ export default function SplitCalculator({
     MAX_PRODUCT_QUANTITY,
     Math.max(1, Math.floor(Number(initialProductQuantity || initialPeople || 3))),
   );
-  const [total, setTotal] = useState(String(Math.max(0, Number(initialTotal || 39000))));
+  // Start empty unless a product supplied its price: a preset example amount had
+  // to be erased by hand every time (Joo, 10/19).
+  const [total, setTotal] = useState(() => {
+    const preset = Math.max(0, Math.floor(Number(initialTotal || 0)));
+    return preset > 0 ? String(preset) : '';
+  });
   const [people, setPeople] = useState(Math.min(MAX_GROUP_PARTICIPANTS, Math.max(1, Math.floor(Number(initialPeople || 3)))));
   const [productQuantity, setProductQuantity] = useState(normalizedProductQuantity);
   const [selectedQuantity, setSelectedQuantity] = useState(
