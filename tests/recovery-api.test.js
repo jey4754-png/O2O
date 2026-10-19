@@ -287,7 +287,8 @@ test('같은 확인번호가 여러 등록과 맞으면 이 기기가 아닌 다
   const source = readFileSync(new URL('../api/recovery.js', import.meta.url), 'utf8');
   // 이 기기가 등록한 행으로 되살리면 이 기기를 이 기기에 더하는 셈이라 바뀌는 것이
   // 없다. 예전에는 마지막으로 맞은 행이 걸렸고 후보가 ref 순이라 사실상 무작위였다.
-  assert.match(source, /const matched = matchedRefs\.find\(\(ref\) => ref !== own\) \|\| matchedRefs\[0\];/);
+  assert.match(source, /const others = matchedRefs\.filter\(\(ref\) => ref !== own\);/);
+  assert.match(source, /ref: others\[index\], redeemAssertion: true/);
   assert.match(source, /if \(timingSafeEqual\(key, Buffer\.from\(item\.verifier\.hash, 'hex'\)\)\) matchedRefs\.push\(item\.ref\);/);
   // 모든 후보를 끝까지 계산하는 것은 그대로다. 몇 개가 맞았는지가 시간으로 새지 않는다.
   assert.equal(/break;/.test(source.slice(source.indexOf('async function matchEnrollment'), source.indexOf('async function verify'))), false);
@@ -353,4 +354,86 @@ test('예전 번호를 잊어도 연결된 기기에서 새 번호를 정하면 
   assert.equal(stale.statusCode, 403);
   assert.equal(stale.body.error, 'invalid_recovery_pin');
   assert.equal(JSON.stringify([store.recovery.rows, store.calls]).includes(NEW_PIN), false, '새 번호 원문도 어디에도 없다');
+});
+
+// 2026-10-19 11:40 실제 상태. 9/23 등록 행(3행)에 휴대폰과 PC 가 연결돼 있고, PC 에는
+// 자기 등록 행(4행)이 따로 있다. 두 행의 확인번호가 같고, 정렬상 PC 자기 행의 ref 가
+// 앞선다(운영 02e779 < 05cc7d). PC 는 자기 행을 건너뛰어 3행으로 되살아났지만, 휴대폰은
+// 두 행 모두 '다른 기기 등록'이라 앞의 4행이 골라졌고, 4행에 휴대폰을 더하면 휴대폰이
+// 두 승계에 걸리므로 수집기가 recovery_succession_exists 로 거절했다.
+const PC_TOKEN_SORTS_FIRST = 'pc-own-enrollment-capability-token-000001';
+const PC_ORDER = 'order-1700000012099';
+
+async function jooShapedState(t) {
+  const store = fixture(t);
+  assert.ok(sha(PC_TOKEN_SORTS_FIRST) < sha(TOKEN), 'PC 자기 행의 ref 가 먼저 정렬돼야 운영과 같다');
+  store.data.customerOrders.rows.push(['', PC_ORDER, PHONE, JSON.stringify({
+    id: PC_ORDER, dealId: store.dealId, customerPhone: PHONE, type: 'purchase', status: 'new',
+    paymentStatus: 'pending', quantity: 1, selectedCount: 1, version: 1, paymentVersion: 1,
+    visitorId: 'pc-visitor', _customerCapabilityHash: sha(PC_TOKEN_SORTS_FIRST),
+  })]);
+  assert.equal((await invoke(enrollBody())).statusCode, 200, '9/23 등록');
+  assert.equal((await invoke(redeemBody())).statusCode, 200, '휴대폰이 9/23 등록에 연결');
+  const pcOwn = await invoke(enrollBody({
+    customerCapabilityToken: PC_TOKEN_SORTS_FIRST, actorId: 'pc-visitor',
+    clientMutationId: 'recovery-enroll-pc0001', groups: [], deals: [],
+  }));
+  assert.equal(pcOwn.statusCode, 200, 'PC 자기 등록(같은 번호)');
+  const pcJoin = await invoke(redeemBody({
+    customerCapabilityToken: PC_TOKEN_SORTS_FIRST, clientMutationId: 'recovery-redeem-pc0001',
+  }));
+  assert.equal(pcJoin.statusCode, 200, JSON.stringify(pcJoin.body));
+  assert.equal(store.recovery.rows.length, 3, '머리글 + 9/23 등록 + PC 자기 등록');
+  return store;
+}
+
+const recoveryRow = (store, hash) => store.recovery.rows.slice(1)
+  .find((row) => String(row[4]) === hash);
+
+test('이미 연결된 등록과 다른 등록이 같은 번호로 함께 맞으면, 연결된 등록으로 다시 되살린다', async (t) => {
+  const store = await jooShapedState(t);
+  const pcRowBefore = JSON.stringify(recoveryRow(store, sha(PC_TOKEN_SORTS_FIRST)));
+  const phoneRedeems = store.calls.filter((call) => call.payload.operation === 'redeem').length;
+
+  const phone = await invoke(redeemBody({ clientMutationId: 'recovery-redeem-phone02' }));
+  assert.equal(phone.statusCode, 200, JSON.stringify(phone.body));
+  assert.deepEqual(phone.body.groups, [{ groupId: GROUP, actorId: 'member-test' }], '연결된 등록의 방 목록을 다시 받는다');
+  assert.deepEqual(phone.body.deals, [DEAL]);
+
+  // 승계가 새로 생기지 않는다. PC 자기 행은 그대로, 9/23 행의 기기 목록도 그대로다.
+  assert.equal(JSON.stringify(recoveryRow(store, sha(PC_TOKEN_SORTS_FIRST))), pcRowBefore);
+  assert.deepEqual(JSON.parse(recoveryRow(store, sha(TOKEN))[5]).sort(),
+    [sha(TOKEN), sha(NEW_TOKEN), sha(PC_TOKEN_SORTS_FIRST)].sort());
+  assert.equal(store.recovery.rows.length, 3);
+  // 거절된 시도는 쓰기 전에 끝났고, 실패 횟수로 세지 않는다.
+  const redeems = store.calls.filter((call) => call.payload.operation === 'redeem').slice(phoneRedeems);
+  assert.deepEqual(redeems.map((call) => call.payload.ref), [sha(PC_TOKEN_SORTS_FIRST), sha(TOKEN)]);
+  assert.equal(store.calls.some((call) => call.payload.operation === 'finish'), false);
+
+  assert.deepEqual(orderIds(store.context, sha(NEW_TOKEN)).sort(), [ORDER, PC_ORDER].sort(), '휴대폰은 계속 합쳐진 주문을 본다');
+  assert.deepEqual(orderIds(store.context, sha(PC_TOKEN_SORTS_FIRST)).sort(), [ORDER, PC_ORDER].sort(), 'PC 도 그대로');
+
+  // 응답이 유실돼 같은 요청을 다시 보내도 같은 결과다.
+  const replay = await invoke(redeemBody({ clientMutationId: 'recovery-redeem-phone02' }));
+  assert.equal(replay.statusCode, 200, JSON.stringify(replay.body));
+  assert.equal(replay.body.duplicate, true);
+  assert.deepEqual(replay.body.groups, [{ groupId: GROUP, actorId: 'member-test' }]);
+});
+
+test('다른 등록에 이미 승계된 기기는 맞는 등록이 그것뿐이면 여전히 거절된다', async (t) => {
+  const store = await jooShapedState(t);
+  // PC 가 연결된 기기로서 번호를 바꾸면 9/23 행의 번호만 바뀌고, PC 자기 행에는 처음
+  // 번호가 남는다. 그 번호는 이제 PC 자기 행만 연다. 휴대폰은 9/23 행에 승계돼 있으므로
+  // PC 행까지 승계하면 두 승계에 걸린다.
+  const OTHER_PIN = '615027';
+  const pcPin = await invoke(enrollBody({
+    pin: OTHER_PIN, customerCapabilityToken: PC_TOKEN_SORTS_FIRST, actorId: 'pc-visitor',
+    clientMutationId: 'recovery-enroll-pc0002', groups: [], deals: [],
+  }));
+  assert.equal(pcPin.statusCode, 200, JSON.stringify(pcPin.body));
+  const rowsBefore = JSON.stringify(store.recovery.rows);
+  const phone = await invoke(redeemBody({ clientMutationId: 'recovery-redeem-phone03' }));
+  assert.equal(phone.statusCode, 409, JSON.stringify(phone.body));
+  assert.equal(phone.body.error, 'recovery_succession_exists');
+  assert.equal(JSON.stringify(store.recovery.rows), rowsBefore, '어느 행도 바뀌지 않는다');
 });

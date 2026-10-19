@@ -267,8 +267,8 @@ async function matchEnrollment(request, body) {
   // 않는다. 예전에는 마지막으로 맞은 행을 골랐고, 후보가 ref 순으로 정렬되어
   // 있어 어느 행이 걸릴지 사실상 무작위였다. 다른 기기가 등록한 행을 먼저 고른다.
   const own = body.capabilityToken ? sha256(body.capabilityToken) : '';
-  const matched = matchedRefs.find((ref) => ref !== own) || matchedRefs[0];
-  return { identity, matched, matchedRefs };
+  const others = matchedRefs.filter((ref) => ref !== own);
+  return { identity, others, matchedRefs };
 }
 
 // Checks a number right after registering it, on the device that holds it,
@@ -280,7 +280,7 @@ async function verify(request, body) {
 }
 
 async function redeem(request, body) {
-  const { identity, matched, matchedRefs } = await matchEnrollment(request, body);
+  const { identity, others, matchedRefs } = await matchEnrollment(request, body);
   // 맞은 등록이 모두 이 기기가 직접 한 등록이면, 되살리기는 이 기기를 이 기기에
   // 더할 뿐이라 아무것도 바뀌지 않는다. 그런데도 성공으로 답하면 화면은 '주문 N건을
   // 볼 수 있습니다'라고 하고 목록은 그대로라, 고객은 기능이 고장 났다고 본다
@@ -289,18 +289,29 @@ async function redeem(request, body) {
   if (matchedRefs.every((ref) => ref === sha256(body.capabilityToken))) {
     throw recoveryError('recovery_own_enrollment', 409);
   }
+  // 같은 번호가 다른 기기의 등록 여러 개와 맞으면, 이 기기가 이미 연결된 등록이 어느
+  // 것인지 여기서는 알 수 없다(기기 목록은 수집기에만 있다). 앞의 등록을 승계하면 이
+  // 기기가 두 승계에 걸리는 경우 수집기는 쓰기 전에 recovery_succession_exists 로
+  // 거절하므로, 그때만 다음 맞은 등록으로 넘어간다. 2026-10-19 11:40 실제 사례: 휴대폰이
+  // 연결된 9/23 등록과 PC 자기 등록이 같은 번호였고 PC 행의 ref 가 먼저 정렬돼, 휴대폰의
+  // 되살리기가 PC 행에 걸려 거절됐다. 넘어가도 승계 규칙은 수집기가 행마다 그대로
+  // 판정하고, 모든 등록이 거절하면 거절이 그대로 전달된다.
   let result;
-  try {
-    result = await collector({
-      operation: 'redeem', identityKey: identity, ref: matched, redeemAssertion: true,
-      clientMutationId: body.clientMutationId, capabilityHash: sha256(body.capabilityToken),
-    });
-  } catch (error) {
-    // The number was right; only the write did not land. Saying so keeps the
-    // customer from doubting the digits, and pressing again is safe: the
-    // collector replays the same request as the same restore.
-    if (error?.status === 503) throw Object.assign(recoveryError('recovery_redeem_incomplete', 503), { upstream: error.upstream });
-    throw error;
+  for (let index = 0; ; index += 1) {
+    try {
+      result = await collector({
+        operation: 'redeem', identityKey: identity, ref: others[index], redeemAssertion: true,
+        clientMutationId: body.clientMutationId, capabilityHash: sha256(body.capabilityToken),
+      });
+      break;
+    } catch (error) {
+      if (error?.code === 'recovery_succession_exists' && index + 1 < others.length) continue;
+      // The number was right; only the write did not land. Saying so keeps the
+      // customer from doubting the digits, and pressing again is safe: the
+      // collector replays the same request as the same restore.
+      if (error?.status === 503) throw Object.assign(recoveryError('recovery_redeem_incomplete', 503), { upstream: error.upstream });
+      throw error;
+    }
   }
   const actorId = typeof result.actorId === 'string' && ID.test(result.actorId) ? result.actorId : '';
   return {
